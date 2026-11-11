@@ -26,6 +26,8 @@ docker build -t repoharbor:local-test .
 python3 tests/docker/smoke.py
 ```
 
+For TLS-intercepting build proxies, an optional BuildKit secret `--secret id=build_ca,src=/path/to/trusted-ca.pem` supplies a CA bundle only during dependency installation, without storing it in the image. TLS verification remains enabled.
+
 The Docker harness checks non-root identity, version/config commands, initialization on an empty bind mount, no listener/healthcheck, graceful SIGTERM and data persistence across recreate. CI runs Python 3.12/3.13, independent fault-injection, SAST, dependency audit, pinned Gitleaks, and Docker build/smoke jobs with read-only GitHub permissions. PR tests never publish images. Required checks must be configured separately in repository settings; the workflow cannot grant itself branch-protection permissions.
 
 README and changelog synchronization is deliberately deferred to the separately authorized final pre-merge task. No real NAS/Portainer or production-provider acceptance is implied by these local/CI tests.

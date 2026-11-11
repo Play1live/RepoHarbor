@@ -73,6 +73,61 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+def validate_state(data: dict[str, Any]) -> None:
+    """Reject semantically corrupt state before any startup write."""
+    try:
+        required = {
+            "active_operation",
+            "active_run",
+            "scheduler",
+            "global_storage",
+            "recovery",
+        }
+        if not required <= data.keys():
+            raise ValueError
+        scheduler = data["scheduler"]
+        if (
+            not isinstance(scheduler, dict)
+            or type(scheduler.get("skipped_overlaps")) is not int
+            or scheduler["skipped_overlaps"] < 0
+        ):
+            raise ValueError
+        if not isinstance(data["global_storage"], dict) or not isinstance(
+            data["recovery"], dict
+        ):
+            raise ValueError
+        if "last_checked_at" not in data["recovery"]:
+            raise ValueError
+        for key in ("active_run", "active_operation"):
+            value = data[key]
+            if value is None:
+                continue
+            if not isinstance(value, dict) or value.get("state") not in {
+                "running",
+                "completed",
+                "interrupted",
+                "reconciled",
+            }:
+                raise ValueError
+            if not isinstance(value.get("started_at"), str):
+                raise ValueError
+            if key == "active_operation":
+                if (
+                    not isinstance(value.get("alias"), str)
+                    or not isinstance(value.get("id"), str)
+                    or value.get("type")
+                    not in {"initial_clone", "mirror_update", "repair"}
+                ):
+                    raise ValueError
+                if "git_completed_at" in value and (
+                    not isinstance(value["git_completed_at"], str)
+                    or type(value.get("changed")) is not bool
+                ):
+                    raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise HarborError("Invalid journal structure; preserving state") from None
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = root
@@ -91,17 +146,7 @@ class Store:
             path = self.root / "data.json"
             if path.exists():
                 self.data = read_json(path)
-                if (
-                    not {
-                        "active_operation",
-                        "active_run",
-                        "scheduler",
-                        "global_storage",
-                        "recovery",
-                    }
-                    <= self.data.keys()
-                ):
-                    raise HarborError("Incomplete central state")
+                validate_state(self.data)
             else:
                 if set(p.name for p in self.root.iterdir()) - {".repoharbor.lock"}:
                     raise HarborError(

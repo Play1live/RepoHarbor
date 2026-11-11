@@ -60,7 +60,18 @@ def smoke():
                 docker("stop", "-t", "15", container)
                 state = json.loads(docker("inspect", container))[0]["State"]
                 assert state["ExitCode"] == 0
-                journal = json.loads((Path(directory) / "data.json").read_text())
+                journal = json.loads(
+                    docker(
+                        "run",
+                        "--rm",
+                        "--entrypoint",
+                        "cat",
+                        "--mount",
+                        f"type=bind,src={directory},dst=/backups,readonly",
+                        IMAGE,
+                        "/backups/data.json",
+                    )
+                )
                 assert (
                     journal["active_run"] is None
                     and journal["active_operation"] is None

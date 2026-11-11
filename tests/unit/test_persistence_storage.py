@@ -30,7 +30,7 @@ def test_atomic_roundtrip_error_ring_and_lock(tmp_path):
     with Store(tmp_path) as store:
         with pytest.raises(BlockingIOError), Store(tmp_path):
             pass
-        op = store.begin("demo", "clone")
+        op = store.begin("demo", "initial_clone")
         assert store.data["active_operation"]["id"] == op
         store.complete()
     with Store(tmp_path) as reopened:
@@ -137,3 +137,39 @@ def test_broken_metadata_preserved(factory, section, value):
     with pytest.raises(HarborError), factory():
         pass
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda d: d.update(scheduler=[]),
+        lambda d: d["scheduler"].update(skipped_overlaps=-1),
+        lambda d: d.update(global_storage=[]),
+        lambda d: d.update(recovery={}),
+        lambda d: d.update(active_run={"state": "unknown"}),
+        lambda d: d.update(active_run={"state": "running", "started_at": 4}),
+        lambda d: d.update(
+            active_operation={"state": "running", "started_at": "now", "alias": 4}
+        ),
+        lambda d: d.update(
+            active_operation={
+                "state": "running",
+                "started_at": "now",
+                "alias": "demo",
+                "id": "x",
+                "type": "initial_clone",
+                "git_completed_at": "now",
+            }
+        ),
+        lambda d: d.update(active_operation={"state": [], "started_at": "now"}),
+    ],
+)
+def test_semantically_corrupt_journal_is_not_changed(tmp_path, change):
+    with Store(tmp_path) as store:
+        data = store.data
+    change(data)
+    atomic_json(tmp_path / "data.json", data)
+    before = (tmp_path / "data.json").read_bytes()
+    with pytest.raises(HarborError), Store(tmp_path):
+        pass
+    assert (tmp_path / "data.json").read_bytes() == before

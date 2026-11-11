@@ -1,5 +1,6 @@
 -e .
 pip==26.2
+setuptools==84.1.0
 pytest==9.0.3
 pytest-cov==7.0.0
 ruff==0.14.5

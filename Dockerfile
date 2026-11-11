@@ -5,7 +5,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ca-certific
 WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
-RUN pip install --no-cache-dir --no-build-isolation pip==26.2 setuptools==80.9.0 \
+RUN --mount=type=secret,id=build_ca \
+    if [ -f /run/secrets/build_ca ]; then export PIP_CERT=/run/secrets/build_ca; fi \
+    && pip install --no-cache-dir --no-build-isolation pip==26.2 setuptools==84.1.0 \
     && pip install --no-cache-dir --no-build-isolation . \
     && chmod +x /usr/local/lib/python3.12/site-packages/repoharbor/askpass.py
 USER 10001:10001
