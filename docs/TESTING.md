@@ -1,0 +1,31 @@
+# Development checks
+
+Initial development version: 0.1.0 (not a stable release). Install Python 3.12+ and Git, then:
+
+```sh
+python -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pip install --no-build-isolation --no-deps -e .
+.venv/bin/ruff check .
+.venv/bin/ruff format --check .
+.venv/bin/mypy
+.venv/bin/pytest --cov --cov-report=xml --cov-report=json --cov-report=term-missing --junitxml=test-results/junit.xml
+.venv/bin/python scripts/check_coverage.py coverage.json
+.venv/bin/bandit -r src -ll
+.venv/bin/pip-audit --local --skip-editable
+.venv/bin/pytest tests/fault_injection
+```
+
+The lock file pins all development dependencies; `requirements-dev.in` records direct requirements. Product version is canonical in `pyproject.toml`; CLI reads installed package metadata. All application modules, including entrypoints and askpass, count toward coverage. The separate gate enforces 90% lines, 85% branches, and 95% lines individually for credentials, persistence, Git, recovery and storage. No coverage exclusions are used.
+
+Tests use synthetic temporary local Git remotes. They cover clone, no-op checks, ref/HEAD changes, deletion, annotated tags, force push, unavailable sources, exclusion/resumption, offline restore, missing-object repair, corrupt JSON, write faults and OS locks. Process tests use IPC barriers for SIGTERM/SIGKILL during active clone/fetch transport and journal/Git/promotion/metadata checkpoints; no real tokens or NAS data are used.
+
+```sh
+docker compose -f deploy/compose.example.yaml config --quiet
+docker build -t repoharbor:local-test .
+python3 tests/docker/smoke.py
+```
+
+The Docker harness checks non-root identity, version/config commands, initialization on an empty bind mount, no listener/healthcheck, graceful SIGTERM and data persistence across recreate. CI runs Python 3.12/3.13, independent fault-injection, SAST, dependency audit, pinned Gitleaks, and Docker build/smoke jobs with read-only GitHub permissions. PR tests never publish images. Required checks must be configured separately in repository settings; the workflow cannot grant itself branch-protection permissions.
+
+README and changelog synchronization is deliberately deferred to the separately authorized final pre-merge task. No real NAS/Portainer or production-provider acceptance is implied by these local/CI tests.

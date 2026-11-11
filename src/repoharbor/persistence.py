@@ -1,0 +1,194 @@
+"""Single-writer, fail-closed JSON persistence on a trusted local filesystem."""
+
+import fcntl
+import json
+import os
+import stat
+import tempfile
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from repoharbor.errors import HarborError
+
+
+def utcnow() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def safe_tree(root: Path) -> None:
+    if root.is_symlink() or not root.is_dir():
+        raise HarborError("Backup root must be an existing real directory")
+    for parent in root.parents:
+        if parent.is_symlink():
+            raise HarborError("Symlink in backup root path")
+    for directory, dirs, files in os.walk(root):
+        for name in dirs + files:
+            mode = (Path(directory) / name).lstat().st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise HarborError("Symlink or special file in backup root")
+
+
+def atomic_json(path: Path, data: dict[str, Any]) -> None:
+    if path.is_symlink():
+        raise HarborError("Refusing JSON symlink")
+    fd, temporary = tempfile.mkstemp(
+        prefix=".repoharbor-", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(data, stream, sort_keys=True, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def sync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        if path.is_symlink():
+            raise ValueError
+        value = json.loads(path.read_text())
+        if (
+            not isinstance(value, dict)
+            or type(value.get("schema_version")) is not int
+            or value["schema_version"] != 1
+        ):
+            raise ValueError
+    except (ValueError, OSError, UnicodeError):
+        raise HarborError(
+            "Invalid or unreadable state; preserving existing data"
+        ) from None
+    return value
+
+
+class Store:
+    def __init__(self, root: Path):
+        self.root = root
+        self.fd: int | None = None
+        self.data: dict[str, Any] = {}
+
+    def __enter__(self) -> "Store":
+        safe_tree(self.root)
+        self.fd = os.open(
+            self.root / ".repoharbor.lock",
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            path = self.root / "data.json"
+            if path.exists():
+                self.data = read_json(path)
+                if (
+                    not {
+                        "active_operation",
+                        "active_run",
+                        "scheduler",
+                        "global_storage",
+                        "recovery",
+                    }
+                    <= self.data.keys()
+                ):
+                    raise HarborError("Incomplete central state")
+            else:
+                if set(p.name for p in self.root.iterdir()) - {".repoharbor.lock"}:
+                    raise HarborError(
+                        "Missing journal in nonempty root; manual inventory required"
+                    )
+                self.data = {
+                    "schema_version": 1,
+                    "active_operation": None,
+                    "active_run": None,
+                    "scheduler": {"skipped_overlaps": 0},
+                    "global_storage": {},
+                    "recovery": {"last_checked_at": None},
+                }
+                self.save()
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def save(self) -> None:
+        atomic_json(self.root / "data.json", self.data)
+
+    def begin(self, alias: str, kind: str) -> str:
+        operation = {
+            "id": utcnow(),
+            "alias": alias,
+            "type": kind,
+            "state": "running",
+            "started_at": utcnow(),
+        }
+        self.data["active_operation"] = operation
+        self.save()
+        return str(operation["id"])
+
+    def complete(self) -> None:
+        operation = self.data["active_operation"]
+        operation["state"] = "completed"
+        operation["completed_at"] = utcnow()
+        self.save()
+
+
+def metadata(
+    alias: str, url: str, web_url: str | None, credential: str | None
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "repository": {
+            "provider": "manual",
+            "id": alias,
+            "clone_url": url,
+            "web_url": web_url,
+        },
+        "selection": {"status": "included", "reason": None},
+        "source": {"status": "unknown"},
+        "backup": {
+            "format": "mirror",
+            "relative_path": "repository.git",
+            "status": "pending",
+            "created_at": None,
+            "last_attempt_at": None,
+            "last_checked_at": None,
+            "last_updated_at": None,
+            "successful_updates": 0,
+            "size_bytes": 0,
+            "limit_bytes": None,
+            "completed_operation": None,
+        },
+        "errors": {"total": 0, "consecutive": 0, "last": None, "recent": []},
+        "integrity": {
+            "status": "unchecked",
+            "last_checked_at": None,
+            "repair_attempts": 0,
+            "successful_repairs": 0,
+        },
+        "authentication": {"credential_name": credential},
+    }
+
+
+def record_error(meta: dict[str, Any], code: str) -> None:
+    error = {"at": utcnow(), "code": code, "message": code}
+    errors = meta["errors"]
+    errors["total"] += 1
+    errors["consecutive"] += 1
+    errors["last"] = error
+    errors["recent"] = (errors["recent"] + [error])[-20:]
