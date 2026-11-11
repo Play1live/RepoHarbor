@@ -116,9 +116,9 @@ def test_fetch_failure_and_dangling_objects(factory, remote, monkeypatch):
         assert engine.repos["demo"]["backup"]["status"] == "error"
         assert engine.repos["demo"]["integrity"]["status"] == "suspect"
         monkeypatch.setattr(engine.git, "fetch", original)
-        recover(engine)
-        assert engine.repos["demo"]["integrity"]["status"] == "healthy"
+        # The next scheduled run performs local reconciliation automatically.
         engine.run()
+        assert engine.repos["demo"]["integrity"]["status"] == "healthy"
         assert "refs/heads/new" in engine.git.refs(mirror)
 
 
@@ -188,3 +188,18 @@ def test_remote_race_fetch_without_effect_does_not_claim_update(factory, monkeyp
             == old["successful_updates"]
         )
         assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+
+
+def test_transient_outage_resumes_without_service_restart(factory, remote, tmp_path):
+    with factory() as engine:
+        engine.run()
+        old = engine.repos["demo"]["backup"]["last_updated_at"]
+        offline = tmp_path / "offline.git"
+        remote[1].rename(offline)
+        engine.run()
+        assert engine.repos["demo"]["errors"]["consecutive"] == 1
+        offline.rename(remote[1])
+        engine.run()
+        assert engine.repos["demo"]["source"]["status"] == "available"
+        assert engine.repos["demo"]["errors"]["consecutive"] == 0
+        assert engine.repos["demo"]["backup"]["last_updated_at"] == old

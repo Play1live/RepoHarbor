@@ -134,6 +134,15 @@ class Engine:
 
     def run(self) -> None:
         safe_tree(self.config.root)
+        if any(
+            meta["integrity"]["status"] == "suspect"
+            and (self.path(alias) / "repository.git").exists()
+            for alias, meta in self.repos.items()
+        ):
+            # A failed mutating command gets local reconciliation before the next run.
+            from repoharbor.recovery import recover
+
+            recover(self)
         self.store.data["active_run"] = {"state": "running", "started_at": utcnow()}
         self.store.data["scheduler"]["last_run_started_at"] = utcnow()
         self.store.save()
@@ -189,6 +198,7 @@ class Engine:
                     backup["last_checked_at"] = utcnow()
                     backup["status"] = "up_to_date"
                     meta["source"]["status"] = "available"
+                    meta["errors"]["consecutive"] = 0
                     self.save_meta(alias)
                     return
                 kind = "mirror_update"
@@ -229,7 +239,7 @@ class Engine:
             meta["source"]["status"] = "unavailable"
             # Only internal error codes cross the Git boundary.
             record_error(meta, str(error))
-            if mirror.exists():
+            if operation and mirror.exists():
                 meta["integrity"]["status"] = "suspect"
             self.save_meta(alias)
             if operation:
