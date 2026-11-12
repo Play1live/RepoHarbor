@@ -136,7 +136,13 @@ def test_repair_guards_and_three_attempts(factory, remote, mode, monkeypatch):
         assert attempts == (3 if mode in ("failure", "invalid") else 0)
         repair(engine, "demo")
         assert engine.repos["demo"]["integrity"]["repair_attempts"] == attempts
-        assert engine.repos["demo"]["backup"]["status"] == "repair_failed"
+        expected_status = "repair_paused" if mode == "limited" else "repair_failed"
+        assert engine.repos["demo"]["backup"]["status"] == expected_status
+        if mode == "limited":
+            assert (
+                engine.repos["demo"]["backup"]["repair_deferred"]
+                == "global_limit_paused"
+            )
         assert engine.git.refs(mirror) == before
 
 

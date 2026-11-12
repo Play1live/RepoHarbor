@@ -210,9 +210,12 @@ def repair(engine: Engine, alias: str) -> None:
         return
     capacity = engine.budget.status(alias, engine.path(alias))
     if capacity:
-        backup["status"] = "repair_failed"
         if integrity["repair_attempts"] < engine.config.repair_attempts:
+            backup["status"] = "repair_paused"
             backup["repair_deferred"] = capacity
+        else:
+            backup["status"] = "repair_failed"
+            backup.pop("repair_deferred", None)
         return
     backup.pop("repair_deferred", None)
     mirror = engine.path(alias) / "repository.git"
