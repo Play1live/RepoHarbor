@@ -5,6 +5,10 @@ import json
 import os
 import stat
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -116,7 +120,7 @@ def validate_state(data: dict[str, Any]) -> None:
                     not isinstance(value.get("alias"), str)
                     or not isinstance(value.get("id"), str)
                     or value.get("type")
-                    not in {"initial_clone", "mirror_update", "repair"}
+                    not in {"initial_clone", "mirror_update", "repair", "quarantine"}
                 ):
                     raise ValueError
                 if "git_completed_at" in value and (
@@ -133,6 +137,7 @@ class Store:
         self.root = root
         self.fd: int | None = None
         self.data: dict[str, Any] = {}
+        self._writer = threading.RLock()
 
     def __enter__(self) -> "Store":
         safe_tree(self.root)
@@ -172,7 +177,24 @@ class Store:
             self.fd = None
 
     def save(self) -> None:
-        atomic_json(self.root / "data.json", self.data)
+        with self._writer:
+            atomic_json(self.root / "data.json", self.data)
+
+    @contextmanager
+    def transaction(self) -> Iterator[dict[str, Any]]:
+        """Serialize scheduler and worker changes with their durable writes."""
+        with self._writer:
+            before = deepcopy(self.data)
+            try:
+                yield self.data
+                self.save()
+            except BaseException:
+                self.data = before
+                raise
+
+    def update_operation(self, **values: Any) -> None:
+        with self.transaction() as data:
+            data["active_operation"].update(values)
 
     def begin(self, alias: str, kind: str) -> str:
         operation = {
@@ -182,15 +204,12 @@ class Store:
             "state": "running",
             "started_at": utcnow(),
         }
-        self.data["active_operation"] = operation
-        self.save()
+        with self.transaction() as data:
+            data["active_operation"] = operation
         return str(operation["id"])
 
     def complete(self) -> None:
-        operation = self.data["active_operation"]
-        operation["state"] = "completed"
-        operation["completed_at"] = utcnow()
-        self.save()
+        self.update_operation(state="completed", completed_at=utcnow())
 
 
 def metadata(

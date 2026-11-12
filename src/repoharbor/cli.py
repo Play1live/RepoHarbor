@@ -1,6 +1,7 @@
 """Headless service entrypoint."""
 
 import argparse
+import errno
 import logging
 import os
 import signal
@@ -32,7 +33,10 @@ def verify_mount(root: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> 
 
 def serve(engine: Engine, stop: threading.Event) -> None:
     scheduler = Scheduler(
-        Cron(engine.config.schedule), engine.config.timezone, datetime.now(UTC)
+        Cron(engine.config.schedule),
+        engine.config.timezone,
+        datetime.now(UTC),
+        on_skip=engine.update_skips,
     )
     last_minute = scheduler.last_minute
     workers: list[threading.Thread] = []
@@ -58,8 +62,17 @@ def serve(engine: Engine, stop: threading.Event) -> None:
     for worker in workers:
         worker.join()
     if failures:
+        failure = failures[0]
+        if isinstance(failure, OSError):
+            code = {
+                errno.ENOSPC: "ENOSPC",
+                errno.EIO: "EIO",
+                errno.EACCES: "EACCES",
+            }.get(failure.errno or 0, "FILESYSTEM_ERROR")
+            raise HarborError(
+                f"Backup worker failed: {code}; journal preserved"
+            ) from None
         raise HarborError("Backup worker failed; journal preserved") from None
-    engine.update_skips(scheduler.skipped)
 
 
 def main() -> int:
@@ -92,10 +105,11 @@ def main() -> int:
     except HarborError as error:
         logging.error("%s", error)
         return 1
-    except OSError:
-        # Do not echo environment, paths or remote-controlled exception strings.
-        logging.error(
-            "Startup/state operation failed; check configuration, mount and state"
+    except OSError as error:
+        # No environment, path or remote-controlled exception string is exposed.
+        code = {errno.ENOSPC: "ENOSPC", errno.EIO: "EIO", errno.EACCES: "EACCES"}.get(
+            error.errno or 0, "FILESYSTEM_ERROR"
         )
+        logging.error("%s: startup/state operation failed", code)
         return 1
     return 0

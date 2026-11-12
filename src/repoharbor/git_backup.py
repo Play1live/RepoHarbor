@@ -1,5 +1,6 @@
 """Git subprocess boundary: arguments only, bounded, no inherited credentials/config."""
 
+import contextlib
 import os
 import shutil
 import signal
@@ -11,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from repoharbor.credentials import Credentials
-from repoharbor.errors import HarborError
+from repoharbor.errors import GitError, HarborError
 
 
 class Git:
@@ -50,13 +51,33 @@ class Git:
                         raise HarborError("INTERRUPTED")
                     self.stop.wait(0.1)
                 if process.returncode:
-                    # Remote stderr may contain secrets; never propagate it.
-                    raise HarborError("GIT_FAILED")
+                    # Classify bounded diagnostics; never persist/print their contents.
+                    err.seek(0)
+                    diagnostic = err.read(65536).lower()
+                    if b"no space left on device" in diagnostic:
+                        raise GitError("ENOSPC")
+                    remote = any(
+                        command in args for command in ("clone", "fetch", "ls-remote")
+                    )
+                    unavailable = remote and any(
+                        marker in diagnostic
+                        for marker in (
+                            b"could not resolve host",
+                            b"failed to connect",
+                            b"unable to access",
+                            b"authentication failed",
+                            b"could not read from remote",
+                            b"does not appear to be a git repository",
+                            b"repository not found",
+                        )
+                    )
+                    raise GitError("GIT_FAILED", "unavailable" if unavailable else None)
                 out.seek(0)
                 return out.read().decode("utf-8", errors="replace")
             finally:
                 if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGTERM)
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
                     try:
                         process.wait(timeout=5)
                     except subprocess.TimeoutExpired:

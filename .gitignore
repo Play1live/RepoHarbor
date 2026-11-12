@@ -283,3 +283,6 @@ playwright-report/
 !/docs/CONFIGURATION.md
 !/docs/SECURITY.md
 !/docs/TESTING.md
+
+# Preserved runtime first-clone quarantines
+**/quarantine/initial-clone/

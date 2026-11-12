@@ -69,6 +69,9 @@ class Credentials:
                 "GIT_CONFIG_VALUE_7": "false",
             }
         )
+        if "SSL_CERT_FILE" in env:
+            # libcurl-backed Git needs its own CA setting for the same trusted bundle.
+            env["GIT_SSL_CAINFO"] = env["SSL_CERT_FILE"]
         if name is not None:
             env["REPOHARBOR_ASKPASS_TOKEN"] = self.values[name]
         return env

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from repoharbor.config import Config, Source, canonical_url, identifier
-from repoharbor.errors import HarborError
+from repoharbor.errors import GitError, HarborError
 from repoharbor.git_backup import Git
 from repoharbor.persistence import (
     Store,
@@ -77,6 +77,19 @@ class Engine:
                     ):
                         raise ValueError
                     canonical_url(repo["clone_url"])
+                    if "partial_operation" in backup and not isinstance(
+                        backup["partial_operation"], str
+                    ):
+                        raise ValueError
+                    if "quarantine" in backup:
+                        q = backup["quarantine"]
+                        if (
+                            not isinstance(q, dict)
+                            or q.get("state") not in ("pending", "preserved")
+                            or not isinstance(q.get("operation_id"), str)
+                            or q.get("relative_path") != "quarantine/initial-clone"
+                        ):
+                            raise ValueError
                     if (
                         not isinstance(errors["recent"], list)
                         or len(errors["recent"]) > 20
@@ -135,43 +148,46 @@ class Engine:
     def run(self) -> None:
         safe_tree(self.config.root)
         if any(
-            meta["integrity"]["status"] == "suspect"
-            and (self.path(alias) / "repository.git").exists()
+            (
+                (
+                    meta["integrity"]["status"] in ("suspect", "repairing")
+                    and (self.path(alias) / "repository.git").exists()
+                )
+                or (self.path(alias) / "repository.git.partial").exists()
+                or meta["backup"].get("quarantine", {}).get("state") == "pending"
+                or "manual_attention_required" in meta["backup"]
+                or meta["backup"]["status"] == "repairing"
+            )
             for alias, meta in self.repos.items()
         ):
             # A failed mutating command gets local reconciliation before the next run.
             from repoharbor.recovery import recover
 
             recover(self)
-        self.store.data["active_run"] = {"state": "running", "started_at": utcnow()}
-        self.store.data["scheduler"]["last_run_started_at"] = utcnow()
-        self.store.save()
+        with self.store.transaction() as data:
+            data["active_run"] = {"state": "running", "started_at": utcnow()}
+            data["scheduler"]["last_run_started_at"] = utcnow()
         for source in self.config.sources:
             if self.git.stop.is_set():
                 break
             self.backup(source)
-        self.store.data["active_run"]["state"] = (
-            "interrupted" if self.git.stop.is_set() else "completed"
-        )
-        self.store.data["scheduler"]["last_run_completed_at"] = utcnow()
-        self.store.save()
+        with self.store.transaction() as data:
+            data["active_run"]["state"] = (
+                "interrupted" if self.git.stop.is_set() else "completed"
+            )
+            data["scheduler"]["last_run_completed_at"] = utcnow()
 
     def backup(self, source: Source) -> None:
         alias = source.alias
         meta, folder = self.repos[alias], self.path(alias)
         backup = meta["backup"]
-        if meta["integrity"]["status"] in ("corrupt", "repair_failed", "suspect"):
+        if "manual_attention_required" in backup or meta["integrity"]["status"] in (
+            "corrupt",
+            "repair_failed",
+            "suspect",
+        ):
             return
-        status = self.budget.status(alias, folder)
-        backup["limit_bytes"] = self.config.storage.overrides.get(
-            alias, self.config.storage.repo_bytes
-        )
-        self.store.data["global_storage"] = {
-            "status": status or "available",
-            "last_measured_bytes": usage(self.config.root),
-            "last_measured_at": utcnow(),
-        }
-        self.store.save()
+        status = self.refresh_storage(alias)
         if status:
             backup["status"] = status
             self.save_meta(alias)
@@ -188,6 +204,7 @@ class Engine:
         try:
             if mirror.exists():
                 remote = self.git.remote_refs(source.url, source.credential)
+                meta["source"]["status"] = "available"
                 local = "\n".join(sorted(self.git.refs(mirror).splitlines()))
                 local_head = self.git.head(mirror)
                 head_changed = (
@@ -207,27 +224,25 @@ class Engine:
                 backup["status"] = "initializing"
                 self.save_meta(alias)
             operation = self.store.begin(alias, kind)
+            if kind == "initial_clone":
+                backup["partial_operation"] = operation
+                self.save_meta(alias)
             self.checkpoint("journal")
 
-            def interrupt() -> bool:
-                return self.budget.interrupt(alias, folder)
+            interrupt = self.budget.monitor(alias, folder)
 
             if kind == "initial_clone":
                 self.git.clone(source.url, partial, source.credential, interrupt)
-                self.store.data["active_operation"].update(
-                    git_completed_at=utcnow(), changed=True
-                )
-                self.store.save()
+                self.store.update_operation(git_completed_at=utcnow(), changed=True)
                 self.checkpoint("git")
                 os.rename(partial, mirror)
                 sync_directory(folder)
             else:
                 self.git.fetch(mirror, source.url, source.credential, interrupt)
                 after = "\n".join(sorted(self.git.refs(mirror).splitlines()))
-                self.store.data["active_operation"].update(
+                self.store.update_operation(
                     git_completed_at=utcnow(), changed=(local != after or head_changed)
                 )
-                self.store.save()
                 self.checkpoint("git")
             self.checkpoint("promoted")
             self.finish(alias, self.store.data["active_operation"])
@@ -235,17 +250,49 @@ class Engine:
             self.store.complete()
             logging.info("backup completed: %s", alias)
         except HarborError as error:
-            backup["status"] = "interrupted" if self.git.stop.is_set() else "error"
-            meta["source"]["status"] = "unavailable"
-            # Only internal error codes cross the Git boundary.
-            record_error(meta, str(error))
+            code = str(error)
+            limited = code in {
+                "FREE_SPACE_RESERVE",
+                "global_limit_paused",
+                "repo_limit_reached",
+            }
+            interrupted = self.git.stop.is_set() or code == "INTERRUPTED"
+            backup["status"] = (
+                code if limited else "interrupted" if interrupted else "error"
+            )
+            if isinstance(error, GitError) and error.source_status is not None:
+                meta["source"]["status"] = error.source_status
+            # Intentional stops/budget pauses are not failed Git attempts.
+            if not limited and not interrupted:
+                record_error(meta, code)
             if operation and mirror.exists():
                 meta["integrity"]["status"] = "suspect"
             self.save_meta(alias)
             if operation:
-                self.store.data["active_operation"]["state"] = "interrupted"
-                self.store.save()
+                self.store.update_operation(state="interrupted")
             logging.warning("backup failed: %s", alias)
+        finally:
+            self.refresh_storage(alias, after=True)
+
+    def refresh_storage(self, alias: str, *, after: bool = False) -> str | None:
+        measurement = self.budget.measure(alias, self.path(alias))
+        backup = self.repos[alias]["backup"]
+        backup["size_bytes"] = measurement.repo_bytes
+        backup["limit_bytes"] = self.config.storage.overrides.get(
+            alias, self.config.storage.repo_bytes
+        )
+        backup["storage_status"] = measurement.status or "available"
+        with self.store.transaction() as data:
+            data["global_storage"] = {
+                "status": measurement.global_status or "available",
+                "last_measured_bytes": measurement.global_bytes,
+                "last_measured_at": measurement.measured_at,
+            }
+        if after:
+            if measurement.status and backup["status"] in ("updated", "up_to_date"):
+                backup["status"] = measurement.status
+            self.save_meta(alias)
+        return measurement.status
 
     def finish(self, alias: str, operation: dict[str, Any]) -> None:
         """Replay a durably proven Git completion exactly once."""
@@ -266,11 +313,14 @@ class Engine:
         if operation["changed"]:
             backup["last_updated_at"] = now
             backup["successful_updates"] += 1
+        if operation["type"] == "initial_clone":
+            backup.pop("partial_operation", None)
         meta["source"]["status"] = "available"
         meta["errors"]["consecutive"] = 0
         meta["integrity"]["status"] = "healthy"
         self.save_meta(alias)
 
     def update_skips(self, skipped: int) -> None:
-        self.store.data["scheduler"]["skipped_overlaps"] += skipped
-        self.store.save()
+        with self.store.transaction() as data:
+            data["scheduler"]["skipped_overlaps"] += skipped
+            data["scheduler"]["last_overlap_at"] = utcnow()

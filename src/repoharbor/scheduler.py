@@ -56,27 +56,38 @@ class Cron:
 
 
 class Scheduler:
-    def __init__(self, cron: Cron, timezone: str, initial: datetime):
+    def __init__(
+        self,
+        cron: Cron,
+        timezone: str,
+        initial: datetime,
+        on_skip: Callable[[int], None] | None = None,
+    ):
         self.cron, self.zone = cron, ZoneInfo(timezone)
         self.last_minute = int(initial.timestamp() // 60)
         self.last_local: tuple[int, ...] | None = None
         self.busy = threading.Lock()
         self.skipped = 0
+        self.on_skip = on_skip
+        self._ticks = threading.Lock()
 
     def tick(self, now: datetime, run: Callable[[], None]) -> bool:
-        minute = int(now.timestamp() // 60)
-        if minute <= self.last_minute:
-            return False
-        self.last_minute = minute
-        local = now.astimezone(self.zone)
-        key = (local.year, local.month, local.day, local.hour, local.minute)
-        # fold=1 is the repeated wall-clock minute: run it at most once.
-        if local.fold or key == self.last_local or not self.cron.matches(local):
-            return False
-        self.last_local = key
-        if not self.busy.acquire(blocking=False):
-            self.skipped += 1
-            return False
+        with self._ticks:
+            minute = int(now.timestamp() // 60)
+            if minute <= self.last_minute:
+                return False
+            self.last_minute = minute
+            local = now.astimezone(self.zone)
+            key = (local.year, local.month, local.day, local.hour, local.minute)
+            # fold=1 is the repeated wall-clock minute: run it at most once.
+            if local.fold or key == self.last_local or not self.cron.matches(local):
+                return False
+            self.last_local = key
+            if not self.busy.acquire(blocking=False):
+                if self.on_skip is not None:
+                    self.on_skip(1)
+                self.skipped += 1
+                return False
         try:
             run()
         finally:
