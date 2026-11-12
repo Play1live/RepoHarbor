@@ -1,7 +1,7 @@
 # Changelog
 
-## 0.1.0 — Entwicklungsstand, nicht veröffentlicht
+## 0.1.0 — Development build (not released)
 
-- Manuelle HTTPS-Git-Mirror-Backups mit benannten Env-/File-Credentials, Cron-Zeitplanung ohne Backfill/Overlap sowie weichen Global-/Repo-Speicherbudgets und Freiplatzreserve.
-- Atomare Zustandsdateien, Prozesssperre, Crash-Recovery, begrenzte nicht-destruktive Reparatur und Partial-Quarantäne; kapazitätsbedingt verschobene Reparaturen werden als `repair_paused` statt als endgültig fehlgeschlagen angezeigt. Vorhandene Daten bleiben erhalten.
-- Unprivilegierter Docker-Dienst mit CLI, Compose-/Portainer-Anleitung, Offline-Restore und automatisierten Test-/Security-/Coverage-Gates. Provider-Discovery und Dashboard fehlen; keine Snapshots, LFS-/Submodul-Payloads oder Hosting-Metadaten. Reale NAS-/Portainer-Abnahme und Release-Freigabe stehen aus.
+- Introduced manually configured HTTPS Git mirror backups, named file/environment credentials, scheduled synchronization without catch-up or overlapping runs, and soft global/per-repository storage budgets with a minimum free-space reserve.
+- Added durable JSON journaling and single-writer locking, crash reconciliation, bounded non-destructive repair, and preservation of incomplete initial clones. Storage-blocked repairs are reported as `repair_paused`, separately from exhausted `repair_failed` attempts.
+- Added an unprivileged, headless Docker service, a Compose example and deployment/restore documentation, plus Python 3.12/3.13 CI, integration, fault-injection, coverage, and security checks. Provider discovery, a dashboard, historical snapshots, Git LFS payloads, and hosting metadata are outside this development build.

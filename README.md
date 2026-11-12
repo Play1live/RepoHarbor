@@ -1,72 +1,77 @@
-# RepoHarbor
+<div align="center">
 
-**Automated Git Repository Backup · Entwicklungsstand 0.1.0**
+# ⚓ RepoHarbor
 
-RepoHarbor ist ein Python-Dienst für Git-Mirror-Backups in einem Linux-Container. Er sichert ausdrücklich konfigurierte HTTPS-Quellen auf einem persistenten lokalen Dateisystem, etwa direkt auf einem NAS. **0.1.0 ist ein Entwicklungsstand, kein veröffentlichtes oder für produktiven NAS-Betrieb abgenommenes Release.** Das Image wird derzeit selbst gebaut.
+**A self-hosted Git mirror backup service for Linux, Docker, and NAS storage.**
 
-## Was dieser Stand leistet
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
+![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![Version](https://img.shields.io/badge/Development-0.1.0-64748B)
+[![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
-- Vollständige Bare-Mirrors mit `git clone --mirror`, Referenzvergleich und direkten Updates mit atomarem Fetch und Prune; keine zusätzliche Arbeitskopie im Backup.
-- Manuelle Quellen mit stabilen Aliasnamen, konservativer URL-Deduplizierung und benannten Credentials aus genau einem Modus: `env` oder `file`.
-- Fünffeldriger Cron mit Zeitzone/DST, ohne Nachholen verpasster Termine und ohne parallele oder aufgestaute Sicherungsdurchgänge.
-- Weiche Global-/Repo-Speicherbudgets, Ausnahmen und physische Freiplatzreserve. Ausgeschlossene Quellen, temporäre Daten und Quarantänen zählen weiter mit.
-- Atomare Zustandsdateien, exklusive Prozesssperre, Crash-Reconciliation, begrenzte Reparatur ohne Überschreiben der Git-Referenzen und begrenzte Partial-Quarantäne.
-- Unprivilegierter Docker-Betrieb ohne Web-Listener oder Healthcheck; lokale Git-/HTTPS-, Fault-Injection-, Security- und Docker-Tests mit CI-Gates.
+</div>
 
-GitHub-/GitLab-Repositories können als manuelle HTTPS-Quellen eingetragen werden. **Automatische Provider-Discovery, Anbieter-ID-Deduplizierung, Metadatenfilter, automatische Rename-/Transfer-Erkennung und Web-Dashboard sind noch nicht implementiert.** Optionale Feature-Flags akzeptieren in diesem Stand nur `false`; es gibt keinen zusätzlichen manuellen Backup-Trigger oder Restore-Assistenten.
+RepoHarbor backs up explicitly configured HTTPS Git repositories as local bare mirrors. It runs unattended in a non-root Docker container, with scheduled synchronization, persistent state, storage limits, and crash recovery.
 
-## Einstieg
+**Status:** `0.1.0` is an unreleased development build, not a published image or a production-validated NAS release. Only manual HTTPS sources are supported so far; automatic GitHub/GitLab repository discovery and the web dashboard are not yet implemented.
 
-Für den Containerbetrieb werden ein Linux-Docker-Endpunkt, Docker Compose v2 und ein vorhandener, korrekt gemounteter und beschreibbarer Backup-Pfad benötigt. Python und Git sind im Image enthalten. Die automatisierten Docker-Prüfungen laufen auf Linux/amd64; andere Architekturen und reale NAS-/Portainer-Installationen sind separat abzunehmen.
+## Features
 
-Aus dem Projekt-Root lässt sich zunächst ohne Backup-Mount bauen und die CLI prüfen:
+- **Git mirror backups:** Complete bare mirrors with branch and tag synchronization, pruning, and offline restoration using Git.
+- **Flexible scheduling:** Five-field cron expressions, IANA timezones, daylight-saving handling, and no missed-run backfill or overlapping runs.
+- **Storage controls:** Soft global and per-repository limits, per-repository overrides, and a minimum free-space reserve.
+- **Safe recovery:** Durable operation journals, integrity checks after interruptions, bounded non-destructive repair, and preservation of incomplete clones for inspection.
+- **Credential isolation:** Named credentials from either environment variables or protected files, without embedding tokens in remote URLs.
+- **Headless Docker service:** Non-root execution, no published application port, and no web server or healthcheck in this version.
+
+## Getting started
+
+Build the development image from the repository root and verify the CLI:
 
 ```sh
 docker build -t repoharbor:local-test .
 docker run --rm repoharbor:local-test --version
-docker run --rm -e REPOHARBOR_TOKEN_SOURCE=env \
+docker run --rm \
+  -e REPOHARBOR_TOKEN_SOURCE=env \
   -e 'REPOHARBOR_CONFIG=schema_version: 1' \
   repoharbor:local-test config validate
 ```
 
-`repoharbor:local-test` ist ein lokales Testimage, kein zugesagtes Registry-Image. Vor einem Dienststart die [Deployment-Anleitung](deploy/README.md) durcharbeiten und [deploy/compose.example.yaml](deploy/compose.example.yaml) anpassen. Die Beispielquelle `code.example.org` ist fiktiv. Nach dem Start initialisiert beziehungsweise prüft der Dienst den lokalen Zustand und wartet auf den nächsten zukünftigen Cron-Termin.
+The image tag `repoharbor:local-test` is local and mutable; it is **not** a published registry image. To run the service, prepare a dedicated persistent backup mount, configure your sources and credentials, and follow the [deployment guide](deploy/README.md). The [Compose example](deploy/compose.example.yaml) contains fictional paths and a fictional Git server.
 
-`config validate` prüft Konfiguration und konfigurierte Credentials, startet aber keinen Git-Download und schreibt keine Runtime-Daten. Auch `docker compose config --quiet` ersetzt keinen echten Backup- und Restore-Test.
+### Automatic first-time setup
 
-## Aufbau und Zustand
+**No initialization mode or one-time environment flag is required.** On startup, RepoHarbor checks its persistent backup directory:
 
-Konfiguration/Credentials → Scheduler → sequenzielle Backup-Engine/Git-CLI. Persistenz, Recovery und Speicherüberwachung sind getrennte Module. Eine OS-Dateisperre verhindert eine zweite aktive Instanz am selben Backup-Root.
+- On a new, empty backup root, it automatically creates its state files and repository metadata as needed.
+- On subsequent starts, it loads existing state and performs recovery checks when necessary.
+- It then waits for the next scheduled backup; starting the container does **not** immediately download repositories.
 
-```text
-src/repoharbor/       Konfiguration, Credentials, CLI, Scheduler, Engine,
-                     Git, Speicher, Persistenz und Recovery
-/backups/data.json   Zentrales Lauf-/Operationsjournal und Schedulerzustand
-/backups/manual/<alias>/
-  metadaten.json     Identität, Auswahl, Zeiten, Fehler, Speicher und Integrität
-  repository.git/   Gültiger Bare-Mirror
-  quarantine/       Höchstens ein automatisch bewahrter Erstclone je Quelle
-deploy/             Compose-Beispiel und Betriebsanleitung
-docs/               Konfigurations-, Sicherheits- und Testreferenz
-tests/              Unit-, Git-/HTTPS-, Crash- und Docker-Prüfungen
-scripts/            Separates Coverage-Gate
+The backup root must already exist as a writable, persistent mount. If the state journal is missing from a non-empty backup root, RepoHarbor stops rather than overwriting data. The Compose setting `init: true` is **Docker's process-management feature**, not a RepoHarbor initialization switch, and should remain enabled.
+
+## Backup and recovery
+
+Each repository is stored under `/backups/manual/<alias>/`, with a `repository.git/` bare mirror and a separate `metadaten.json`. The central `/backups/data.json` tracks operations and scheduler state. For example, a mirror can be restored without contacting its original host:
+
+```sh
+git clone --no-hardlinks /path/to/backups/manual/example-demo/repository.git ./restored-demo
 ```
 
-Beim Erstclone kann vorübergehend `repository.git.partial/` existieren. Ein nur strukturell gesundes Partial beweist keinen vollständigen Download. Unklare Fälle bleiben bewahrt und werden als `manual_attention_required` sichtbar; Betreiberaktionen beschreibt die [Sicherheitsreferenz](docs/SECURITY.md).
+**Mirrors are not historical snapshots.** Synchronization reflects deleted refs and force-pushes; RepoHarbor does not back up Git LFS payloads, separate submodule contents, issues, pull/merge requests, or unpushed local changes. Excluded repositories remain stored locally. Interrupted or damaged backups may require manual intervention; existing mirrors are never silently replaced with fresh clones.
 
-## Datensicherheit und Grenzen
+## Documentation
 
-Ein Mirror enthält Git-Objekte und spiegelbare Referenzen einschließlich normaler Commit-Historie. **Er ist kein historischer Backup-Snapshot:** Erfolgreiches Spiegeln übernimmt gelöschte Branches/Tags und Force-Pushes; unerreichbare alte Objekte können später verschwinden. Ein Backup ersetzt keine zusätzliche Strategie gegen unerwünschte Historienänderungen.
+| Topic | Guide |
+|---|---|
+| Docker Compose, Portainer, NAS setup, updates, and restore | [Deployment](deploy/README.md) |
+| Configuration, HTTPS sources, credentials, cron, and storage limits | [Configuration](docs/CONFIGURATION.md) |
+| Data integrity, recovery, quarantine, and security | [Security](docs/SECURITY.md) |
+| Development setup, test suites, coverage, and CI | [Testing](docs/TESTING.md) |
+| Development history | [Changelog](Changelog.md) |
 
-Nicht gesichert werden Git-LFS-Payloads, eigenständige Submodul-Inhalte, Issues, Pull-/Merge-Requests, Hosting-Artefakte oder nie gepushte lokale Daten. Ausgeschlossene oder nicht erreichbare Quellen werden lokal nicht automatisch gelöscht. Nicht mehr verfügbare Git-Objekte können eine Reparatur unmöglich machen.
+## Development and deployment notes
 
-Die Dateisystemgarantien für flock, fsync und atomare Umbenennung müssen erfüllt sein; SMB/NFS werden als aktiver Backup-Root nicht als konsistent garantiert. Ein Container-Bind-Mount beweist **nicht**, dass der gewünschte NAS-Datenträger auf dem Host tatsächlich gemountet ist. Speicherbudgets sind keine harten Quotas. Secrets gehören weder in URLs noch ins Repository; `file` mit geschütztem Read-only-Mount ist die empfohlene Credential-Variante.
+Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 
-## Dokumentation und Entwicklung
-
-- [Docker-/Portainer-Betrieb und Offline-Restore](deploy/README.md)
-- [Konfigurationsschema, Defaults und Auswahl manueller Quellen](docs/CONFIGURATION.md)
-- [Sicherheit, Journal, Recovery und sichere Betreiberaktionen](docs/SECURITY.md)
-- [Tests, Coverage-Gates und CI](docs/TESTING.md)
-- [Changelog des Entwicklungsstands](Changelog.md)
-
-Für lokale Entwicklung: Python 3.12+ und Git. Die CI prüft Python 3.12 und 3.13. Mindestabdeckung: 90 % Lines, 85 % Branches und 95 % Lines je kritischem Modul; die exakten Befehle stehen in der Testreferenz. Releases, Image-Publishing, Merge und produktive Bereitstellung benötigen jeweils eine gesonderte Freigabe.
+Before relying on a backup, verify the host storage mount, permissions, a completed scheduled run, and an **offline restore** on the target system. Automated CI results do not replace NAS/Portainer acceptance testing.

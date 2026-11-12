@@ -1,32 +1,111 @@
-# Configuration contract (foundation, schema 1)
+# Configuration reference (schema 1)
 
-This development version supports manual HTTPS sources, not provider discovery or a dashboard. Run `repoharbor --version`, `repoharbor config validate`, or `repoharbor` (service). Validation reads the configured credentials but does not contact remotes or write backup data. Service startup reconciles local state, then waits for future cron minutes.
+RepoHarbor `0.1.0` is an **unreleased development build**. It supports manually configured HTTPS Git remotes; provider API discovery, dashboard access, and additional optional features are not yet implemented.
 
-Use `deploy/compose.example.yaml` as the stack definition. Before deploying, create the actual persistent backup and secret directories with appropriate UID/GID permissions (image defaults to 10001:10001). Replace the fictional bind paths and source URL. Bind mounts must already exist; the service refuses an unmounted `/backups` in Docker. NAS/Portainer operation requires separate acceptance testing. There is no healthcheck, UI listener, database or initialization flag.
+The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected, rather than silently ignored. The schema requires the integer `schema_version: 1`.
 
-`REPOHARBOR_CONFIG` contains YAML with required integer `schema_version: 1`. Unknown keys fail validation. Supported keys:
+For installation, host mounts, and Portainer instructions, see the [deployment guide](../deploy/README.md). For the supported source and storage behavior, refer to the actual [`deploy/compose.example.yaml`](../deploy/compose.example.yaml) and application source.
 
-| Key | Contract |
-| --- | --- |
-| `schedule` | Five cron fields, default `0 3 * * *`; timezone comes from `TZ` (default UTC). |
-| `credentials` | List of unique lowercase credential names. |
-| `manual_git_urls` | List of objects with required stable `alias` and HTTPS `url`, optional `web_url` and `credential`. |
-| `storage` | `global_gib`, `default_repo_gib`, `overrides` (alias to GiB), `during_transfer` (`finish` or `abort`), `min_free_gib` (default 2). |
-| `recovery` | `automatic_repair` (default true), `max_repair_attempts_per_incident` (integer 1–3, default 3). |
-| `features` | `web_ui`, `integrity_check`, `auto_retry`, `manual_run`, `restore_helper`, `extended_logging`: only false is supported in this development step. |
+## Configuration schema
 
-Budget defaults are unlimited (`null`), except free-space reserve. `0` prohibits starting new operations; one GiB is exactly 1073741824 bytes, fractional values truncate to whole bytes. Overrides replace the repository default. Usage includes excluded sources, journal, metadata, partials and quarantines. These are soft limits; `finish` permits overshoot. Physical reserve or `abort` can stop an active transfer. Git signals are polled every 100 ms; transfer capacity is checked at most once every five seconds. `finish` checks only physically free space during a transfer; `abort` additionally inventories soft budgets. Budgets are freshly measured before and after operations, including the last source, with distinct global and per-repository pause states. Re-measurement at subsequent scheduled runs automatically resumes eligible work. No data is deleted to free space.
+| Key | Supported value and default |
+|---|---|
+| `schema_version` | Required integer `1`. Other versions are rejected. |
+| `schedule` | Five-field cron expression; default `0 3 * * *`. |
+| `credentials` | List of unique lowercase credential identifiers; default `[]`. |
+| `manual_git_urls` | List of manual HTTPS Git sources; default `[]`. Each requires `alias` and `url`; `web_url` and `credential` are optional. |
+| `storage.global_gib` | Soft global size budget in GiB, or `null` for unlimited (default). |
+| `storage.default_repo_gib` | Soft budget per repository in GiB, or `null` for unlimited (default). |
+| `storage.overrides` | Mapping from configured source aliases to replacement per-repository GiB budgets; default `{}`. |
+| `storage.during_transfer` | `finish` (default) or `abort`. |
+| `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
+| `recovery.automatic_repair` | Boolean; default `true`. |
+| `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
+| `features` | Recognizes `web_ui`, `integrity_check`, `auto_retry`, `manual_run`, `restore_helper`, and `extended_logging`; every specified value must be `false` in this build. |
 
-Set `REPOHARBOR_TOKEN_SOURCE` explicitly to `env` or `file`, even for an empty credential list. For credential `example_primary`, env mode reads `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`; file mode reads `/run/secrets/repoharbor/example_primary`. `SSL_CERT_FILE` can point to a trusted CA bundle for private HTTPS instances; TLS verification remains enabled. Secret files are read-only mounted, regular UTF-8 files, with trailing CR/LF removed. A configured secret present in both modes is rejected. Names with `-` map to `_` in env keys; resulting collisions are rejected. Rotation requires a service restart. Optional `REPOHARBOR_SECRETS_DIR` and `REPOHARBOR_BACKUP_ROOT` must be absolute paths.
+An example configuration with invented sources and values:
 
-URLs normalize scheme/hostname and default port, and remove trailing slashes. Path case and `.git` suffix remain significant. Identical normalized URLs use the first alias; conflicting credentials fail. Aliases are stable identities and backup paths (`manual/<alias>`); changing an existing alias URL, or reassigning its URL to another alias, fails closed. Removing a source marks it excluded and keeps its mirror. Adding back the same alias/URL resumes at the next scheduled run. Provider-ID deduplication and rename/transfer handling are future work.
+```yaml
+schema_version: 1
+schedule: "0 3 * * *"
+credentials: [example_primary]
+manual_git_urls:
+  - alias: example-demo
+    url: https://code.example.org/team/demo.git
+    web_url: https://code.example.org/team/demo
+    credential: example_primary
+storage:
+  global_gib: 50
+  default_repo_gib: 2
+  overrides:
+    example-demo: 4
+  during_transfer: finish
+  min_free_gib: 2
+recovery:
+  automatic_repair: true
+  max_repair_attempts_per_incident: 3
+features:
+  web_ui: false
+```
 
-Cron supports stars, numbers, ranges, lists and positive steps. Sunday is 0 or 7. Restricted month-day and weekday use OR semantics. Missing DST wall-clock minutes are skipped; the second occurrence of a repeated minute is skipped. No downtime replay; a tick during an active run is skipped without queuing. Mirrors follow remote deletions and force pushes; they are not historical snapshots.
+`REPOHARBOR_CONFIG` can be provided in a Docker Compose multiline environment entry as in the [example stack](../deploy/compose.example.yaml). Use `repoharbor config validate` to validate the configuration and referenced credentials; this command does **not** download from a remote or create backup state.
 
-Restore offline with `git clone --no-hardlinks /backups/manual/example-demo/repository.git ./restored-demo`. Git objects and normal history are present; LFS payloads, submodule contents and hosting metadata are outside scope.
+## Environment and credential modes
 
-## Repair and operator-visible states
+| Variable | Behavior |
+|---|---|
+| `REPOHARBOR_TOKEN_SOURCE` | **Required:** exactly `env` or `file`, even if no credentials are configured. |
+| `TZ` | IANA timezone for cron; default `UTC`. Example: `Etc/UTC`. |
+| `REPOHARBOR_BACKUP_ROOT` | Absolute backup-root path; default `/backups`. |
+| `REPOHARBOR_SECRETS_DIR` | Absolute secret-file directory; default `/run/secrets/repoharbor`. |
+| `SSL_CERT_FILE` | Optional path to a trusted custom CA bundle for private HTTPS servers; TLS verification remains active. |
 
-A repair blocked only by storage capacity is `backup.status=repair_paused`; `backup.repair_deferred` records `global_limit_paused`, `repo_limit_reached` or `FREE_SPACE_RESERVE`. It consumes no failed attempt and is re-evaluated at the next regular run without a service restart. A running transfer interrupted by a stop or capacity check remains `interrupted`. Exhausted genuine repair attempts remain `repair_failed`, even if capacity is also low; an exhausted incident is not relabeled as a pause. A new or successfully verified repair does not invent a Git-reference update timestamp.
+For a configured credential named `example_primary`:
 
-See the [project overview](../README.md), [deployment guide](../deploy/README.md), [security/recovery guidance](SECURITY.md) and [development changelog](../Changelog.md). Version 0.1.0 is a development build; no published image or production NAS acceptance is implied.
+- In **`env` mode**, the token is read from `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`.
+- In **`file` mode**, the token is read from the regular UTF-8 file `/run/secrets/repoharbor/example_primary`, mounted read-only. Its trailing CR/LF is stripped.
+
+A configured secret found in both the chosen and opposite modes is rejected. Credential names use lowercase letters, digits, `_`, and `-`, and must be unique. Because `-` and `_` map to the same environment variable name, ambiguous names are rejected. Empty or malformed credential values are rejected. Tokens are never intended to be embedded in URLs or persisted in metadata. Credential rotation requires a restart.
+
+## Source identity, selection, and scope
+
+Each `manual_git_urls` entry needs a stable `alias` (for example `example-demo`) and a credential-free `https://` Git URL. The optional `web_url` describes the repository web page; it does not change the Git transport URL.
+
+Source URLs are normalized conservatively: scheme/host case, default HTTPS port, and trailing slashes are normalized; path case and the `.git` suffix remain significant. Query parameters, URL-embedded username/password, unsupported protocols, and suspicious paths are rejected.
+
+Identical normalized URLs are deduplicated using the **first** alias, provided credentials do not conflict. Aliases identify persistent directories under `manual/<alias>`. Reassigning an existing alias to a different URL, or its URL to another alias, fails closed. Removing a source from the configuration marks the existing repository as excluded; it does **not** delete the mirror. Restoring the same alias/URL makes it eligible again on the next scheduled run.
+
+Provider-owned immutable repository IDs, organization/collaborator discovery, property filters, and automatic rename/transfer handling remain future features. The current manual alias is not a provider ID.
+
+## Scheduling and storage behavior
+
+Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts stars, values, lists, ranges, and positive steps. Sunday is `0` or `7`. Restricted day-of-month **and** day-of-week fields use traditional **OR** semantics. An IANA timezone determines local firing times. Missing DST minutes are skipped; a repeated local minute fires at most once. Missed execution times during downtime are not replayed, and ticks during an active backup are skipped without a queue.
+
+Budgets use binary GiB (`1 GiB = 1,073,741,824 bytes`); fractional inputs are truncated to whole bytes. `0` means no new transfer may start. An override replaces the default per-repository budget; it does not add to it. Global usage includes **all** backup-root data, including excluded sources, journals, metadata, partials, and quarantines.
+
+With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh on future scheduled runs. No existing backup is automatically deleted to free space.
+
+## Runtime state and recovery
+
+- `data.json` is the central, durable run/operation journal and scheduler state.
+- `manual/<alias>/metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror.
+- `manual/<alias>/repository.git/` is the valid bare mirror. A partial first clone can exist as `repository.git.partial/`; an interrupted partial may be preserved in `quarantine/initial-clone/`.
+
+| State | Meaning |
+|---|---|
+| `updated` / `up_to_date` | Successful changed mirror or successful no-op remote check. |
+| `global_limit_paused`, `repo_limit_reached`, `FREE_SPACE_RESERVE` | A new operation was withheld by a capacity condition. |
+| `repair_paused` + `repair_deferred` | Repair deferred for storage, without consuming a failed attempt; reevaluated at the next regular run. |
+| `repair_failed` | Genuine exhausted repair attempts or an unrecoverable/unavailable repair condition. |
+| `interrupted` | Operation was interrupted or not proven complete. |
+| `manual_attention_required` | Data-preservation conflict, unknown partial, or occupied/missing quarantine requiring explicit operator action. |
+
+`last_attempt_at`, `last_checked_at`, and `last_updated_at` have different meanings; skipped or failed operations must not create a false successful check or update. Repairs do not themselves imply a new Git reference update. An exhausted genuine repair does not become `repair_paused` simply because free space is also low.
+
+For controlled recovery and operator actions, read [SECURITY.md](SECURITY.md). An offline restore from an intact mirror is performed with Git:
+
+```sh
+git clone --no-hardlinks /backups/manual/example-demo/repository.git ./restored-example
+```
+
+This restores regular Git objects and refs, not LFS payloads, separate submodules, issues, or hosting metadata. See the [deployment guide](../deploy/README.md) and [changelog](../Changelog.md). No published image or production NAS acceptance is implied.
