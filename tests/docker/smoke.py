@@ -31,8 +31,30 @@ def smoke():
         docker("run", "--rm", *env, IMAGE, "config", "validate")
         == "Configuration valid"
     )
+    refused = subprocess.run(
+        ["docker", "run", "--rm", *env, IMAGE],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert refused.returncode == 1
+    assert "dedicated persistent bind mount" in refused.stderr
     with tempfile.TemporaryDirectory() as directory:
         Path(directory).chmod(0o777)
+        assert (
+            docker(
+                "run",
+                "--rm",
+                *env,
+                "--mount",
+                f"type=bind,src={directory},dst=/backups",
+                IMAGE,
+                "config",
+                "validate",
+            )
+            == "Configuration valid"
+        )
+        assert list(Path(directory).iterdir()) == []
         for _ in range(2):
             container = docker(
                 "run",
