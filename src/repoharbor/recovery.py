@@ -115,6 +115,7 @@ def recover(engine: Engine) -> None:
             or integrity["status"] in ("suspect", "repairing")
             or backup["status"] == "repairing"
             or "manual_attention_required" in backup
+            or backup.get("repair_deferred")
         ):
             continue
         if partial.exists():
@@ -140,6 +141,7 @@ def recover(engine: Engine) -> None:
             integrity["status"] = "healthy" if healthy else "corrupt"
             if healthy:
                 integrity["repair_attempts"] = 0
+                backup.pop("repair_deferred", None)
                 if interrupted and active is not None:
                     if active["type"] == "repair":
                         if integrity.get("completed_repair_operation") != active["id"]:
@@ -203,10 +205,16 @@ def repair(engine: Engine, alias: str) -> None:
         source is None
         or meta["selection"]["status"] == "excluded"
         or not engine.config.automatic_repair
-        or engine.budget.status(alias, engine.path(alias))
     ):
         backup["status"] = "repair_failed"
         return
+    capacity = engine.budget.status(alias, engine.path(alias))
+    if capacity:
+        backup["status"] = "repair_failed"
+        if integrity["repair_attempts"] < engine.config.repair_attempts:
+            backup["repair_deferred"] = capacity
+        return
+    backup.pop("repair_deferred", None)
     mirror = engine.path(alias) / "repository.git"
     while integrity["repair_attempts"] < engine.config.repair_attempts:
         if engine.git.stop.is_set():

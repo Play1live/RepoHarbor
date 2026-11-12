@@ -432,3 +432,23 @@ def test_worker_io_failure_reports_code_without_private_exception(factory, monke
         with pytest.raises(HarborError, match="ENOSPC") as caught:
             cli.serve(engine, stop)
         assert "fictional-secret-path" not in str(caught.value)
+
+
+def test_repair_capacity_pause_resumes_at_future_run(factory, monkeypatch):
+    from conftest import git
+
+    with factory() as engine:
+        engine.run()
+        mirror = engine.path("demo") / "repository.git"
+        oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
+        (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        engine.repos["demo"]["integrity"]["status"] = "suspect"
+        engine.save_meta("demo")
+        normal = engine.budget.config
+        engine.budget.config = replace(normal, global_bytes=0)
+        engine.run()
+        assert engine.repos["demo"]["integrity"]["repair_attempts"] == 0
+        engine.budget.config = normal
+        engine.run()
+        assert engine.git.healthy(mirror)
+        assert engine.repos["demo"]["integrity"]["successful_repairs"] == 1

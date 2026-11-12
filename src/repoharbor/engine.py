@@ -157,6 +157,7 @@ class Engine:
                 or meta["backup"].get("quarantine", {}).get("state") == "pending"
                 or "manual_attention_required" in meta["backup"]
                 or meta["backup"]["status"] == "repairing"
+                or meta["backup"].get("repair_deferred")
             )
             for alias, meta in self.repos.items()
         ):
