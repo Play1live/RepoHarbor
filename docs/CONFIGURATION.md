@@ -24,3 +24,9 @@ URLs normalize scheme/hostname and default port, and remove trailing slashes. Pa
 Cron supports stars, numbers, ranges, lists and positive steps. Sunday is 0 or 7. Restricted month-day and weekday use OR semantics. Missing DST wall-clock minutes are skipped; the second occurrence of a repeated minute is skipped. No downtime replay; a tick during an active run is skipped without queuing. Mirrors follow remote deletions and force pushes; they are not historical snapshots.
 
 Restore offline with `git clone --no-hardlinks /backups/manual/example-demo/repository.git ./restored-demo`. Git objects and normal history are present; LFS payloads, submodule contents and hosting metadata are outside scope.
+
+## Repair and operator-visible states
+
+A repair blocked only by storage capacity is `backup.status=repair_paused`; `backup.repair_deferred` records `global_limit_paused`, `repo_limit_reached` or `FREE_SPACE_RESERVE`. It consumes no failed attempt and is re-evaluated at the next regular run without a service restart. A running transfer interrupted by a stop or capacity check remains `interrupted`. Exhausted genuine repair attempts remain `repair_failed`, even if capacity is also low; an exhausted incident is not relabeled as a pause. A new or successfully verified repair does not invent a Git-reference update timestamp.
+
+See the [project overview](../README.md), [deployment guide](../deploy/README.md), [security/recovery guidance](SECURITY.md) and [development changelog](../Changelog.md). Version 0.1.0 is a development build; no published image or production NAS acceptance is implied.
