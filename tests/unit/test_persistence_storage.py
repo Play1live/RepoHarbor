@@ -1,6 +1,7 @@
 import errno
 import json
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,54 @@ from repoharbor.persistence import (
     safe_tree,
 )
 from repoharbor.storage import Budget, usage
+
+
+def test_live_measurement_tolerates_removed_file(tmp_path, monkeypatch):
+    victim = tmp_path / "temporary.pack"
+    victim.write_bytes(b"temporary")
+    (tmp_path / "retained.pack").write_bytes(b"retained")
+    is_file = Path.is_file
+
+    def remove_after_check(path):
+        result = is_file(path)
+        if path == victim:
+            path.unlink()
+        return result
+
+    monkeypatch.setattr(Path, "is_file", remove_after_check)
+    budget = Budget(tmp_path, Storage(min_free_bytes=0, during_transfer="abort"))
+    assert budget.monitor("demo", tmp_path)() is False
+    assert usage(tmp_path) == len(b"retained")
+
+
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.EACCES, errno.EIO])
+@pytest.mark.parametrize("phase", ["stat", "walk"])
+def test_measurement_only_ignores_disappearance(tmp_path, monkeypatch, code, phase):
+    victim = tmp_path / "temporary.lock"
+    victim.touch()
+    error = OSError(code, "synthetic")
+    if phase == "stat":
+        stat = Path.stat
+
+        def failing_stat(path, **kwargs):
+            if path == victim and kwargs.get("follow_symlinks", True):
+                raise error
+            return stat(path, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", failing_stat)
+    else:
+
+        def failing_walk(path, onerror):
+            onerror(error)
+            return iter(())
+
+        monkeypatch.setattr("repoharbor.storage.os.walk", failing_walk)
+    if code == errno.ENOENT:
+        assert usage(tmp_path) == 0
+    else:
+        with pytest.raises(OSError) as caught:
+            usage(tmp_path)
+        assert caught.value.errno == code
 
 
 def test_atomic_roundtrip_error_ring_and_lock(tmp_path):

@@ -13,7 +13,8 @@ from repoharbor.persistence import utcnow
 
 
 def walk_error(error: OSError) -> None:
-    raise error
+    if not isinstance(error, FileNotFoundError):
+        raise error
 
 
 def usage(path: Path) -> int:
@@ -21,10 +22,14 @@ def usage(path: Path) -> int:
     for directory, dirs, files in os.walk(path, onerror=walk_error):
         for name in dirs + files:
             p = Path(directory) / name
-            if p.is_symlink():
-                raise HarborError("Symlink in storage tree")
-            if p.is_file():
-                total += p.stat().st_size
+            try:
+                if p.is_symlink():
+                    raise HarborError("Symlink in storage tree")
+                if p.is_file():
+                    total += p.stat().st_size
+            except FileNotFoundError:
+                # Git and atomic journal replacements can remove entries mid-scan.
+                continue
     return total
 
 
