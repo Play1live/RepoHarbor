@@ -12,13 +12,16 @@ from repoharbor.persistence import read_json
 from repoharbor.recovery import recover, repair
 
 
-@pytest.mark.parametrize("kind", ["clone", "update"])
+@pytest.mark.parametrize("kind", ["clone", "update", "detached"])
 @pytest.mark.parametrize("checkpoint", ["journal", "git", "promoted", "metadata"])
 def test_sigkill_at_durable_boundaries(factory, remote, kind, checkpoint):
-    if kind == "update":
+    if kind in ("update", "detached"):
         with factory() as engine:
             engine.run()
-        git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+        if kind == "update":
+            git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+        else:
+            git("update-ref", "--no-deref", "HEAD", "refs/heads/main", cwd=remote[1])
     context = multiprocessing.get_context("fork")
     parent, child = context.Pipe()
 
@@ -55,11 +58,19 @@ def test_sigkill_at_durable_boundaries(factory, remote, kind, checkpoint):
         else:
             assert after["successful_updates"] == before["successful_updates"]
             assert after["last_checked_at"] == before["last_checked_at"]
-        if kind == "update" or checkpoint in ("git", "promoted", "metadata"):
+        if kind in ("update", "detached") or checkpoint in (
+            "git",
+            "promoted",
+            "metadata",
+        ):
             mirror = engine.path("demo") / "repository.git"
             assert engine.git.healthy(mirror)
         if checkpoint in ("git", "promoted", "metadata"):
             assert after["status"] == "updated"
+            if kind == "detached":
+                assert engine.git.head(mirror) == git(
+                    "rev-parse", "HEAD", cwd=remote[1]
+                )
         else:
             assert after["status"] == "interrupted"
         assert read_json(factory.root / "data.json")["recovery"]["last_checked_at"]
@@ -88,11 +99,20 @@ def test_invalid_journal_fails_closed(factory, active):
             recover(engine)
 
 
-def test_real_missing_object_repair_preserves_refs(factory, remote):
+@pytest.mark.parametrize("detached", [False, True])
+def test_real_missing_object_repair_preserves_refs(factory, remote, detached):
+    if detached:
+        work, bare = remote
+        (work / "hello.txt").write_text("detached only\n")
+        git("commit", "-am", "detached", cwd=work)
+        git("push", "origin", "HEAD:refs/heads/temporary", cwd=work)
+        git("update-ref", "--no-deref", "HEAD", "refs/heads/temporary", cwd=bare)
+        git("update-ref", "-d", "refs/heads/temporary", cwd=bare)
     with factory() as engine:
         engine.run()
         mirror = engine.path("demo") / "repository.git"
         old_refs = engine.git.refs(mirror)
+        old_head = engine.git.head(mirror)
         oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
         # Unlink the local hardlink; the remote object remains intact.
         (mirror / "objects" / oid[:2] / oid[2:]).unlink()
@@ -102,6 +122,7 @@ def test_real_missing_object_repair_preserves_refs(factory, remote):
         recover(engine)
         assert engine.git.healthy(mirror)
         assert engine.git.refs(mirror) == old_refs
+        assert engine.git.head(mirror) == old_head
         assert engine.repos["demo"]["integrity"]["successful_repairs"] == 1
         assert engine.repos["demo"]["integrity"]["status"] == "healthy"
 

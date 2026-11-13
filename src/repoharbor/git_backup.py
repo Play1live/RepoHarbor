@@ -97,17 +97,25 @@ class Git:
             fields = line.split()
             if fields[0] == "ref:" and fields[-1] == "HEAD":
                 self.remote_head = fields[1]
+            elif fields[-1] == "HEAD" and self.remote_head is None:
+                self.remote_head = fields[0]
             elif fields[-1].startswith("refs/") and not fields[-1].endswith("^{}"):
                 refs.append(" ".join(fields))
         return "\n".join(sorted(refs))
 
     def head(self, mirror: Path) -> str | None:
+        """Return the symbolic target or the object ID of a detached HEAD."""
         try:
             return self.run(
                 ["-C", str(mirror), "symbolic-ref", "--quiet", "HEAD"]
             ).strip()
         except HarborError:
-            return None
+            try:
+                return self.run(
+                    ["-C", str(mirror), "rev-parse", "--verify", "HEAD"]
+                ).strip()
+            except HarborError:
+                return None
 
     def healthy(self, mirror: Path) -> bool:
         try:
@@ -158,7 +166,22 @@ class Git:
             if repair
             else ["+refs/*:refs/*"]
         )
+        head = self.head(mirror) if repair else self.remote_head
+        if head and not head.startswith("refs/"):
+            refs.append(head)
         args += ["--", url, *refs]
         self.run(args, credential, interrupt)
         if not repair and self.remote_head:
-            self.run(["-C", str(mirror), "symbolic-ref", "HEAD", self.remote_head])
+            if self.remote_head.startswith("refs/"):
+                self.run(["-C", str(mirror), "symbolic-ref", "HEAD", self.remote_head])
+            else:
+                self.run(
+                    [
+                        "-C",
+                        str(mirror),
+                        "update-ref",
+                        "--no-deref",
+                        "HEAD",
+                        self.remote_head,
+                    ]
+                )

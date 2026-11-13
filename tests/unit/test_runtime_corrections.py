@@ -336,7 +336,7 @@ def test_detached_mirror_head_is_supported(factory):
         mirror = engine.path("demo") / "repository.git"
         oid = git("rev-parse", "HEAD", cwd=mirror)
         (mirror / "HEAD").write_text(oid + "\n")
-        assert engine.git.head(mirror) is None
+        assert engine.git.head(mirror) == oid
 
 
 def test_repair_result_replay_does_not_count_again(factory):

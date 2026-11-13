@@ -8,6 +8,38 @@ from repoharbor.persistence import read_json
 from repoharbor.recovery import recover
 
 
+def test_detached_remote_head_updates_restore_and_noop(factory, remote, tmp_path):
+    work, bare = remote
+    with factory() as engine:
+        engine.run()
+        mirror = engine.path("demo") / "repository.git"
+        original_refs = engine.git.refs(mirror)
+        for index in range(2):
+            (work / "hello.txt").write_text(f"detached {index}\n")
+            git("commit", "-am", f"detached {index}", cwd=work)
+            oid = git("rev-parse", "HEAD", cwd=work)
+            git("push", "origin", "HEAD:refs/heads/temporary", cwd=work)
+            git("update-ref", "--no-deref", "HEAD", oid, cwd=bare)
+            git("update-ref", "-d", "refs/heads/temporary", cwd=bare)
+            engine.run()
+            assert engine.git.refs(mirror) == original_refs
+            assert engine.git.head(mirror) == oid
+            assert (mirror / "HEAD").read_text().strip() == oid
+            assert engine.git.healthy(mirror)
+            updates = engine.repos["demo"]["backup"]["successful_updates"]
+            assert updates == index + 2
+            calls = len(engine.git.calls)
+            engine.run()
+            assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+            assert engine.repos["demo"]["backup"]["successful_updates"] == updates
+            assert not any("fetch" in args for args in engine.git.calls[calls:])
+        git("clone", "--no-hardlinks", mirror, tmp_path / "detached-restore")
+        assert (tmp_path / "detached-restore/hello.txt").read_text() == "detached 1\n"
+        git("symbolic-ref", "HEAD", "refs/heads/main", cwd=bare)
+        engine.run()
+        assert engine.git.head(mirror) == "refs/heads/main"
+
+
 def test_mirror_lifecycle_and_offline_restore(factory, remote, tmp_path):
     work, bare = remote
     with factory() as engine:
