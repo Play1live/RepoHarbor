@@ -13,6 +13,7 @@ import pytest
 from conftest import LocalGit, git
 
 from repoharbor.errors import HarborError
+from repoharbor.persistence import read_json
 from repoharbor.recovery import recover, repair
 from repoharbor.scheduler import Cron, Scheduler
 from repoharbor.storage import usage
@@ -494,3 +495,95 @@ def test_active_update_is_reconciled_before_other_source_quarantine(factory, rem
         assert (engine.path("demo") / "quarantine/initial-clone/precious").exists()
         assert engine.repos["other"]["backup"]["successful_updates"] == 1
         assert not any("fetch" in args or "clone" in args for args in engine.git.calls)
+
+
+@pytest.mark.parametrize(
+    "point", ["repair_recovery_metadata", "repair_recovery_journal", "repair_git"]
+)
+def test_paused_repair_journal_handoff_survives_sigkill(factory, tmp_path, point):
+    from repoharbor.config import Source
+
+    config = replace(
+        factory.config,
+        sources=(
+            *factory.config.sources,
+            Source("other", "https://example.org/other.git"),
+        ),
+    )
+    with factory(config) as engine:
+        for alias in engine.repos:
+            mirror = engine.path(alias) / "repository.git"
+            engine.git.clone(config.sources[0].url, mirror, None, lambda: False)
+            oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
+            (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+            engine.repos[alias]["integrity"]["status"] = "suspect"
+            engine.save_meta(alias)
+        engine.store.begin("demo", "repair")
+        engine.store.update_operation(state="interrupted")
+        burden = engine.path("demo") / "preserved-burden"
+        limit = usage(engine.path("demo")) + 16384
+        burden.write_bytes(b"x" * 65536)
+    config = replace(config, storage=replace(config.storage, overrides={"demo": limit}))
+
+    def configured_factory(checkpoint=None):
+        return factory(config, checkpoint=checkpoint)
+
+    def recovery(engine):
+        original = engine.git.fetch
+
+        def fetch(mirror, url, *args, **kwargs):
+            return original(mirror, config.sources[0].url, *args, **kwargs)
+
+        engine.git.fetch = fetch
+        recover(engine)
+
+    kill_at(configured_factory, recovery, point)
+    with factory(config) as engine:
+        for _ in range(3):
+            recovery(engine)
+        assert engine.repos["demo"]["backup"]["status"] == "repair_paused"
+        assert engine.repos["other"]["integrity"]["successful_repairs"] == 1
+        assert engine.store.data["active_operation"]["alias"] == "other"
+        burden.rename(tmp_path / "operator-preserved")
+        for _ in range(3):
+            recovery(engine)
+        for alias in engine.repos:
+            assert engine.git.healthy(engine.path(alias) / "repository.git")
+            assert engine.repos[alias]["integrity"]["successful_repairs"] == 1
+            assert engine.repos[alias]["integrity"]["repair_attempts"] == 0
+            assert engine.repos[alias]["errors"]["total"] == 0
+        assert (tmp_path / "operator-preserved").read_bytes() == b"x" * 65536
+
+
+@pytest.mark.parametrize("phase", ["metadata", "journal"])
+def test_paused_repair_handoff_io_error_keeps_journal(factory, monkeypatch, phase):
+    import repoharbor.engine as engine_module
+
+    mirror, refs = corrupt(factory)
+    with factory() as engine:
+        operation = engine.store.begin("demo", "repair")
+        engine.store.update_operation(state="interrupted")
+        engine.budget.config = replace(engine.budget.config, overrides={"demo": 0})
+        original_begin = engine.store.begin
+        begin = Mock(wraps=original_begin)
+        monkeypatch.setattr(engine.store, "begin", begin)
+        with monkeypatch.context() as local:
+            target, name = (
+                (engine_module, "atomic_json")
+                if phase == "metadata"
+                else (engine.store, "update_operation")
+            )
+            local.setattr(
+                target, name, Mock(side_effect=OSError(errno.EIO, "synthetic"))
+            )
+            with pytest.raises(OSError):
+                recover(engine)
+        begin.assert_not_called()
+        journal = read_json(factory.root / "data.json")["active_operation"]
+        assert journal["id"] == operation and journal["state"] == "interrupted"
+    with factory() as engine:
+        recover(engine)
+        assert engine.git.healthy(mirror)
+        assert engine.git.refs(mirror) == refs
+        assert engine.repos["demo"]["integrity"]["successful_repairs"] == 1
+        assert engine.repos["demo"]["errors"]["total"] == 0

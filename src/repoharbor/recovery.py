@@ -160,13 +160,22 @@ def recover(engine: Engine) -> None:
         engine.save_meta(alias)
         current = store.data["active_operation"]
         if current and current["alias"] == alias:
-            if current["type"] == "repair" and current["state"] == "interrupted":
-                break
+            # save_meta above durably retains suspect/repair_deferred before the
+            # single journal slot can be reused. Recovery will revisit this repo
+            # even after another repository replaces active_operation. A signal
+            # still leaves the operation interrupted and stops the next iteration.
+            paused_repair = (
+                current["type"] == "repair" and current["state"] == "interrupted"
+            )
+            if paused_repair:
+                engine.checkpoint("repair_recovery_metadata")
             if not engine.git.stop.is_set() and current["state"] in (
                 "running",
                 "interrupted",
             ):
                 store.update_operation(state="reconciled", completed_at=utcnow())
+                if paused_repair:
+                    engine.checkpoint("repair_recovery_journal")
     with store.transaction() as data:
         if data["active_run"] and data["active_run"]["state"] == "running":
             data["active_run"]["state"] = "interrupted"
