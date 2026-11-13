@@ -55,11 +55,11 @@ def smoke():
             == "Configuration valid"
         )
         assert list(Path(directory).iterdir()) == []
-        for _ in range(2):
+        for init_args in ([], ["--init"]):
             container = docker(
                 "run",
                 "-d",
-                "--init",
+                *init_args,
                 *env,
                 "--mount",
                 f"type=bind,src={directory},dst=/backups",

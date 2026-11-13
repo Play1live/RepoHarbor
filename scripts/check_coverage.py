@@ -4,7 +4,14 @@ import json
 import sys
 from pathlib import Path
 
-CRITICAL = {"persistence", "recovery", "storage", "credentials", "git_backup"}
+CRITICAL = {
+    "persistence",
+    "recovery",
+    "storage",
+    "credentials",
+    "git_backup",
+    "selection",
+}
 
 
 def percent(covered, total):

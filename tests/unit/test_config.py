@@ -58,7 +58,7 @@ def test_defaults_and_supported_schema():
     [
         {"schema_version": 2},
         {"schema_version": True},
-        {"providers": []},
+        {"providers": [{}]},
         {"credentials": "demo"},
         {"credentials": ["../bad"]},
         {"credentials": ["my-token", "my_token"]},

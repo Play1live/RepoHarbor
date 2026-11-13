@@ -1,14 +1,20 @@
 import subprocess
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from repoharbor.config import Config, Source, Storage
+from repoharbor.config import Config, Provider, Source, Storage
 from repoharbor.credentials import Credentials
 from repoharbor.engine import Engine
 from repoharbor.git_backup import Git
+from repoharbor.github import parse_repository
 from repoharbor.persistence import Store
+from repoharbor.providers import Observation
+from repoharbor.selection import Selection
 
 
 def git(*args, cwd=None):
@@ -85,3 +91,68 @@ def factory(tmp_path, remote):
     create.config = cfg
     create.root = root
     return create
+
+
+@pytest.fixture
+def github_env(factory, remote, monkeypatch):
+    cfg = replace(
+        factory.config,
+        sources=(),
+        credentials=("first", "second"),
+        providers=(Provider("one", "first"), Provider("two", "second")),
+        selection=Selection(mode="all"),
+    )
+    results = {"first": [raw_repo()], "second": [raw_repo()]}
+    client = Mock()
+
+    def discover(provider):
+        return [
+            Observation(parse_repository(r), provider.credential, True)
+            for r in results[provider.credential]
+        ]
+
+    client.discover.side_effect = discover
+    client.request.return_value = (raw_repo(), {})
+    monkeypatch.setattr("repoharbor.engine.GitHub", lambda credentials: client)
+
+    class MappedGit(LocalGit):
+        def __init__(self, bare):
+            super().__init__(bare)
+            self.credentials.values.update(
+                first="fictional-first", second="fictional-second"
+            )
+
+        def run(self, args, credential=None, interrupt=lambda: False):
+            self.calls.append(args.copy())
+            args = [
+                str(self.bare) if a.startswith("https://github.com/") else a
+                for a in args
+            ]
+            return super().run(args, credential, interrupt)
+
+    return SimpleNamespace(
+        config=cfg,
+        create=factory,
+        client=client,
+        results=results,
+        git=lambda: MappedGit(remote[1]),
+        key="github:github.com:17",
+    )
+
+
+def raw_repo(rid=17, owner="fictional", name="project", **extra):
+    return {
+        "id": rid,
+        "owner": {"login": owner, "type": "User"},
+        "name": name,
+        "full_name": f"{owner}/{name}",
+        "clone_url": f"https://github.com/{owner}/{name}.git",
+        "html_url": f"https://github.com/{owner}/{name}",
+        "private": False,
+        "visibility": "public",
+        "fork": False,
+        "archived": False,
+        "default_branch": "main",
+        "created_at": "2026-01-01T00:00:00Z",
+        **extra,
+    }

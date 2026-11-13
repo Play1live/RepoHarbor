@@ -209,7 +209,17 @@ def repair_result(engine: Engine, alias: str, operation: str, healthy: bool) -> 
 def repair(engine: Engine, alias: str) -> None:
     meta = engine.repos[alias]
     integrity, backup = meta["integrity"], meta["backup"]
-    source = next((s for s in engine.config.sources if s.alias == alias), None)
+    candidates = engine.sources if ":" in alias else engine.config.sources
+    source = next((s for s in candidates if s.alias == alias), None)
+    if (
+        source is None
+        and ":" in alias
+        and meta["selection"]["status"] != "excluded"
+        and engine.config.automatic_repair
+    ):
+        backup["status"] = "repair_paused"
+        backup["repair_deferred"] = "DISCOVERY_REQUIRED"
+        return
     if (
         source is None
         or meta["selection"]["status"] == "excluded"
