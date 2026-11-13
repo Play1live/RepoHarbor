@@ -44,9 +44,11 @@ class Cron:
         minute, hour, day, month, weekday = self.fields
         dom = local.day in day
         dow = (local.weekday() + 1) % 7 in {v % 7 for v in weekday}
-        date_match = (
-            (dom or dow) if self.raw[2] != "*" and self.raw[4] != "*" else dom and dow
-        )
+        # Vixie cron: a day field beginning with '*' (including steps/lists)
+        # selects AND semantics. Explicit ranges/lists retain OR semantics,
+        # even when their expanded values cover every possible day.
+        wildcard_day = self.raw[2].startswith("*") or self.raw[4].startswith("*")
+        date_match = (dom and dow) if wildcard_day else (dom or dow)
         return (
             local.minute in minute
             and local.hour in hour
