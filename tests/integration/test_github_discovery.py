@@ -7,7 +7,7 @@ import pytest
 from conftest import git, raw_repo
 
 from repoharbor.config import Source, Storage
-from repoharbor.errors import HarborError
+from repoharbor.errors import GitError, HarborError
 from repoharbor.github import DiscoveryError, parse_repository
 from repoharbor.persistence import atomic_json, read_json
 from repoharbor.providers import Observation
@@ -67,12 +67,117 @@ def test_new_excluded_unavailable_and_reincluded_keep_mirror(github_env):
         engine.config = env.config
         before = copy.deepcopy(engine.repos[env.key]["backup"])
         engine.run()
-        assert engine.repos[env.key]["source"]["status"] == "unavailable"
+        assert engine.repos[env.key]["source"]["discovery_status"] == "unavailable"
+        assert engine.repos[env.key]["source"]["status"] == "available"
         assert engine.repos[env.key]["backup"] == before
         env.results["second"] = [raw_repo()]
         engine.run()
         assert engine.repos[env.key]["backup"]["status"] == "up_to_date"
         assert mirror.stat().st_ino == inode
+
+
+def test_api_rediscovery_and_restart_preserve_git_failure_until_successful_fetch(
+    github_env, remote, monkeypatch
+):
+    env = github_env
+    with env.create(env.config, git_instance=env.git()) as engine:
+        engine.run()
+        with monkeypatch.context() as patch:
+
+            def fail(*args):
+                raise GitError("GIT_FAILED", "unavailable")
+
+            patch.setattr(engine.git, "remote_refs", fail)
+            engine.run()
+        meta = engine.repos[env.key]
+        assert meta["source"]["status"] == "unavailable"
+        assert meta["errors"]["total"] == 1
+        meta["source"]["last_git_error_at"] = "2026-01-02T00:00:00Z"
+        meta["source"]["details"] = {"code": "GIT_FAILED"}
+        engine.save_meta(env.key)
+        before = copy.deepcopy(meta)
+        engine.discover()
+        assert meta is not engine.repos[env.key]
+        expected = {
+            **before["source"],
+            "last_seen_at": engine.repos[env.key]["source"]["last_seen_at"],
+        }
+        assert engine.repos[env.key]["source"] == expected
+        assert engine.repos[env.key]["errors"] == before["errors"]
+        assert engine.repos[env.key]["backup"] == before["backup"]
+        assert read_json(engine.path(env.key) / "metadaten.json")["source"] == expected
+    with env.create(env.config, git_instance=env.git()) as engine:
+        recover(engine)
+        engine.discover()
+        assert engine.repos[env.key]["source"]["status"] == "unavailable"
+        assert engine.repos[env.key]["source"]["details"] == {"code": "GIT_FAILED"}
+        assert engine.repos[env.key]["errors"] == before["errors"]
+        assert not engine.git.calls
+        (remote[0] / "hello.txt").write_text("Git available again\n")
+        git("commit", "-am", "new remote content", cwd=remote[0])
+        git("push", "origin", "main", cwd=remote[0])
+        engine.run()
+        assert any("fetch" in command for command in engine.git.calls)
+        assert engine.repos[env.key]["source"]["status"] == "available"
+        assert engine.repos[env.key]["source"]["details"] == {"code": "GIT_FAILED"}
+        assert engine.repos[env.key]["errors"]["total"] == 1
+        assert engine.repos[env.key]["errors"]["consecutive"] == 0
+
+
+@pytest.mark.parametrize("status", ["unknown", "unavailable"])
+@pytest.mark.parametrize(
+    "skip", ["repo_limit", "global_limit", "excluded", "visibility"]
+)
+def test_skipped_git_access_never_promotes_api_observation_to_git_success(
+    github_env, status, skip
+):
+    env = github_env
+    with env.create(env.config, git_instance=env.git()) as engine:
+        engine.discover()
+        assert engine.repos[env.key]["source"]["status"] == "unknown"
+        engine.repos[env.key]["source"].update(status=status, existing_note="preserve")
+        engine.save_meta(env.key)
+    cfg = env.config
+    if skip == "repo_limit":
+        cfg = replace(cfg, storage=replace(cfg.storage, overrides={env.key: 0}))
+    elif skip == "global_limit":
+        cfg = replace(cfg, storage=replace(cfg.storage, global_bytes=0))
+    elif skip == "excluded":
+        cfg = replace(cfg, selection=Selection(mode="all", excluded=(env.key,)))
+    else:
+        cfg = replace(cfg, selection=Selection(mode="all", visibility=("private",)))
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        source = engine.repos[env.key]["source"]
+        assert source["status"] == status
+        assert source["discovery_status"] == "available"
+        assert source["existing_note"] == "preserve"
+        assert source["last_seen_at"]
+        assert not engine.git.calls
+        assert engine.repos[env.key]["backup"]["last_checked_at"] is None
+        assert not (engine.path(env.key) / "repository.git").exists()
+        assert read_json(engine.path(env.key) / "metadaten.json")["source"] == source
+
+
+def test_api_failure_and_absence_do_not_rewrite_last_confirmed_git_status(github_env):
+    env = github_env
+    with env.create(env.config, git_instance=env.git()) as engine:
+        engine.run()
+        before = copy.deepcopy(engine.repos[env.key]["source"])
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                env.client.discover,
+                "side_effect",
+                DiscoveryError("GITHUB_UNAUTHORIZED"),
+            )
+            engine.run()
+        assert engine.repos[env.key]["source"] == before
+        env.results["first"] = env.results["second"] = []
+        engine.run()
+        assert engine.repos[env.key]["source"] == {
+            **before,
+            "discovery_status": "unavailable",
+        }
 
 
 def test_failure_of_second_token_preserves_all_selection_and_runs_manual(

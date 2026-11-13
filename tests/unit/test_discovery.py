@@ -434,10 +434,52 @@ def test_registry_dedup_rename_filters_and_credential_order():
     metas, sources = plan(excluded, proposed, [observation(renamed)], set())
     assert sources == () and metas[key]["selection"]["reason"] == "explicit_exclusion"
     unavailable, sources = plan(cfg, proposed, [], set())
-    assert sources == () and unavailable[key]["source"]["status"] == "unavailable"
+    assert sources == ()
+    assert unavailable[key]["source"]["discovery_status"] == "unavailable"
+    assert unavailable[key]["source"]["status"] == "unknown"
     assert unavailable[key]["selection"]["status"] == "included"
     disabled, _ = plan(replace(cfg, providers=()), proposed, [], set())
     assert disabled[key]["selection"]["reason"] == "provider_disabled"
+
+
+@pytest.mark.parametrize("status", ["unknown", "unavailable", "available"])
+def test_discovery_preserves_git_status_errors_and_source_extensions(
+    monkeypatch, status
+):
+    known, _ = plan(config(), {}, [observation()], set())
+    key = next(iter(known))
+    previous = {
+        "status": status,
+        "last_seen_at": "2026-01-01T00:00:00Z",
+        "last_git_attempt_at": "2026-01-02T00:00:00Z",
+        "diagnostic": {"code": "GIT_FAILED", "at": "2026-01-02T00:00:00Z"},
+    }
+    known[key]["source"] = copy.deepcopy(previous)
+    known[key]["errors"]["total"] = 1
+    original = copy.deepcopy(known)
+    monkeypatch.setattr("repoharbor.registry.utcnow", lambda: "2026-01-03T00:00:00Z")
+    proposed, _ = plan(config(), known, [observation()], set())
+    assert proposed[key]["source"] == {
+        **previous,
+        "last_seen_at": "2026-01-03T00:00:00Z",
+        "discovery_status": "available",
+    }
+    assert proposed[key]["errors"] == original[key]["errors"]
+    assert known == original
+    absent, sources = plan(config(), proposed, [], set())
+    assert sources == ()
+    assert absent[key]["source"] == {
+        **proposed[key]["source"],
+        "discovery_status": "unavailable",
+    }
+
+
+def test_new_repository_api_success_does_not_confirm_git():
+    proposed, sources = plan(config(), {}, [observation()], set())
+    assert len(sources) == 1
+    assert proposed[sources[0].alias]["source"]["status"] == "unknown"
+    assert proposed[sources[0].alias]["source"]["last_seen_at"]
+    assert proposed[sources[0].alias]["source"]["discovery_status"] == "available"
 
 
 def test_registry_conflicts_and_scope():

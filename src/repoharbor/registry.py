@@ -139,11 +139,13 @@ def plan(
                     "aliases": sorted(aliases),
                 }
             )
-            meta["source"] = {"status": "available", "last_seen_at": utcnow()}
+            # API visibility is not evidence of successful Git access. Preserve
+            # transport status, diagnostics and extensions; only observe the API.
+            meta["source"].update(discovery_status="available", last_seen_at=utcnow())
         else:
             repo = stored_repository(meta, key)
             aliases = set(meta["repository"]["aliases"])
-            meta["source"]["status"] = "unavailable"
+            meta["source"]["discovery_status"] = "unavailable"
         reason = config.selection.reason(
             key, aliases, repo.visibility, repo.fork, repo.archived
         )
