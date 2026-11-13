@@ -10,6 +10,7 @@ import pytest
 import yaml
 from conftest import raw_repo
 
+from repoharbor import __version__
 from repoharbor.config import Config, Provider, Source, load
 from repoharbor.credentials import Credentials
 from repoharbor.errors import HarborError
@@ -254,6 +255,7 @@ def test_transport_secret_scope_size_json_network_and_deadline():
     assert client.request("/user", "first")[0] == {"login": "fictional"}
     request = client.opener.open.call_args.args[0]
     assert request.full_url == "https://api.github.com/user"
+    assert request.get_header("User-agent") == f"RepoHarbor/{__version__}"
     assert request.get_header("Authorization") == "Bearer fictional-secret"
     assert "fictional-secret" not in request.full_url
     assert client.opener.open.call_args.kwargs["timeout"] == 15

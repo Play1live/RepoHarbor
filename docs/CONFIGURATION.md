@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.1.0` is an **unreleased development build**. It supports GitHub.com REST discovery and manually configured HTTPS Git remotes. GitLab, GitHub Enterprise, SSH, dashboard access, and additional optional features are not yet implemented.
+This document covers RepoHarbor `0.2.0`. It supports GitHub.com REST discovery and manually configured HTTPS Git remotes. GitLab, GitHub Enterprise, SSH, dashboard access, and additional optional features are not yet implemented.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected, rather than silently ignored. The schema requires the integer `schema_version: 1`.
 
@@ -142,11 +142,19 @@ Selectors accept a stable key (`github:github.com:123456`) or a canonical addres
 
 Explicit exclusions always apply. Visibility, fork and archive filters apply before explicit selection can permit a repository; provider scopes also constrain the result. Thus explicitly selecting a private repository does not override `visibility: [public]`. `all` and `all_except` both include all in-scope, property-matching repositories except explicit exclusions; `selected` additionally requires a selector match. These provider filters do not infer visibility for arbitrary manual HTTPS sources.
 
-Selection is recomputed at each future scheduled run. New matching repositories become eligible; excluded repositories receive no Git updates or remote repair downloads. A repository absent from a **complete** discovery is marked unavailable and receives no Git access, without claiming deletion or deleting its mirror. Explicit filters can still exclude a known unavailable repository. A later successful rediscovery reuses the same backup.
+Selection is recomputed at each future scheduled run. New matching repositories become eligible; excluded repositories receive no Git updates or remote repair downloads. A repository absent from a **complete** discovery has `source.discovery_status: unavailable` and receives no Git access, without claiming deletion or deleting its mirror. Its last confirmed Git transport status is preserved. Explicit filters can still exclude a known unavailable repository. A later successful rediscovery reuses the same backup.
 
 Any failed token, incomplete pagination, malformed response, network failure or uncertain identity pauses the **entire GitHub part** of that run. No partial global selection is published and no old selection authorizes GitHub remote repair. Independent manual sources continue. A diagnostic is recorded in `data.json.discovery`; rate limits defer further discovery until the persisted retry time and a future scheduled tick. Retry-After/reset are honored with a minimum 60-second cooldown, capped at 24 hours. Other failures are retried at the next normal tick; no backfill or immediate automatic retry loop is added.
 
 Discovery permits at most 1,000 pages per token, 100 repositories per page, 4 MiB per response, a 15-second socket timeout, and a shared 120-second discovery deadline checked between reads/requests. Exceeding a bound is an incomplete discovery, never a successful truncated catalog. Redirects and pagination links to other hosts/endpoints are rejected.
+
+### API observation and Git source status
+
+`source.status` records Git transport availability (`unknown`, `available`, or `unavailable`), independently of API visibility. A newly discovered repository starts with `unknown`; only a successful Git remote query or completed Git operation confirms `available`. A Git access failure remains visible after successful API rediscovery. Exclusion, property filters and storage limits do not confirm Git access or advance backup check/update timestamps.
+
+`source.discovery_status` is an optional, additive field describing presence (`available`) or absence (`unavailable`) in the last complete API discovery. `source.last_seen_at` records the last successful API observation and is updated only when the repository is observed. Discovery preserves other source fields, diagnostics and timestamps. On incomplete discovery neither the previous API observation nor Git status is republished as current; inspect `data.json.discovery` for failure/staleness. None of these fields guarantees current network reachability.
+
+No schema bump or migration is required: existing schema-1 metadata without `discovery_status` loads unchanged and gains that field at the next complete discovery. Earlier overwritten source fields cannot be reconstructed from current metadata; the correction prevents further overwrites. A later successful Git query establishes fresh Git availability.
 
 ### Stable paths and manual conflicts
 
@@ -191,4 +199,4 @@ For controlled recovery and operator actions, read [SECURITY.md](SECURITY.md). A
 git clone --no-hardlinks /backups/manual/example-demo/repository.git ./restored-example
 ```
 
-This restores regular Git objects and refs, not LFS payloads, separate submodules, issues, or hosting metadata. See the [deployment guide](../deploy/README.md) and [changelog](../Changelog.md). No published image or production NAS acceptance is implied.
+This restores regular Git objects and refs, not LFS payloads, separate submodules, issues, or hosting metadata. See the [deployment guide](../deploy/README.md) and [changelog](../Changelog.md). Production NAS acceptance remains an operator task.

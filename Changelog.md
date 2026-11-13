@@ -1,7 +1,13 @@
 # Changelog
 
-## 0.1.0 — Development build (not released)
+## 0.2.0
 
-- Added GitHub.com REST discovery alongside manual HTTPS mirrors: multiple named tokens, stable repository IDs, deduplication, owned/organization/collaborator scopes, explicit selection/exclusion and visibility/fork/archive filters. Renames and transfers preserve the same ID directory; incomplete discovery pauses all GitHub work and manual identity conflicts block automatic adoption.
-- Preserved durable JSON journaling, single-writer locking, sequential cron scheduling without backfill, storage budgets, bounded non-destructive recovery and incomplete-clone quarantine. GitHub remote repair requires a fresh complete selection; existing manual paths, metadata and journals remain compatible.
-- Expanded Python 3.12/3.13 integration, fault-injection, coverage and security checks, plus Docker smoke testing without init. Updated configuration, security, deployment and restore guidance, including NAS-compatible init omission and Vixie cron wildcard/step semantics. GitLab, Enterprise/SSH, the dashboard, historical snapshots, LFS payloads and hosting metadata remain outside this development build.
+- Added scheduled GitHub.com repository discovery with multiple classic/fine-grained tokens, ID-based deduplication, owned/organization/collaborator scopes, explicit selection/exclusion and visibility/fork/archive filters.
+- Added stable ID paths and rename/transfer address history, conservative manual-source conflict handling, bounded REST pagination and persisted rate-limit cooldowns. Incomplete discovery pauses all GitHub updates and remote repairs while independent manual sources continue.
+- Separated API observation from Git transport availability: discovery preserves existing source fields and Git errors, new repositories remain unknown until successful Git access, and API absence changes only the discovery status.
+
+## 0.1.0
+
+- Introduced manually configured HTTPS Git mirror backups, named file/environment credentials, scheduled synchronization without catch-up or overlapping runs, and soft global/per-repository storage budgets with a minimum free-space reserve.
+- Added durable JSON journaling and single-writer locking, crash reconciliation, bounded non-destructive repair, and preservation of incomplete initial clones. Storage-blocked repairs are reported as `repair_paused`, separately from exhausted `repair_failed` attempts.
+- Added an unprivileged, headless Docker service, a Compose example and deployment/restore documentation, plus Python 3.12/3.13 CI, integration, fault-injection, coverage, and security checks. Provider discovery, a dashboard, historical snapshots, Git LFS payloads, and hosting metadata are outside this development build.

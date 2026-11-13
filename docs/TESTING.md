@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.1.0` is an **unreleased development build**. The test suite checks mocked GitHub REST responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash/recovery behavior, and a Linux Docker image. Tests do **not** certify an actual NAS or Portainer deployment.
+This document covers RepoHarbor `0.2.0`. The test suite checks mocked GitHub REST responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash/recovery behavior, and a Linux Docker image. Tests do **not** certify an actual NAS or Portainer deployment.
 
 ## Local prerequisites and commands
 
@@ -39,6 +39,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | GitHub discovery | Multiple overlapping/restricted token lists, configured scopes, all selection modes, filter precedence, fork/archive handling, pagination and rate limits, malformed responses, token/network failures, and manual identity conflicts. |
 | Git integration | First mirror clone, no-op checks, default-branch changes, annotated tags, branch deletion/pruning, force-pushes, remote outages, and offline restore. |
 | HTTPS and credentials | Real local Git smart-HTTP over loopback TLS, a temporary trusted certificate, `GIT_ASKPASS` challenges, both `env` and `file` modes, redaction and token rotation behavior. |
+| Git/API status separation | Git failures survive API rediscovery/restart; new repositories remain unknown; exclusions, visibility filters and global/repository limits cannot confirm Git success; completed Git fetch restores availability; source extensions and timestamps survive discovery. |
 | GitHub persistence | Rename/transfer retains one mirror and counters; exclusion/unavailability preserves data; partial discovery suspends the whole provider; no startup remote repair; publication I/O failures and SIGKILL before/after metadata/Git/journal writes. |
 | Recovery and fault injection | SIGTERM/SIGKILL during clone/fetch/repair, journal checkpoints, metadata writes, interrupted/owned/unowned partials, quarantine replay, bounded repair, and idempotency. |
 | Storage and scheduler | Global/per-repository budgets, free-space reserve, capacity pause/resume, five-second transfer monitoring, DST behavior, missed ticks, and durable overlap counts. |
@@ -91,6 +92,8 @@ For the reviewed development commit `d3d8080` on 2026-11-12, the associated [Git
 ### GitHub discovery validation
 
 The implementation commit `0b54760` was validated locally on Python 3.12.14 and 3.13.5 with **359 passing tests on each**, **98.90% line coverage** and **97.56% branch coverage**. All six critical module gates passed (the lowest was `git_backup` at 97.92% lines). This is a local result, not a claim about a future PR/CI run. The existing historical CI baseline above refers to its own earlier commit.
+
+The source-status correction adds 14 regression cases covering actual Git access failure followed by successful API discovery, exclusion/visibility/storage skips, unknown initial Git status, successful local Git fetch, retained source extensions and timestamps, API absence/failure, and restart with schema-1 metadata. The corrected code passed **373 tests** on Python 3.12 before the version/documentation completion, with **98.90% line** and **97.56% branch coverage** and all coverage gates satisfied. The earlier 359-test result above remains a historical snapshot of its named commit; the final PR commit must pass its own CI run.
 
 Use a separate `COVERAGE_FILE` and report paths if running Python versions concurrently, or isolate each interpreter in its own CI job. For example, using the appropriate virtual environment:
 

@@ -11,6 +11,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+from repoharbor import __version__
 from repoharbor.config import Provider
 from repoharbor.credentials import Credentials
 from repoharbor.errors import HarborError
@@ -99,7 +100,7 @@ class GitHub:
                 "Authorization": "Bearer " + self.credentials.values[credential],
                 "Accept": "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": "RepoHarbor/0.1.0",
+                "User-Agent": f"RepoHarbor/{__version__}",
             },
         )
         try:

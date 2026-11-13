@@ -7,14 +7,14 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Development-0.1.0-64748B)
+![Version](https://img.shields.io/badge/Version-0.2.0-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
 
 RepoHarbor discovers GitHub repositories and backs them up alongside explicitly configured HTTPS Git repositories as local bare mirrors. It runs unattended in a non-root Docker container, with scheduled synchronization, persistent state, storage limits, and crash recovery.
 
-**Status:** `0.1.0` is an unreleased development build, not a published image or a production-validated NAS release. GitHub.com REST discovery and manual HTTPS sources are supported. GitLab, GitHub Enterprise, SSH, and the web dashboard are not yet implemented.
+**Version:** `0.2.0`. GitHub.com REST discovery and manual HTTPS sources are supported. GitLab, GitHub Enterprise, SSH, and the web dashboard are not yet implemented.
 
 ## Features
 
@@ -39,7 +39,7 @@ docker run --rm \
   repoharbor:local-test config validate
 ```
 
-The image tag `repoharbor:local-test` is local and mutable; it is **not** a published registry image. To run the service, prepare a dedicated persistent backup mount, configure your sources and credentials, and follow the [deployment guide](deploy/README.md). The [Compose example](deploy/compose.example.yaml) contains fictional paths and a fictional Git server.
+The image tag `repoharbor:local-test` is local and mutable. To run the service, prepare a dedicated persistent backup mount, configure your sources and credentials, and follow the [deployment guide](deploy/README.md). The [Compose example](deploy/compose.example.yaml) contains fictional paths and a fictional Git server.
 
 ### Automatic first-time setup
 
@@ -74,6 +74,8 @@ GitHub discovery is reevaluated at future scheduled runs. Its safe default is `s
 | Development history | [Changelog](Changelog.md) |
 
 ## Development and deployment notes
+
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.2.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history; GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

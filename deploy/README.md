@@ -1,6 +1,6 @@
-# RepoHarbor 0.1.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.2.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers the **current, unreleased development build**. No real NAS/Portainer deployment has yet been accepted. The commands below are operator instructions, not claims that deployment or a production restore has already been performed. All example hosts, source repositories, paths, and credential names are fictional and must be checked for your environment.
+This guide covers RepoHarbor **0.2.0**. No real NAS/Portainer deployment has yet been accepted. The commands below are operator instructions, not claims that deployment or a production restore has already been performed. All example hosts, source repositories, paths, and credential names are fictional and must be checked for your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.1.0`. `repoharbor:local-test` is a local, mutable **test image**, not a released registry image. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.2.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -141,7 +141,7 @@ git clone --no-hardlinks /path/to/backups/github/github.com/654321/repository.gi
 
 IDs here are fictional. Read the actual ID and path from your metadata. Renames and transfers retain that ID directory. Excluded, unavailable and conflicted mirrors remain stored and count against storage limits.
 
-Inspect `data.json.discovery` when GitHub sources do not run. `GITHUB_UNAUTHORIZED` indicates an invalid/expired token; `GITHUB_FORBIDDEN` indicates insufficient permission; rate-limit, API/network and invalid-page failures pause the entire GitHub part while independent manual sources continue. Rate-limit retry times persist across restart; startup itself does not trigger new discovery. Current GitHub selection must be confirmed before remote repair, so `repair_deferred: DISCOVERY_REQUIRED` can persist until a successful scheduled discovery. These states do not prove remote deletion.
+Inspect `data.json.discovery` when GitHub sources do not run. `GITHUB_UNAUTHORIZED` indicates an invalid/expired token; `GITHUB_FORBIDDEN` indicates insufficient permission; rate-limit, API/network and invalid-page failures pause the entire GitHub part while independent manual sources continue. Rate-limit retry times persist across restart; startup itself does not trigger new discovery. Current GitHub selection must be confirmed before remote repair, so `repair_deferred: DISCOVERY_REQUIRED` can persist until a successful scheduled discovery. These states do not prove remote deletion. API visibility and Git access are separate: `source.discovery_status` and `source.last_seen_at` describe API observation, while `source.status` retains the last confirmed Git transport result. A successful discovery cannot clear a Git failure; new or skipped repositories are not reported as Git-accessible until a successful Git query or operation.
 
 Manual/API identity collisions block automatic assignment (`manual_identity_conflict`). An unresolved manual GitHub address pauses discovery, and a new manual alias for a known provider mirror is withheld (`PROVIDER_IDENTITY_CONFLICT`). Resolve the source configuration without deleting or transferring backup data. Details and limitations are in the [identity rules](../docs/CONFIGURATION.md#stable-paths-and-manual-conflicts).
 

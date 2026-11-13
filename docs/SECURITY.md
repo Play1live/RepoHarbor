@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-RepoHarbor `0.1.0` is an **unreleased development build**. This document describes the implemented protections and their limits. Passing local or CI tests does not certify a production NAS/Portainer installation.
+This document covers RepoHarbor `0.2.0`. This document describes the implemented protections and their limits. Passing local or CI tests does not certify a production NAS/Portainer installation.
 
 ## Trusted storage boundary
 
@@ -23,7 +23,7 @@ Local Git transports are enabled **only in test fixtures**, not as a production 
 
 Discovery uses the official `https://api.github.com` REST endpoint with TLS verification enabled. Tokens are resolved through the same exclusive env/file credential system and sent only in an Authorization header. The API client rejects redirects; pagination is validated against the fixed host/path and expected next page. Git clone targets are reconstructed from validated GitHub owner/name fields and must match the API's canonical GitHub URLs. Remote errors and response bodies are not logged or stored; only fixed error codes are exposed.
 
-Requests have socket/deadline, response-size and page-count bounds. HTTP 401, 403, 404, server failures, malformed responses and primary/secondary rate limits remain distinct from a confirmed deletion. Rate-limit cooldowns are persisted. API visibility is limited by each token's grants; metadata access does not itself prove Git contents access. Git uses the first in-scope configured token and the existing isolated Askpass/HTTPS boundary. There is no automatic Git credential fallback.
+Requests have socket/deadline, response-size and page-count bounds. HTTP 401, 403, 404, server failures, malformed responses and primary/secondary rate limits remain distinct from a confirmed deletion. Rate-limit cooldowns are persisted. API visibility is limited by each token's grants; metadata access does not itself prove Git contents access. Successful discovery updates only `source.last_seen_at` and the separate `source.discovery_status`; it preserves the Git `source.status`, diagnostics and source extensions. New repositories retain unknown Git status until actual successful Git access. Absence from complete discovery changes the API status only; incomplete discovery leaves both observations unchanged. Excluded or storage-limited repositories receive no false Git success confirmation. These additive metadata fields retain schema version 1 and use the existing atomic persistence/recovery path. Git uses the first in-scope configured token and the existing isolated Askpass/HTTPS boundary. There is no automatic Git credential fallback.
 
 The registry deduplicates by provider, host and immutable repository ID, retaining confirmed address history. Contradictory IDs/properties or reuse of a retained address by another ID fail closed. Stable numeric directories avoid moving mirrors on rename/transfer. Arbitrary manual sources keep their original identity contracts. URL equality or a newly resolved API ID does not prove ownership of an old manual mirror: conflicts block automatic assignment and never authorize adoption or overwrite.
 
