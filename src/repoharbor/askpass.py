@@ -6,7 +6,7 @@ import sys
 
 
 def main() -> None:
-    if "username" in sys.argv[1].lower():
+    if sys.argv[1].lower().startswith("username"):
         print("oauth2")
     else:
         print(os.environ.get("REPOHARBOR_ASKPASS_TOKEN", ""))

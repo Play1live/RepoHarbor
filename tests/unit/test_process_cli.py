@@ -17,6 +17,24 @@ from repoharbor.errors import HarborError
 from repoharbor.git_backup import Git
 
 
+@pytest.mark.parametrize(
+    "prompt,expected",
+    [
+        ("Username for 'https://username.example.org': ", "oauth2"),
+        ("Password for 'https://oauth2@username.example.org': ", "test-token"),
+        ("Password for 'https://example.org/username': ", "test-token"),
+        ("USERNAME for 'https://example.org': ", "oauth2"),
+    ],
+)
+def test_askpass_prompt_type_ignores_url(monkeypatch, capsys, prompt, expected):
+    monkeypatch.setenv("REPOHARBOR_ASKPASS_TOKEN", "test-token")
+    monkeypatch.setattr(sys, "argv", ["askpass", prompt])
+    askpass.main()
+    captured = capsys.readouterr()
+    assert captured.out == expected + "\n"
+    assert captured.err == ""
+
+
 def test_askpass(monkeypatch, capsys):
     monkeypatch.setenv("REPOHARBOR_ASKPASS_TOKEN", "fictional-test-token")
     monkeypatch.setattr(sys, "argv", ["askpass", "Username for https://example.org"])

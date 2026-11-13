@@ -22,8 +22,48 @@ from repoharbor.git_backup import Git
 from repoharbor.persistence import Store
 
 
+def test_https_detached_head_only_update(tmp_path, remote, monkeypatch):
+    from repoharbor.config import Config, Source, Storage
+
+    work, bare = remote
+    root = tmp_path / "backups"
+    root.mkdir()
+    with https_remote(tmp_path, bare) as (url, cert, secret, _):
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        cfg = Config(
+            (Source("demo", url, credential="local"),),
+            ("local",),
+            "env",
+            root=root,
+            storage=Storage(min_free_bytes=0),
+        )
+        with Store(root) as store:
+            engine = Engine(
+                cfg, store, Git(Credentials({"local": secret}), threading.Event())
+            )
+            engine.inventory()
+            engine.run()
+            mirror = engine.path("demo") / "repository.git"
+            refs = engine.git.refs(mirror)
+            (work / "hello.txt").write_text("HTTPS detached\n")
+            git("commit", "-am", "detached", cwd=work)
+            oid = git("rev-parse", "HEAD", cwd=work)
+            git("push", "origin", "HEAD:refs/heads/temporary", cwd=work)
+            git("update-ref", "--no-deref", "HEAD", oid, cwd=bare)
+            git("update-ref", "-d", "refs/heads/temporary", cwd=bare)
+            engine.run()
+            assert engine.git.refs(mirror) == refs
+            assert engine.git.head(mirror) == oid
+            assert engine.git.healthy(mirror)
+            assert engine.repos["demo"]["backup"]["successful_updates"] == 2
+    git("clone", "--no-hardlinks", mirror, tmp_path / "https-detached-restore")
+    assert (
+        tmp_path / "https-detached-restore/hello.txt"
+    ).read_text() == "HTTPS detached\n"
+
+
 @contextmanager
-def https_remote(tmp_path, bare):
+def https_remote(tmp_path, bare, hostname="127.0.0.1"):
     cert, key = tmp_path / "server.crt", tmp_path / "server.key"
     subprocess.run(
         [
@@ -42,7 +82,7 @@ def https_remote(tmp_path, bare):
             "-subj",
             "/CN=localhost",
             "-addext",
-            "subjectAltName=IP:127.0.0.1",
+            "subjectAltName=IP:127.0.0.1,DNS:username.example.org",
         ],
         check=True,
         capture_output=True,
@@ -117,7 +157,12 @@ def https_remote(tmp_path, bare):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"https://127.0.0.1:{server.server_port}/{bare.name}", cert, secret, state
+        yield (
+            f"https://{hostname}:{server.server_port}/{bare.name}",
+            cert,
+            secret,
+            state,
+        )
     finally:
         server.shutdown()
         server.server_close()
@@ -126,15 +171,33 @@ def https_remote(tmp_path, bare):
 
 
 @pytest.mark.parametrize("mode", ["env", "file"])
+@pytest.mark.parametrize("hostname", ["127.0.0.1", "username.example.org"])
 def test_https_authentication_and_offline_restore(
-    tmp_path, remote, monkeypatch, caplog, mode
+    tmp_path, remote, monkeypatch, caplog, mode, hostname
 ):
     root = tmp_path / "backups"
     root.mkdir()
     secrets = tmp_path / "secrets"
     secrets.mkdir()
-    with https_remote(tmp_path, remote[1]) as (url, cert, secret, state):
+    with https_remote(tmp_path, remote[1], hostname) as (url, cert, secret, state):
         monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        git_env = Credentials.git_env
+
+        def loopback_env(self, name):
+            env = git_env(self, name)
+            count = int(env["GIT_CONFIG_COUNT"])
+            env.update(
+                {
+                    "GIT_CONFIG_COUNT": str(count + 1),
+                    f"GIT_CONFIG_KEY_{count}": "http.curloptResolve",
+                    f"GIT_CONFIG_VALUE_{count}": (
+                        f"{hostname}:{urlsplit(url).port}:127.0.0.1"
+                    ),
+                }
+            )
+            return env
+
+        monkeypatch.setattr(Credentials, "git_env", loopback_env)
         env = {
             "REPOHARBOR_TOKEN_SOURCE": mode,
             "REPOHARBOR_BACKUP_ROOT": str(root),
