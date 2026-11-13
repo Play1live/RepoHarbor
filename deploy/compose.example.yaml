@@ -3,7 +3,6 @@ services:
     build:
       context: ..
     image: repoharbor:local-test
-    init: true
     user: "10001:10001"
     restart: unless-stopped
     stop_grace_period: 5m

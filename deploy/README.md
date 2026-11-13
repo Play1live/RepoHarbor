@@ -44,7 +44,7 @@ The version command should print `0.1.0`. `repoharbor:local-test` is a local, mu
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
 ```
 
-Do not disable certificate validation. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `init: true`, `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. Do **not** add an application port, healthcheck, or `INITIALIZE_*` environment variable. `init: true` only helps manage child processes.
+Do not disable certificate validation. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. Do **not** add an application port, healthcheck, or `INITIALIZE_*` environment variable. Docker init is intentionally omitted for NAS compatibility: on the tested NAS it prevents startup with `/sbin/docker-init: permission denied`.
 
 ## 3. Configure sources and credentials
 
