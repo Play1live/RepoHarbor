@@ -123,9 +123,31 @@ Supply the interpolated variable through a protected local mechanism or the Port
 
 Multiple named credentials are supported. Each configured source may reference one credential name; for example, `example_primary` maps to `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`. If a private Git server uses its own CA, mount a trusted certificate bundle read-only and set `SSL_CERT_FILE` to its path. TLS verification must remain enabled. See the [configuration reference](../docs/CONFIGURATION.md) for normalization rules, supported fields, and defaults.
 
+### GitHub sources alongside manual sources
+
+GitHub.com REST discovery is available in this development build. Use the complete [GitHub configuration example](../docs/CONFIGURATION.md#github-discovery-and-selection) as the value of `REPOHARBOR_CONFIG`; retain the existing Compose mount, non-root user, restart policy and credential mode. No extra application port, init setting, config-file mount or service is required. GitLab, Enterprise servers, SSH and the dashboard remain unimplemented.
+
+For the example's two credential names, file mode expects `example_personal` and `example_team` in the protected read-only secrets mount. In env mode, supply `REPOHARBOR_TOKEN_EXAMPLE_PERSONAL` and `REPOHARBOR_TOKEN_EXAMPLE_TEAM` securely and omit the secret mount. Do not configure both sources. Never paste real tokens into committed YAML or URLs.
+
+Classic PATs need sufficient repository read access; fine-grained PATs need access to each selected repository plus metadata and contents read permissions. Organization approval or SSO may also be required. Restricted fine-grained tokens do not discover repositories outside their grants, even with `mode: all`. Multiple provider entries reference these existing named credentials; the first in-scope configured provider determines Git authentication.
+
+The default selection is `selected` with an empty list. Choose repositories explicitly or deliberately opt into `all`/`all_except`; configure visibility, forks and archived repositories as needed. Explicit exclusion and property/scope filters always take precedence. Changes take effect after restart and are applied at future scheduled runs.
+
+GitHub mirrors live under `/backups/github/github.com/<repository-id>/`; manual paths remain under `/backups/manual/<alias>/`. Restore an intact discovered mirror offline using the same procedure, for example:
+
+```sh
+git clone --no-hardlinks /path/to/backups/github/github.com/654321/repository.git ./restored-example
+```
+
+IDs here are fictional. Read the actual ID and path from your metadata. Renames and transfers retain that ID directory. Excluded, unavailable and conflicted mirrors remain stored and count against storage limits.
+
+Inspect `data.json.discovery` when GitHub sources do not run. `GITHUB_UNAUTHORIZED` indicates an invalid/expired token; `GITHUB_FORBIDDEN` indicates insufficient permission; rate-limit, API/network and invalid-page failures pause the entire GitHub part while independent manual sources continue. Rate-limit retry times persist across restart; startup itself does not trigger new discovery. Current GitHub selection must be confirmed before remote repair, so `repair_deferred: DISCOVERY_REQUIRED` can persist until a successful scheduled discovery. These states do not prove remote deletion.
+
+Manual/API identity collisions block automatic assignment (`manual_identity_conflict`). An unresolved manual GitHub address pauses discovery, and a new manual alias for a known provider mirror is withheld (`PROVIDER_IDENTITY_CONFLICT`). Resolve the source configuration without deleting or transferring backup data. Details and limitations are in the [identity rules](../docs/CONFIGURATION.md#stable-paths-and-manual-conflicts).
+
 ## 4. Scheduling, limits, and status
 
-`0 3 * * *` means 03:00 every day in `TZ`. Cron uses five fields with numbers, ranges, lists, and steps. When both day-of-month and day-of-week are restricted, the matching semantics are **OR**. Nonexistent DST wall-clock minutes do not run; the repeated minute is run at most once. Missed ticks after downtime are **not** replayed; a scheduled tick during an active run is skipped and recorded durably.
+`0 3 * * *` means 03:00 every day in `TZ`. Cron uses five fields with numbers, ranges, lists, and steps. Following Vixie cron, when either day field begins with `*`, including `*/1`, `*/2`, or a wildcard-leading list, **both** day fields must match. For example, `0 3 */2 * 1` matches Mondays with an odd month day. If neither day field begins with `*`, matching uses **OR**, including explicit full ranges such as `1-31` and `0-7`. See the [configuration reference](../docs/CONFIGURATION.md#scheduling-and-storage-behavior). Nonexistent DST wall-clock minutes do not run; the repeated minute is run at most once. Missed ticks after downtime are **not** replayed; a scheduled tick during an active run is skipped and recorded durably.
 
 Storage values are in GiB (`1 GiB = 1,073,741,824 bytes`). `null` disables an individual soft size budget and `0` prevents starting new operations. Per-repository overrides use stable source aliases. The global budget includes all data in the backup root, including excluded repositories, metadata, journals, partial clones, and quarantine. A per-repository budget counts its entire source directory.
 
