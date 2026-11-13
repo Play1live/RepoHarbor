@@ -1,0 +1,46 @@
+services:
+  repoharbor:
+    build:
+      context: ..
+    image: repoharbor:local-test
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_grace_period: 5m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TZ: Europe/Berlin
+      REPOHARBOR_TOKEN_SOURCE: file
+      REPOHARBOR_CONFIG: |
+        schema_version: 1
+        schedule: "0 3 * * *"
+        credentials: []
+        manual_git_urls:
+          - alias: example-demo
+            url: https://code.example.org/team/demo.git
+            web_url: https://code.example.org/team/demo
+        storage:
+          global_gib: 50
+          default_repo_gib: 2
+          overrides: {}
+          during_transfer: finish
+          min_free_gib: 2
+        recovery:
+          automatic_repair: true
+          max_repair_attempts_per_incident: 3
+        features:
+          web_ui: false
+    volumes:
+      - type: bind
+        source: /srv/repoharbor/backups
+        target: /backups
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /srv/repoharbor/secrets
+        target: /run/secrets/repoharbor
+        read_only: true
+        bind:
+          create_host_path: false
