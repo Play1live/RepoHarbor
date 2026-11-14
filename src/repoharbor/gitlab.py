@@ -122,6 +122,7 @@ def parse_project(value: Any, host: str) -> Repository:
 
 
 class GitLab(GitHub):
+    base = ""
     quota_exhausted = staticmethod(quota_exhausted)
     retry_time = staticmethod(cooldown)
 
@@ -142,6 +143,8 @@ class GitLab(GitHub):
         }
 
     def request(self, path: str, credential: str) -> tuple[Any, Mapping[str, str]]:
+        if not self.base:
+            raise DiscoveryError("GITLAB_UNBOUND_INSTANCE")
         # All callers construct relative, endpoint-specific paths locally.
         if not path.startswith("/") or path.startswith("//") or "#" in path:
             raise DiscoveryError("GITLAB_INVALID_ENDPOINT")

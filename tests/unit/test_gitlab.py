@@ -581,3 +581,11 @@ def test_gitlab_port_directory_roundtrip(gitlab_env):
         assert folder.joinpath("metadaten.json").is_file()
     with env.create(cfg, git_instance=env.git()) as engine:
         assert engine.repos[key]["repository"]["host"] == host
+
+
+def test_unbound_client_cannot_send_private_token_to_inherited_github_base():
+    c = GitLab(Credentials({"first": "fictional-secret"}), request_delay_ms=0)
+    c.opener.open = Mock()
+    with pytest.raises(DiscoveryError, match="GITLAB_UNBOUND_INSTANCE"):
+        c.request("/user", "first")
+    c.opener.open.assert_not_called()
