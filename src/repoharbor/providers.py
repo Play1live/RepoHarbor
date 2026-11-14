@@ -15,12 +15,20 @@ class Repository:
     created_at: str
 
     @property
+    def host(self) -> str:
+        return self.key.split(":", 1)[1].rsplit(":", 1)[0]
+
+    @property
+    def provider(self) -> str:
+        return self.key.split(":", 1)[0]
+
+    @property
     def address(self) -> str:
-        return f"github.com/{self.owner}/{self.name}".lower()
+        return f"{self.host}/{self.owner}/{self.name}".lower()
 
     @property
     def url(self) -> str:
-        return f"https://github.com/{self.owner}/{self.name}.git"
+        return f"https://{self.host}/{self.owner}/{self.name}.git"
 
 
 @dataclass(frozen=True)

@@ -128,6 +128,18 @@ def parse_repository(value: Any) -> Repository:
 
 
 class GitHub:
+    base = BASE
+    quota_exhausted = staticmethod(quota_exhausted)
+    retry_time = staticmethod(retry_time)
+
+    def headers(self, credential: str) -> dict[str, str]:
+        return {
+            "Authorization": "Bearer " + self.credentials.values[credential],
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": f"RepoHarbor/{__version__}",
+        }
+
     def __init__(
         self,
         credentials: Credentials,
@@ -172,27 +184,27 @@ class GitHub:
             finally:
                 self.last_completed = time.monotonic()
 
+    def persist_cooldown(self) -> None:
+        pass
+
     def _request(self, path: str, credential: str) -> tuple[Any, Mapping[str, str]]:
-        req = Request(
-            BASE + path,
-            headers={
-                "Authorization": "Bearer " + self.credentials.values[credential],
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-                "User-Agent": f"RepoHarbor/{__version__}",
-            },
-        )
+        req = Request(self.base + path, headers=self.headers(credential))
         try:
             remaining = self.deadline - time.monotonic()
             if remaining <= 0:
                 raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT")
             with self.opener.open(req, timeout=min(15, remaining)) as response:
+                status = getattr(response, "status", 200)
+                if type(status) is int and status != 200:
+                    raise DiscoveryError("GITHUB_HTTP_ERROR")
                 headers = response.headers
-                if quota_exhausted(headers):
+                if self.quota_exhausted(headers):
                     self.retry_at = max(
                         self.retry_at,
-                        retry_time(headers, time.time(), require_reset=True),
+                        self.retry_time(headers, time.time(), require_reset=True),
                     )
+                if self.retry_at:
+                    self.persist_cooldown()
                 body = bytearray()
                 while True:
                     if time.monotonic() >= self.deadline:
@@ -211,7 +223,7 @@ class GitHub:
                 rate = error.code == 429 or (
                     error.code == 403
                     and (
-                        quota_exhausted(error.headers)
+                        self.quota_exhausted(error.headers)
                         or bool(headers.get("retry-after"))
                         or b"rate limit" in error.read(4096).lower()
                     )
@@ -227,8 +239,10 @@ class GitHub:
                 )
                 if rate:
                     self.retry_at = max(
-                        self.retry_at, retry_time(error.headers, time.time())
+                        self.retry_at, self.retry_time(error.headers, time.time())
                     )
+                if rate:
+                    self.persist_cooldown()
                 retry = self.retry_at if rate else 0
             raise DiscoveryError(code, retry) from None
 

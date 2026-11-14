@@ -6,23 +6,54 @@ from dataclasses import dataclass
 from repoharbor.errors import HarborError
 
 
-def repository_key(value: str) -> str:
-    if not isinstance(value, str) or not re.fullmatch(
-        r"github:github\.com:[1-9][0-9]{0,19}", value
+def instance_host(value: str) -> str:
+    """Canonical DNS authority, optionally with an explicit non-default port."""
+    if not isinstance(value, str) or len(value) > 259:
+        raise HarborError("Invalid GitLab host")
+    match = re.fullmatch(
+        r"([a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::([1-9][0-9]{0,4}))?", value
+    )
+    if not match:
+        raise HarborError("Invalid GitLab host")
+    host, port = match.groups()
+    if (
+        any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", x)
+            for x in host.split(".")
+        )
+        or "." not in host
     ):
+        raise HarborError("Invalid GitLab host")
+    if port and (int(port) > 65535 or port == "443"):
+        raise HarborError("Invalid or noncanonical GitLab port")
+    return value
+
+
+def repository_key(value: str) -> str:
+    if not isinstance(value, str):
         raise HarborError("Invalid provider repository identity")
+    if re.fullmatch(r"github:github\.com:[1-9][0-9]{0,19}", value):
+        return value
+    match = re.fullmatch(r"gitlab:(.+):([1-9][0-9]{0,19})", value)
+    if not match:
+        raise HarborError("Invalid provider repository identity")
+    instance_host(match[1])
     return value
 
 
 def address(value: str) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or len(value) > 4096:
         raise HarborError("Invalid repository selector")
     value = value.removeprefix("https://").rstrip("/")
     if value.endswith(".git"):
         value = value[:-4]
-    if not re.fullmatch(r"github\.com/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", value):
+    host, *parts = value.split("/")
+    instance_host(host)
+    if len(parts) < 2 or any(
+        not re.fullmatch(r"[A-Za-z0-9_.-]+", p) or p in (".", "..") for p in parts
+    ):
         raise HarborError("Invalid repository selector")
-    if value.split("/")[-1] in (".", ".."):
+    if host == "github.com" and len(parts) != 2:
         raise HarborError("Invalid repository selector")
     return value.lower()
 
@@ -30,7 +61,7 @@ def address(value: str) -> str:
 def selector(value: str) -> str:
     return (
         repository_key(value)
-        if isinstance(value, str) and ":" in value and not value.startswith("https://")
+        if isinstance(value, str) and value.startswith(("github:", "gitlab:"))
         else address(value)
     )
 
