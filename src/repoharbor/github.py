@@ -42,10 +42,30 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def retry_time(headers: Mapping[str, str] | Message[str, str], now: float) -> float:
+def normalized_headers(
+    headers: Mapping[str, str] | Message[str, str],
+) -> list[tuple[str, str]]:
+    return [(name.lower(), value.strip()) for name, value in headers.items()]
+
+
+def quota_exhausted(headers: Mapping[str, str] | Message[str, str]) -> bool:
+    # Duplicate contradictory values are conservative: a valid zero wins.
+    # Match digits without converting untrusted, potentially huge integers.
+    return any(
+        name == "x-ratelimit-remaining" and re.fullmatch(r"0+", value)
+        for name, value in normalized_headers(headers)
+    )
+
+
+def retry_time(
+    headers: Mapping[str, str] | Message[str, str],
+    now: float,
+    *,
+    require_reset: bool = False,
+) -> float:
     times = []
-    for name, value in headers.items():
-        name = name.lower()
+    valid_reset = False
+    for name, value in normalized_headers(headers):
         if name not in {"retry-after", "x-ratelimit-reset"}:
             continue
         try:
@@ -64,6 +84,9 @@ def retry_time(headers: Mapping[str, str] | Message[str, str], now: float) -> fl
             times.append(min(now + number, sys.float_info.max))
         elif number > now:
             times.append(number)
+            valid_reset = True
+    if require_reset and not valid_reset:
+        times.append(now + 60)
     # A server cooldown is persisted, not slept here or capped to one day.
     return max(times, default=now + 60)
 
@@ -164,6 +187,12 @@ class GitHub:
             if remaining <= 0:
                 raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT")
             with self.opener.open(req, timeout=min(15, remaining)) as response:
+                headers = response.headers
+                if quota_exhausted(headers):
+                    self.retry_at = max(
+                        self.retry_at,
+                        retry_time(headers, time.time(), require_reset=True),
+                    )
                 body = bytearray()
                 while True:
                     if time.monotonic() >= self.deadline:
@@ -174,16 +203,15 @@ class GitHub:
                         raise DiscoveryError("GITHUB_RESPONSE_TOO_LARGE")
                     if not part:
                         break
-                headers = response.headers
             data = json.loads(body)
             return data, headers
         except HTTPError as error:
             with error:
-                headers = {name.lower(): value for name, value in error.headers.items()}
+                headers = dict(normalized_headers(error.headers))
                 rate = error.code == 429 or (
                     error.code == 403
                     and (
-                        headers.get("x-ratelimit-remaining") == "0"
+                        quota_exhausted(error.headers)
                         or bool(headers.get("retry-after"))
                         or b"rate limit" in error.read(4096).lower()
                     )

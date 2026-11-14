@@ -40,6 +40,7 @@ def test_protocol_read_errors_are_redacted_discovery_failures(status, failure):
     client = GitHub(Credentials({"first": "fictional-secret"}))
     body = Mock()
     body.closed = False
+    body.headers = {}
     body.read.side_effect = failure(b"fictional-secret response body")
     if status == 200:
         body.__enter__ = Mock(return_value=body)
@@ -385,3 +386,98 @@ def test_http_date_and_reset_choose_later_time(github_clock):
         )
         == github_clock.time() + 172800
     )
+
+
+@pytest.mark.parametrize("delay", [0, 250, 1000])
+@pytest.mark.parametrize(
+    "name", ["X-RateLimit-Remaining", "x-ratelimit-remaining", "X-rAtElImIt-ReMaInInG"]
+)
+def test_successful_response_is_returned_but_exhaustion_blocks_next_call(
+    github_clock, github_stop, delay, name
+):
+    client = GitHub(
+        Credentials({"first": "fictional-secret"}),
+        request_delay_ms=delay,
+        stop=github_stop,
+    )
+    until = github_clock.time() + 172800
+    headers = {name: "0", "x-RaTeLiMiT-ReSeT": str(until)}
+    client.opener.open = Mock(
+        return_value=api_response({"login": "fictional"}, headers)
+    )
+    assert client.request("/user", "first") == ({"login": "fictional"}, headers)
+    assert client.retry_at == until
+    with pytest.raises(DiscoveryError, match="RATE_LIMIT") as error:
+        client.request("/user/repos", "first")
+    assert error.value.retry_at == until
+    assert "fictional-secret" not in str(error.value)
+    assert client.opener.open.call_count == 1 and github_stop.waits == []
+
+
+@pytest.mark.parametrize(
+    "remaining", [None, "1", "2500", "bad", "-1", "nan", "inf", "0.0"]
+)
+def test_success_without_valid_zero_remaining_does_not_block(github_clock, remaining):
+    client = GitHub(Credentials({"first": "fictional-secret"}), request_delay_ms=0)
+    headers = {
+        "X-RateLimit-Reset": str(github_clock.time() + 172800),
+        "Retry-After": "120",
+    }
+    if remaining is not None:
+        headers["X-RateLimit-Remaining"] = remaining
+    client.opener.open = Mock(side_effect=[api_response({}, headers), api_response({})])
+    client.request("/user", "first")
+    client.request("/user/repos", "first")
+    assert client.retry_at == 0 and client.opener.open.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "reset", [None, "", "invalid", "-1", "nan", "inf", "1e999", "0"]
+)
+def test_successful_exhaustion_uses_minimum_fallback_for_unusable_reset(
+    github_clock, reset
+):
+    client = GitHub(Credentials({"first": "fictional-secret"}))
+    headers = {"X-RateLimit-Remaining": "0", "Retry-After": "5"}
+    if reset is not None:
+        headers["X-RateLimit-Reset"] = reset
+    client.opener.open = Mock(return_value=api_response({}, headers))
+    assert client.request("/user", "first")[0] == {}
+    assert client.retry_at == github_clock.time() + 60
+
+
+@pytest.mark.parametrize("existing", [0, 360000])
+def test_success_exhaustion_preserves_longer_cooldown_and_conflicting_headers(
+    github_clock,
+    existing,
+):
+    client = GitHub(Credentials({"first": "fictional-secret"}))
+    until = github_clock.time() + 172800
+    headers = Message()
+    headers["X-RateLimit-Remaining"] = "1"
+    headers["x-ratelimit-remaining"] = " 0 "
+    headers["x-ratelimit-reset"] = str(until)
+    headers["X-RateLimit-Reset"] = str(github_clock.time() + 120)
+
+    def respond(*args, **kwargs):
+        client.retry_at = github_clock.time() + existing if existing else 0
+        return api_response({}, headers)
+
+    client.opener.open = Mock(side_effect=respond)
+    client.request("/user", "first")
+    assert client.retry_at == max(until, github_clock.time() + existing)
+
+
+@pytest.mark.parametrize("retry,expected", [("5", 10), ("120", 120)])
+def test_successful_exhaustion_combines_valid_reset_and_retry_after(
+    github_clock, retry, expected
+):
+    client = GitHub(Credentials({"first": "fictional-secret"}))
+    headers = {
+        "X-RateLimit-Remaining": "0",
+        "X-RateLimit-Reset": str(github_clock.time() + 10),
+        "Retry-After": retry,
+    }
+    client.opener.open = Mock(return_value=api_response({}, headers))
+    client.request("/user", "first")
+    assert client.retry_at == github_clock.time() + expected

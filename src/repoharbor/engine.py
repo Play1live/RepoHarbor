@@ -186,6 +186,7 @@ class Engine:
             return
         with self.store.transaction() as data:
             data["discovery"] = {"state": "running", "started_at": utcnow()}
+        client: GitHub | None = None
         try:
             client = GitHub(
                 self.git.credentials,
@@ -208,10 +209,16 @@ class Engine:
         except DiscoveryError as error:
             with self.store.transaction() as data:
                 data["discovery"].update(
-                    state="failed", code=str(error), retry_at=error.retry_at
+                    state="failed",
+                    code=str(error),
+                    retry_at=max(error.retry_at, client.retry_at if client else 0),
                 )
             logging.warning("GitHub discovery skipped: %s", error)
             return
+        if client.retry_at:
+            # Keep a known server cooldown even if metadata publication crashes.
+            with self.store.transaction() as data:
+                data["discovery"]["retry_at"] = client.retry_at
         # Publish no runnable sources until every metadata write is durable. On a
         # crash, startup performs local recovery only; next discovery recomputes all.
         for alias, meta in proposed.items():
@@ -227,7 +234,7 @@ class Engine:
             self.checkpoint("discovery_metadata")
         with self.store.transaction() as data:
             data["discovery"].update(
-                state="completed", completed_at=utcnow(), retry_at=0
+                state="completed", completed_at=utcnow(), retry_at=client.retry_at
             )
         self.sources = self.manual_sources() + sources
 

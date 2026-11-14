@@ -106,6 +106,7 @@ def github_env(factory, remote, monkeypatch):
     )
     results = {"first": [raw_repo()], "second": [raw_repo()]}
     client = Mock()
+    client.retry_at = 0.0
 
     def discover(provider):
         return [

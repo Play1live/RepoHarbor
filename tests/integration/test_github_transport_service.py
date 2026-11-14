@@ -18,6 +18,7 @@ from repoharbor.persistence import read_json
 
 def broken_response():
     response = Mock(closed=False)
+    response.headers = {}
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
     response.read.side_effect = IncompleteRead(b"fictional-secret response body")
@@ -221,3 +222,157 @@ def test_engine_discards_partial_discovery_when_delay_exhausts_deadline(
         assert engine.store.data["discovery"]["state"] == "failed"
         assert engine.store.data["discovery"]["code"] == "GITHUB_DISCOVERY_TIMEOUT"
         assert engine.sources == () and engine.repos == {}
+
+
+@pytest.mark.parametrize("delay", [0, 250, 1000])
+@pytest.mark.parametrize("complete", [False, True])
+def test_http_200_cooldown_persists_complete_or_incomplete_discovery_across_restart(
+    github_env, monkeypatch, github_clock, github_stop, caplog, delay, complete
+):
+    env = github_env
+    cfg = replace(
+        env.config,
+        providers=env.config.providers[:1],
+        discovery=Discovery(delay),
+        sources=(Source("demo", "https://example.org/repo.git"),),
+    )
+    until = github_clock.time() + 172800
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        metadata_path = engine.path(env.key) / "metadaten.json"
+        before = metadata_path.read_bytes()
+        mirror = engine.path(env.key) / "repository.git"
+        inode = mirror.stat().st_ino
+        new_key = "github:github.com:18"
+        headers = {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(until)}
+        if not complete:
+            headers["Link"] = (
+                '<https://api.github.com/user/repos?per_page=100&page=2>; rel="next"'
+            )
+        opener = Mock()
+        opener.open.side_effect = [
+            api_response({"login": "fictional"}),
+            api_response([raw_repo(), raw_repo(18, name="new")], headers),
+        ]
+
+        def create_client(credentials, **kwargs):
+            kwargs["stop"] = github_stop
+            return GitHub(credentials, **kwargs)
+
+        monkeypatch.setattr("repoharbor.engine.GitHub", create_client)
+        monkeypatch.setattr("repoharbor.github.build_opener", lambda *args: opener)
+        monkeypatch.setattr("time.time", github_clock.time)
+        engine.run()
+        state = engine.store.data["discovery"]
+        assert state["state"] == ("completed" if complete else "failed")
+        assert state["retry_at"] == until
+        assert opener.open.call_count == 2
+        assert github_stop.waits == ([delay / 1000] if delay else [])
+        assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+        assert (engine.path(new_key) / "repository.git").exists() == complete
+        assert mirror.stat().st_ino == inode and engine.git.healthy(mirror)
+        if complete:
+            assert {s.alias for s in engine.sources} == {"demo", env.key, new_key}
+        else:
+            assert (
+                engine.sources == cfg.sources and metadata_path.read_bytes() == before
+            )
+            assert new_key not in engine.repos
+        assert read_json(cfg.root / "data.json")["discovery"]["retry_at"] == until
+    snapshot = metadata_path.read_bytes()
+    # A fully completed run retains its success status throughout the cooldown.
+    for elapsed in (90000, 172799):
+        github_clock.elapsed = elapsed
+        with env.create(cfg, git_instance=env.git()) as engine:
+            opener.open.reset_mock()
+            engine.run()
+            opener.open.assert_not_called()
+            assert engine.sources == cfg.sources
+            assert engine.store.data["discovery"] == state
+            assert metadata_path.read_bytes() == snapshot
+            assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+    github_clock.elapsed = 172800
+    opener.open.side_effect = [
+        api_response({"login": "fictional"}),
+        api_response([raw_repo()]),
+    ]
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        assert opener.open.call_count == 2
+        assert engine.store.data["discovery"]["state"] == "completed"
+        assert engine.store.data["discovery"]["retry_at"] == 0
+    assert (
+        "fictional-first" not in caplog.text and "fictional-second" not in caplog.text
+    )
+
+
+@pytest.mark.parametrize("failure", ["invalid_user", "invalid_page", "incomplete_body"])
+def test_http_200_cooldown_survives_failure_after_header_receipt(
+    github_env, monkeypatch, github_clock, caplog, failure
+):
+    env = github_env
+    cfg = replace(env.config, discovery=Discovery(0))
+    until = github_clock.time() + 172800
+    headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(until)}
+    opener = Mock()
+    if failure == "invalid_user":
+        responses = [api_response({}, headers)]
+    elif failure == "invalid_page":
+        responses = [api_response({"login": "fictional"}), api_response({}, headers)]
+    else:
+        response = broken_response()
+        response.headers = headers
+        responses = [response]
+    opener.open.side_effect = responses
+    monkeypatch.setattr("repoharbor.engine.GitHub", GitHub)
+    monkeypatch.setattr("repoharbor.github.build_opener", lambda *args: opener)
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.discover()
+        assert engine.store.data["discovery"]["state"] == "failed"
+        assert engine.store.data["discovery"]["retry_at"] == until
+        assert engine.sources == () and engine.repos == {}
+        assert opener.open.call_count == len(responses)
+    assert "fictional-secret" not in caplog.text and "response body" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    "exhaust_at", ["provider_boundary", "before_identity", "last_identity"]
+)
+def test_http_200_cooldown_applies_across_providers_and_identity_checks(
+    github_env, monkeypatch, github_clock, exhaust_at
+):
+    env = github_env
+    cfg = replace(env.config, discovery=Discovery(0))
+    until = github_clock.time() + 172800
+    headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(until)}
+    complete = exhaust_at == "last_identity"
+    if exhaust_at == "provider_boundary":
+        responses = [
+            api_response({"login": "fictional"}),
+            api_response([raw_repo()], headers),
+        ]
+    else:
+        cfg = replace(
+            cfg,
+            providers=cfg.providers[:1],
+            sources=(Source("manual", "https://github.com/fictional/project.git"),),
+        )
+        responses = [
+            api_response({"login": "fictional"}),
+            api_response([raw_repo()], {} if complete else headers),
+        ]
+        if complete:
+            responses.append(api_response(raw_repo(), headers))
+    opener = Mock()
+    opener.open.side_effect = responses
+    monkeypatch.setattr("repoharbor.engine.GitHub", GitHub)
+    monkeypatch.setattr("repoharbor.github.build_opener", lambda *args: opener)
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.discover()
+        assert engine.store.data["discovery"]["state"] == (
+            "completed" if complete else "failed"
+        )
+        assert engine.store.data["discovery"]["retry_at"] == until
+        assert opener.open.call_count == len(responses)
+        if not complete:
+            assert engine.sources == cfg.sources and env.key not in engine.repos

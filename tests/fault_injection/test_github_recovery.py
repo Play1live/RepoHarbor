@@ -6,7 +6,7 @@ from unittest.mock import Mock
 from urllib.error import HTTPError
 
 import pytest
-from conftest import raw_repo
+from conftest import api_response, raw_repo
 from test_crash_corrections import kill_at
 
 from repoharbor.config import Discovery, Source
@@ -137,3 +137,39 @@ def test_sigkill_after_rate_limit_keeps_long_cooldown_and_existing_mirrors(
         assert meta_path.read_bytes() == before
         assert mirror.stat().st_ino == inode and engine.git.healthy(mirror)
         assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+
+
+def test_sigkill_during_publication_keeps_http_200_cooldown(
+    github_env, monkeypatch, github_clock
+):
+    env = github_env
+    cfg = replace(
+        env.config, discovery=Discovery(0), providers=env.config.providers[:1]
+    )
+    until = github_clock.time() + 172800
+    monkeypatch.setattr("repoharbor.engine.GitHub", GitHub)
+    monkeypatch.setattr("time.time", github_clock.time)
+    opener = Mock()
+    opener.open.side_effect = [
+        api_response({"login": "fictional"}),
+        api_response(
+            [raw_repo()],
+            {"x-ratelimit-remaining": "0", "x-ratelimit-reset": str(until)},
+        ),
+    ]
+    monkeypatch.setattr("repoharbor.github.build_opener", lambda *args: opener)
+
+    def create(**kwargs):
+        return env.create(cfg, git_instance=env.git(), **kwargs)
+
+    kill_at(create, lambda engine: engine.run(), "discovery_metadata")
+    state = read_json(cfg.root / "data.json")["discovery"]
+    assert state["state"] == "running" and state["retry_at"] == until
+    github_clock.elapsed = 90000
+    with create() as engine:
+        recover(engine)
+        engine.run()
+        opener.open.assert_not_called()
+        assert engine.sources == ()
+        assert engine.store.data["discovery"]["retry_at"] == until
+        assert not engine.git.calls
