@@ -600,7 +600,9 @@ def test_disabling_and_reenabling_provider_preserves_known_cooldown(gitlab_env):
         engine.discover()
         assert engine.store.data["provider_discovery"][state_key]["retry_at"] == until
     env.client.discover.reset_mock()
-    with env.create(replace(env.config, providers=()), git_instance=env.git()) as engine:
+    with env.create(
+        replace(env.config, providers=()), git_instance=env.git()
+    ) as engine:
         engine.discover()
         assert engine.store.data["provider_discovery"][state_key]["retry_at"] == until
     with env.create(env.config, git_instance=env.git()) as engine:
