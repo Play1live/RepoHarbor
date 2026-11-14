@@ -7,7 +7,7 @@ from urllib.parse import urlsplit
 from repoharbor.config import Config, Source
 from repoharbor.errors import HarborError
 from repoharbor.github import DiscoveryError, GitHub, parse_repository
-from repoharbor.gitlab import parse_project
+from repoharbor.gitlab import GitLab, parse_project
 from repoharbor.persistence import metadata, utcnow
 from repoharbor.providers import Observation, Repository
 from repoharbor.selection import address, repository_key
@@ -103,6 +103,31 @@ def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[st
                     raise
         else:
             raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED")
+    return result
+
+
+def gitlab_manual_identities(
+    client: GitLab, config: Config, names: set[str], host: str
+) -> set[str]:
+    """Resolve manual identities; only a 404 permits another instance token."""
+    result = set()
+    credentials = list(
+        dict.fromkeys(
+            p.credential
+            for p in config.providers
+            if p.type == "gitlab" and p.host == host
+        )
+    )
+    for name in sorted(names):
+        for credential in credentials:
+            try:
+                result.add(client.manual_identity(name, credential))
+                break
+            except DiscoveryError as error:
+                if str(error) != "GITLAB_NOT_ACCESSIBLE":
+                    raise
+        else:
+            raise DiscoveryError("GITLAB_MANUAL_IDENTITY_UNRESOLVED")
     return result
 
 

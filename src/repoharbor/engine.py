@@ -23,6 +23,7 @@ from repoharbor.persistence import (
     utcnow,
 )
 from repoharbor.registry import (
+    gitlab_manual_identities,
     manual_addresses,
     manual_identities,
     plan,
@@ -240,12 +241,15 @@ class Engine:
         client.on_cooldown = persist_cooldown
         try:
             observations = []
-            manual_ids = set()
             for provider in config.providers:
                 observations.extend(client.discover(provider))
-                # Resolve only with the explicitly bound credential; no fallback chain.
-                for name in sorted(manual_addresses(config, self.repos, host)):
-                    manual_ids.add(client.manual_identity(name, provider.credential))
+            manual_ids = (
+                gitlab_manual_identities(
+                    client, config, manual_addresses(config, self.repos, host), host
+                )
+                if config.providers
+                else set()
+            )
             proposed, sources = plan(
                 config,
                 self.repos,

@@ -1,7 +1,7 @@
 import copy
 import time
 from dataclasses import replace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 from conftest import api_response, git, raw_project, raw_repo
@@ -216,3 +216,295 @@ def test_manual_conflict_limits_removed_provider(gitlab_env):
     with env.create(cfg, git_instance=env.git()) as engine:
         engine.run()
         assert engine.sources == ()
+
+
+@pytest.mark.parametrize("token_count", [2, 3])
+def test_manual_identity_404_uses_later_instance_token_without_duplicate_mirror(
+    gitlab_env, token_count
+):
+    env = gitlab_env
+    host = "gitlab.example.org"
+    names = ("first", "second", "third")[:token_count]
+    cfg = replace(
+        env.config,
+        sources=(Source("manual", f"https://{host}/group/beta.git"),),
+        credentials=names,
+        providers=tuple(
+            Provider(f"provider_{name}", name, type="gitlab", host=host)
+            for name in names
+        ),
+    )
+    alpha = raw_project(17, owner="group", name="alpha", kind="group")
+    beta = raw_project(18, owner="group", name="beta", kind="group")
+    env.results.update({name: [alpha] for name in names})
+    env.results[names[-1]] = [alpha, beta]
+    key = f"gitlab:{host}:18"
+    env.client.manual_identity.side_effect = [
+        *(DiscoveryError("GITLAB_NOT_ACCESSIBLE") for _ in names[:-1]),
+        key,
+    ]
+    transport = env.git()
+    transport.credentials.values["third"] = "fictional-third"
+    with env.create(cfg, git_instance=transport) as engine:
+        engine.run()
+        assert (
+            engine.store.data["provider_discovery"][f"gitlab:{host}"]["state"]
+            == "completed"
+        )
+        assert env.client.manual_identity.call_args_list == [
+            call(f"{host}/group/beta", name) for name in names
+        ]
+        assert engine.repos[key]["selection"]["reason"] == "manual_identity_conflict"
+        assert not (engine.path(key) / "repository.git").exists()
+        assert (engine.path(env.key) / "repository.git").exists()
+        manual = engine.path("manual") / "repository.git"
+        assert engine.git.healthy(manual)
+        assert len(list(cfg.root.rglob("repository.git"))) == 2
+        calls = [c[0] for c in env.client.method_calls]
+        assert max(i for i, c in enumerate(calls) if c == "discover") < min(
+            i for i, c in enumerate(calls) if c == "manual_identity"
+        )
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "GITLAB_NOT_ACCESSIBLE",
+        "GITLAB_UNAUTHORIZED",
+        "GITLAB_FORBIDDEN",
+        "GITLAB_RATE_LIMIT",
+        "GITLAB_INVALID_RESPONSE_OR_NETWORK",
+        "GITLAB_HTTP_ERROR",
+        "GITLAB_INVALID_PROJECT",
+        "GITLAB_INCOMPLETE_PAGINATION",
+    ],
+)
+def test_manual_resolution_failure_preserves_catalog_and_independent_backups(
+    gitlab_env, code, caplog
+):
+    env = gitlab_env
+    host = "gitlab.example.org"
+    state_key = "gitlab:" + host
+    cfg = replace(
+        env.config,
+        sources=(
+            Source("manual", f"https://{host}/group/beta.git"),
+            Source("demo", "https://example.org/repo.git"),
+        ),
+    )
+    alpha = raw_project(17, owner="group", name="alpha", kind="group")
+    beta = raw_project(18, owner="group", name="beta", kind="group")
+    env.results["first"] = env.results["second"] = [alpha, beta]
+    env.client.manual_identity.return_value = f"gitlab:{host}:18"
+    until = time.time() + 3600 if code == "GITLAB_RATE_LIMIT" else 0
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        before = {
+            key: (engine.path(key) / "metadaten.json").read_bytes()
+            for key in engine.repos
+            if key.startswith("gitlab:")
+        }
+        mirrors = {p: p.stat().st_ino for p in cfg.root.rglob("repository.git")}
+        checked = engine.repos["manual"]["backup"]["last_checked_at"]
+        env.client.manual_identity.reset_mock()
+        env.client.manual_identity.side_effect = DiscoveryError(code, until)
+        engine.git.calls.clear()
+        engine.run()
+        state = engine.store.data["provider_discovery"][state_key]
+        assert state["state"] == "failed"
+        expected = (
+            "GITLAB_MANUAL_IDENTITY_UNRESOLVED"
+            if code == "GITLAB_NOT_ACCESSIBLE"
+            else code
+        )
+        assert state["code"] == expected
+        assert state["retry_at"] == until
+        assert env.client.manual_identity.call_args_list == [
+            call(f"{host}/group/beta", credential)
+            for credential in (
+                ("first", "second") if code == "GITLAB_NOT_ACCESSIBLE" else ("first",)
+            )
+        ]
+        assert all(
+            (engine.path(key) / "metadaten.json").read_bytes() == contents
+            for key, contents in before.items()
+        )
+        assert mirrors == {p: p.stat().st_ino for p in cfg.root.rglob("repository.git")}
+        assert engine.sources == cfg.sources
+        assert engine.repos["manual"]["backup"]["last_checked_at"] != checked
+        assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+        assert not any("clone" in args or "fetch" in args for args in engine.git.calls)
+        assert "fictional-first" not in caplog.text
+        assert "fictional-second" not in caplog.text
+    if until:
+        env.client.reset_mock()
+        with env.create(cfg, git_instance=env.git()) as engine:
+            engine.run()
+            env.client.discover.assert_not_called()
+            env.client.manual_identity.assert_not_called()
+            assert (
+                engine.store.data["provider_discovery"][state_key]["retry_at"] == until
+            )
+            assert engine.sources == cfg.sources
+
+
+def test_manual_resolution_after_all_discoveries_and_first_success_stops(gitlab_env):
+    env = gitlab_env
+    host = "gitlab.example.org"
+    cfg = replace(
+        env.config, sources=(Source("manual", f"https://{host}/fictional/project.git"),)
+    )
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        env.client.manual_identity.assert_called_once_with(
+            f"{host}/fictional/project", "first"
+        )
+        assert len(list(cfg.root.rglob("repository.git"))) == 1
+        assert (
+            engine.repos[env.key]["selection"]["reason"] == "manual_identity_conflict"
+        )
+        env.client.reset_mock()
+        env.client.discover.side_effect = [
+            [],
+            DiscoveryError("GITLAB_INCOMPLETE_PAGINATION"),
+        ]
+        engine.run()
+        env.client.manual_identity.assert_not_called()
+        assert engine.store.data["provider_discovery"][f"gitlab:{host}"]["code"] == (
+            "GITLAB_INCOMPLETE_PAGINATION"
+        )
+
+
+def test_manual_resolution_multiple_addresses_and_renamed_identity_conflict(gitlab_env):
+    env = gitlab_env
+    host = "gitlab.example.org"
+    alpha = raw_project(17, owner="group", name="alpha", kind="group")
+    beta = raw_project(18, owner="group", name="beta", kind="group")
+    cfg = replace(
+        env.config,
+        sources=(
+            Source("beta", f"https://{host}/group/beta.git"),
+            Source("old_alpha", f"https://{host}/former/alpha.git"),
+        ),
+    )
+    env.results["first"] = env.results["second"] = [alpha, beta]
+
+    def resolve(name, credential):
+        if credential == "first":
+            raise DiscoveryError("GITLAB_NOT_ACCESSIBLE")
+        return f"gitlab:{host}:" + ("17" if name.endswith("/alpha") else "18")
+
+    env.client.manual_identity.side_effect = resolve
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        assert env.client.manual_identity.call_args_list == [
+            call(name, credential)
+            for name in (f"{host}/former/alpha", f"{host}/group/beta")
+            for credential in ("first", "second")
+        ]
+        assert len(list(cfg.root.rglob("repository.git"))) == 2
+        for key in (env.key, f"gitlab:{host}:18"):
+            assert (
+                engine.repos[key]["selection"]["reason"] == "manual_identity_conflict"
+            )
+            assert not (engine.path(key) / "repository.git").exists()
+        assert {s.alias for s in engine.sources} == {"beta", "old_alpha"}
+
+
+def test_manual_404_exhaustion_does_not_block_other_hosts_or_github(
+    gitlab_env, monkeypatch
+):
+    env = gitlab_env
+    host = "gitlab.example.org"
+    other_host = "other.example.org"
+    cfg = replace(
+        env.config,
+        credentials=env.config.credentials + ("other", "github"),
+        sources=(
+            Source("manual", f"https://{host}/group/beta.git"),
+            Source("other_manual", f"https://{other_host}/group/shared.git"),
+        ),
+        providers=env.config.providers
+        + (
+            Provider("other", "other", type="gitlab", host=other_host),
+            Provider("github", "github"),
+        ),
+    )
+    github = Mock(retry_at=0.0)
+    github.discover.return_value = [
+        Observation(parse_repository(raw_repo()), "github", True)
+    ]
+    monkeypatch.setattr("repoharbor.engine.GitHub", lambda *a, **kw: github)
+    other = Mock(retry_at=0.0)
+    other.discover.return_value = []
+    other.manual_identity.return_value = f"gitlab:{other_host}:19"
+    clients = iter((env.client, other))
+    monkeypatch.setattr("repoharbor.engine.GitLab", lambda *a, **kw: next(clients))
+    env.client.manual_identity.side_effect = DiscoveryError("GITLAB_NOT_ACCESSIBLE")
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.discover()
+        assert env.client.manual_identity.call_args_list == [
+            call(f"{host}/group/beta", "first"),
+            call(f"{host}/group/beta", "second"),
+        ]
+        other.manual_identity.assert_called_once_with(
+            f"{other_host}/group/shared", "other"
+        )
+        states = engine.store.data["provider_discovery"]
+        assert states["gitlab:" + host]["state"] == "failed"
+        assert states["gitlab:" + other_host]["state"] == "completed"
+        assert engine.store.data["discovery"]["state"] == "completed"
+        assert {s.alias for s in engine.sources} == {
+            "manual",
+            "other_manual",
+            "github:github.com:17",
+        }
+
+
+@pytest.mark.parametrize("status", [200, 401, 403, 429, 500])
+def test_real_api_manual_lookup_only_retries_404(gitlab_env, monkeypatch, status):
+    import io
+    from urllib.error import HTTPError
+
+    env = gitlab_env
+    host = "gitlab.example.org"
+    cfg = replace(
+        env.config,
+        sources=(Source("manual", f"https://{host}/fictional/project.git"),),
+        discovery=Discovery(0),
+    )
+    client = GitLab(env.git().credentials, request_delay_ms=0)
+    # Keep provider discovery isolated; manual lookups use the real transport/parser.
+    client.discover = Mock(return_value=[])
+    opener = Mock()
+    first_error = HTTPError("", 404, "fictional-secret", {}, io.BytesIO())
+    second = (
+        api_response(raw_project())
+        if status == 200
+        else HTTPError(
+            "",
+            status,
+            "fictional-secret",
+            {"Retry-After": "3600"} if status == 429 else {},
+            io.BytesIO(),
+        )
+    )
+    opener.open.side_effect = [first_error, second]
+    client.opener = opener
+    monkeypatch.setattr("repoharbor.engine.GitLab", lambda *a, **kw: client)
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.discover()
+        requests = [c.args[0] for c in opener.open.call_args_list]
+        assert [r.get_header("Private-token") for r in requests] == [
+            "fictional-first",
+            "fictional-second",
+        ]
+        assert all(
+            r.full_url.startswith(f"https://{host}/api/v4/projects/") for r in requests
+        )
+        state = engine.store.data["provider_discovery"]["gitlab:" + host]
+        assert state["state"] == ("completed" if status == 200 else "failed")
+        if status == 429:
+            assert state["retry_at"] > time.time() + 3500
+            engine.discover()
+            assert opener.open.call_count == 2
