@@ -7,7 +7,7 @@ import pytest
 from conftest import api_response, git, raw_project, raw_repo
 
 from repoharbor.config import Discovery, Provider, Source, Storage
-from repoharbor.errors import HarborError
+from repoharbor.errors import GitError, HarborError
 from repoharbor.github import DiscoveryError, parse_repository
 from repoharbor.gitlab import GitLab
 from repoharbor.persistence import atomic_json, read_json
@@ -508,3 +508,103 @@ def test_real_api_manual_lookup_only_retries_404(gitlab_env, monkeypatch, status
             assert state["retry_at"] > time.time() + 3500
             engine.discover()
             assert opener.open.call_count == 2
+
+
+@pytest.mark.parametrize("existing_mirror", [False, True])
+def test_missing_default_branch_keeps_discovery_transport_and_persistence_separate(
+    gitlab_env, monkeypatch, existing_mirror
+):
+    from urllib.parse import parse_qs, urlsplit
+
+    env = gitlab_env
+    host = "gitlab.example.org"
+    unknown = raw_project(17, name="restricted")
+    accessible = raw_project(18, name="accessible")
+    filtered = raw_project(19, name="internal", visibility="internal")
+    projects = [unknown, accessible, filtered]
+    cfg = replace(
+        env.config, providers=env.config.providers[:1], discovery=Discovery(0)
+    )
+    monkeypatch.setattr("repoharbor.engine.GitLab", GitLab)
+    opener = Mock()
+
+    def respond(request, **kwargs):
+        url = urlsplit(request.full_url)
+        if url.path == "/api/v4/user":
+            return api_response({"id": 1, "username": "fictional"})
+        if url.path == "/api/v4/projects":
+            return api_response(
+                projects if parse_qs(url.query).get("membership") == ["true"] else []
+            )
+        assert url.path == "/api/v4/groups"
+        return api_response([])
+
+    opener.open.side_effect = respond
+    monkeypatch.setattr("repoharbor.github.build_opener", lambda *a: opener)
+    other_key = f"gitlab:{host}:18"
+    with env.create(cfg, git_instance=env.git()) as engine:
+        mirror = engine.path(env.key) / "repository.git"
+        prior = None
+        if existing_mirror:
+            engine.run()
+            assert engine.git.healthy(mirror)
+            prior = (mirror.stat().st_ino, engine.git.refs(mirror))
+        unknown.pop("default_branch")
+        engine.discover()
+        meta = engine.repos[env.key]
+        assert meta["repository"]["id"] == "17"
+        assert meta["repository"]["default_branch"] is None
+        assert meta["selection"]["status"] == "included"
+        assert meta["source"]["discovery_status"] == "available"
+        assert meta["source"]["status"] == (
+            "available" if existing_mirror else "unknown"
+        )
+        assert engine.repos[f"gitlab:{host}:19"]["selection"]["reason"] == (
+            "visibility_filter"
+        )
+        assert {s.alias for s in engine.sources} == {env.key, other_key}
+
+        run = engine.git.run
+        denied = []
+
+        def deny_git_read(args, credential=None, interrupt=lambda: False):
+            if unknown["http_url_to_repo"] in args and any(
+                command in args for command in ("clone", "ls-remote", "fetch")
+            ):
+                denied.append((args, credential))
+                raise GitError("GIT_FAILED", "unavailable")
+            return run(args, credential, interrupt)
+
+        monkeypatch.setattr(engine.git, "run", deny_git_read)
+        engine.run()
+        assert len(denied) == 1
+        assert denied[0][1] == "first"
+        assert engine.store.data["provider_discovery"]["gitlab:" + host]["state"] == (
+            "completed"
+        )
+        saved = engine.repos[env.key]
+        assert saved["source"]["discovery_status"] == "available"
+        assert saved["source"]["status"] == "unavailable"
+        assert saved["backup"]["status"] == "error"
+        assert saved["errors"]["recent"][-1]["code"] == "GIT_FAILED"
+        assert saved["repository"]["default_branch"] is None
+        other_mirror = engine.path(other_key) / "repository.git"
+        assert engine.git.healthy(other_mirror)
+        assert engine.repos[other_key]["backup"]["status"] == (
+            "up_to_date" if existing_mirror else "updated"
+        )
+        assert engine.store.data["active_run"]["state"] == "completed"
+        if prior:
+            assert (mirror.stat().st_ino, engine.git.refs(mirror)) == prior
+            assert engine.git.healthy(mirror)
+        else:
+            assert not mirror.exists()
+        persisted = read_json(engine.path(env.key) / "metadaten.json")
+        assert persisted["repository"]["default_branch"] is None
+    with env.create(cfg, git_instance=env.git()) as engine:
+        assert engine.repos[env.key]["repository"]["default_branch"] is None
+        assert engine.repos[env.key]["source"]["status"] == "unavailable"
+        assert engine.repos[env.key]["source"]["discovery_status"] == "available"
+        assert engine.repos[env.key]["backup"]["status"] == "error"
+        assert engine.git.healthy(engine.path(other_key) / "repository.git")
+        assert not (engine.path(f"gitlab:{host}:19") / "repository.git").exists()

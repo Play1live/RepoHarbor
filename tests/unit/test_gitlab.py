@@ -609,3 +609,50 @@ def test_disabling_and_reenabling_provider_preserves_known_cooldown(gitlab_env):
         engine.discover()
         env.client.discover.assert_not_called()
         assert not engine.sources
+
+
+@pytest.mark.parametrize("host", ["gitlab.com", HOST])
+@pytest.mark.parametrize(
+    "branch,present,valid",
+    [
+        (None, False, True),
+        (None, True, True),
+        ("main", True, True),
+        (17, True, False),
+        ("x" * 256, True, False),
+        ("topic\nbranch", True, False),
+        ("topic\x00branch", True, False),
+    ],
+)
+def test_default_branch_is_optional_but_validated(host, branch, present, valid):
+    raw = raw_project(host=host, default_branch=branch)
+    if not present:
+        raw.pop("default_branch")
+    if valid:
+        repo = parse_project(raw, host)
+        assert repo.default_branch == branch
+        assert repo.key == f"gitlab:{host}:17"
+    else:
+        with pytest.raises(DiscoveryError, match="^GITLAB_INVALID_PROJECT$"):
+            parse_project(raw, host)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "id",
+        "namespace",
+        "path",
+        "http_url_to_repo",
+        "web_url",
+        "visibility",
+        "archived",
+        "created_at",
+    ],
+)
+def test_optional_branch_does_not_make_required_project_fields_optional(field):
+    raw = raw_project()
+    raw.pop("default_branch")
+    raw.pop(field)
+    with pytest.raises(DiscoveryError, match="^GITLAB_INVALID_PROJECT$"):
+        parse_project(raw, HOST)

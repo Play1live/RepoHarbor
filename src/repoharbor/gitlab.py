@@ -96,7 +96,8 @@ def parse_project(value: Any, host: str) -> Repository:
         fork = upstream is not None or "mr_default_target_self" in value
         if upstream is not None:
             numeric_id(value["forked_from_project"]["id"])
-        branch, created = value["default_branch"], value["created_at"]
+        branch = value.get("default_branch")
+        created = value["created_at"]
         if branch is not None and (
             not isinstance(branch, str)
             or len(branch) > 255
