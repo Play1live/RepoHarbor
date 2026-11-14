@@ -13,7 +13,7 @@ import yaml
 
 from repoharbor.errors import HarborError
 from repoharbor.scheduler import Cron
-from repoharbor.selection import Selection, repository_key, selector
+from repoharbor.selection import Selection, instance_host, repository_key, selector
 
 
 def identifier(value: Any) -> str:
@@ -86,6 +86,10 @@ class Provider:
     include_owned: bool = True
     include_organizations: bool = True
     include_collaborators: bool = True
+    type: str = "github"
+    host: str = "github.com"
+    include_groups: bool = True
+    include_shared: bool = True
 
 
 @dataclass(frozen=True)
@@ -128,12 +132,26 @@ def discovery_settings(
                 "include_owned",
                 "include_organizations",
                 "include_collaborators",
+                "include_groups",
+                "include_shared",
             },
         )
         name = identifier(p.get("id"))
         credential = p.get("credential")
-        if p.get("type") != "github" or p.get("host", "github.com") != "github.com":
-            raise HarborError("Only GitHub.com discovery is supported")
+        kind = p.get("type")
+        host = p.get("host", "github.com" if kind == "github" else "gitlab.com")
+        if kind not in ("github", "gitlab"):
+            raise HarborError("Unknown discovery provider")
+        instance_host(host)
+        if kind == "github" and (
+            host != "github.com" or {"include_groups", "include_shared"}.intersection(p)
+        ):
+            raise HarborError("Invalid GitHub provider")
+        if kind == "gitlab" and (
+            host in ("github.com", "api.github.com")
+            or {"include_organizations", "include_collaborators"}.intersection(p)
+        ):
+            raise HarborError("Invalid GitLab provider")
         if credential not in names or any(x.id == name for x in providers):
             raise HarborError("Invalid provider credential or duplicate provider ID")
         flags = [
@@ -142,7 +160,28 @@ def discovery_settings(
         ]
         if any(type(x) is not bool for x in flags):
             raise HarborError("Provider scope flags must be booleans")
-        providers.append(Provider(name, credential, *flags))
+        groups, shared = p.get("include_groups", True), p.get("include_shared", True)
+        if type(groups) is not bool or type(shared) is not bool:
+            raise HarborError("Provider scope flags must be booleans")
+        # A credential belongs to exactly one service authority; no cross-host reuse.
+        if any(
+            x.credential == credential and (x.type, x.host) != (kind, host)
+            for x in providers
+        ):
+            raise HarborError("Credential is already bound to another provider host")
+        providers.append(
+            Provider(
+                name,
+                credential,
+                flags[0],
+                flags[1],
+                flags[2],
+                kind,
+                host,
+                groups,
+                shared,
+            )
+        )
     s = keys(
         d.get("selection", {}),
         {
@@ -162,7 +201,7 @@ def discovery_settings(
         mode not in ("all", "selected", "all_except")
         or not isinstance(visibility, list)
         or not visibility
-        or any(v not in ("public", "private") for v in visibility)
+        or any(v not in ("public", "private", "internal") for v in visibility)
     ):
         raise HarborError("Invalid selection mode or visibility")
     forks, archived = s.get("include_forks", False), s.get("include_archived", False)
@@ -233,6 +272,9 @@ def load(env: dict[str, str]) -> Config:
         credential = s.get("credential")
         if credential is not None and credential not in names:
             raise HarborError("Unknown credential reference")
+        bound = next((p for p in providers if p.credential == credential), None)
+        if bound is not None and urlsplit(url).netloc != bound.host:
+            raise HarborError("Manual source credential belongs to another host")
         if any(x.alias == alias for x in sources):
             raise HarborError("Duplicate source alias")
         existing = next((x for x in sources if x.url == url), None)
