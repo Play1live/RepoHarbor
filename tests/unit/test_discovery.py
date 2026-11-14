@@ -245,7 +245,7 @@ def test_empty_default_branch_and_nonobject():
 
 
 def test_transport_secret_scope_size_json_network_and_deadline():
-    client = GitHub(Credentials({"first": "fictional-secret"}))
+    client = GitHub(Credentials({"first": "fictional-secret"}), request_delay_ms=0)
     response = Mock()
     response.__enter__ = Mock(return_value=response)
     response.__exit__ = Mock(return_value=False)
@@ -317,7 +317,12 @@ def test_http_error_redaction_and_rate_limits(status, headers, body, expected):
         client.request("/user", "first")
     assert "fictional-secret" not in str(error.value)
     if expected == "RATE_LIMIT":
-        assert time.time() + 58 < error.value.retry_at <= time.time() + 86400
+        expected_retry = (
+            99999999999
+            if "X-RateLimit-Reset" in headers
+            else time.time() + (120 if status == 429 else 60)
+        )
+        assert error.value.retry_at == pytest.approx(expected_retry, abs=1)
     else:
         assert error.value.retry_at == 0
 

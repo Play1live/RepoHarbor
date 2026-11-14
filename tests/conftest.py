@@ -1,3 +1,5 @@
+import io
+import json
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -113,7 +115,9 @@ def github_env(factory, remote, monkeypatch):
 
     client.discover.side_effect = discover
     client.request.return_value = (raw_repo(), {})
-    monkeypatch.setattr("repoharbor.engine.GitHub", lambda credentials: client)
+    monkeypatch.setattr(
+        "repoharbor.engine.GitHub", lambda credentials, **kwargs: client
+    )
 
     class MappedGit(LocalGit):
         def __init__(self, bare):
@@ -156,3 +160,49 @@ def raw_repo(rid=17, owner="fictional", name="project", **extra):
         "created_at": "2026-01-01T00:00:00Z",
         **extra,
     }
+
+
+@pytest.fixture
+def github_clock(monkeypatch):
+    class Clock:
+        elapsed = 0.0
+        epoch = 1800000000.0
+
+        def monotonic(self):
+            return self.elapsed
+
+        def time(self):
+            return self.epoch + self.elapsed
+
+    clock = Clock()
+    # Replace only the GitHub module's clock, leaving Git/process timeouts real.
+    monkeypatch.setattr("repoharbor.github.time", clock)
+    return clock
+
+
+class ControlledStop:
+    def __init__(self, clock):
+        self.clock = clock
+        self.stopped = False
+        self.waits = []
+        self.on_wait = lambda: None
+
+    def is_set(self):
+        return self.stopped
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.clock.elapsed += seconds
+        self.on_wait()
+        return self.stopped
+
+
+@pytest.fixture
+def github_stop(github_clock):
+    return ControlledStop(github_clock)
+
+
+def api_response(value, headers=None):
+    response = io.BytesIO(json.dumps(value).encode())
+    response.headers = headers or {}
+    return response

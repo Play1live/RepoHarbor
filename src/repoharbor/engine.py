@@ -187,7 +187,11 @@ class Engine:
         with self.store.transaction() as data:
             data["discovery"] = {"state": "running", "started_at": utcnow()}
         try:
-            client = GitHub(self.git.credentials)
+            client = GitHub(
+                self.git.credentials,
+                request_delay_ms=self.config.discovery.request_delay_ms,
+                stop=self.git.stop,
+            )
             observations = []
             for provider in self.config.providers:
                 if self.git.stop.is_set():

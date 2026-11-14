@@ -89,6 +89,11 @@ class Provider:
 
 
 @dataclass(frozen=True)
+class Discovery:
+    request_delay_ms: int = 1000
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
     credentials: tuple[str, ...]
@@ -102,6 +107,7 @@ class Config:
     repair_attempts: int = 3
     providers: tuple[Provider, ...] = ()
     selection: Selection = field(default_factory=Selection)
+    discovery: Discovery = field(default_factory=Discovery)
 
 
 def discovery_settings(
@@ -191,6 +197,7 @@ def load(env: dict[str, str]) -> Config:
             "features",
             "providers",
             "selection",
+            "discovery",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -210,6 +217,12 @@ def load(env: dict[str, str]) -> Config:
     if len({n.upper().replace("-", "_") for n in names}) != len(names):
         raise HarborError("Duplicate credential names")
     providers, selection = discovery_settings(d, names)
+    discovery = keys(d.get("discovery", {}), {"request_delay_ms"})
+    delay = discovery.get("request_delay_ms", 1000)
+    if type(delay) is not int or not 0 <= delay <= 60000:
+        raise HarborError(
+            "discovery.request_delay_ms must be an integer from 0 to 60000"
+        )
     raw_sources = d.get("manual_git_urls", [])
     if not isinstance(raw_sources, list):
         raise HarborError("manual_git_urls must be a list")
@@ -299,4 +312,5 @@ def load(env: dict[str, str]) -> Config:
         attempts,
         providers,
         selection,
+        Discovery(delay),
     )

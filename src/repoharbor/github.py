@@ -1,11 +1,18 @@
 """Bounded GitHub REST reads; no redirects or remote diagnostic disclosure."""
 
+from __future__ import annotations
+
 import contextlib
 import json
+import math
 import re
+import sys
+import threading
 import time
 from collections.abc import Mapping
+from email.message import Message
 from email.utils import parsedate_to_datetime
+from http.client import HTTPException
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
@@ -35,18 +42,30 @@ class NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def retry_time(headers: Mapping[str, str], now: float) -> float:
-    delay = 60.0
-    value = headers.get("Retry-After", "")
-    try:
-        delay = max(delay, float(value))
-    except ValueError:
-        with contextlib.suppress(ValueError, TypeError, OverflowError):
-            delay = max(delay, parsedate_to_datetime(value).timestamp() - now)
-    with contextlib.suppress(ValueError):
-        delay = max(delay, float(headers.get("X-RateLimit-Reset", "0")) - now)
-    # Invalid/unbounded server values cannot disable backups forever.
-    return now + min(delay, 86400)
+def retry_time(headers: Mapping[str, str] | Message[str, str], now: float) -> float:
+    times = []
+    for name, value in headers.items():
+        name = name.lower()
+        if name not in {"retry-after", "x-ratelimit-reset"}:
+            continue
+        try:
+            number = float(value)
+        except ValueError:
+            if name == "retry-after":
+                with contextlib.suppress(ValueError, TypeError, OverflowError):
+                    date = parsedate_to_datetime(value)
+                    if date.tzinfo is not None and date.timestamp() > now:
+                        times.append(date.timestamp())
+            continue
+        if not math.isfinite(number) or number < 0:
+            continue
+        if name == "retry-after":
+            # Saturate arithmetic overflow, never shorten a finite server delay.
+            times.append(min(now + number, sys.float_info.max))
+        elif number > now:
+            times.append(number)
+    # A server cooldown is persisted, not slept here or capped to one day.
+    return max(times, default=now + 60)
 
 
 def parse_repository(value: Any) -> Repository:
@@ -86,14 +105,51 @@ def parse_repository(value: Any) -> Repository:
 
 
 class GitHub:
-    def __init__(self, credentials: Credentials):
+    def __init__(
+        self,
+        credentials: Credentials,
+        *,
+        request_delay_ms: int = 1000,
+        stop: threading.Event | None = None,
+    ):
         self.credentials = credentials
         self.opener = build_opener(NoRedirect())
         self.deadline = time.monotonic() + 120
+        self.stop = stop if stop is not None else threading.Event()
+        self.delay = request_delay_ms / 1000
+        self.last_completed: float | None = None
+        self.retry_at = 0.0
+        self.lock = threading.Lock()
 
     def request(self, path: str, credential: str) -> tuple[Any, Mapping[str, str]]:
-        if time.monotonic() >= self.deadline:
-            raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT")
+        # One client is shared by all providers, pages and identity checks per run.
+        with self.lock:
+            while True:
+                if self.stop.is_set():
+                    raise DiscoveryError("INTERRUPTED")
+                now = time.monotonic()
+                if now >= self.deadline:
+                    raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT")
+                if self.retry_at > time.time():
+                    raise DiscoveryError("GITHUB_RATE_LIMIT", self.retry_at)
+                remaining = (
+                    self.last_completed + self.delay - now
+                    if self.last_completed is not None
+                    else 0
+                )
+                if remaining <= 0:
+                    break
+                self.stop.wait(min(remaining, self.deadline - now))
+            try:
+                return self._request(path, credential)
+            except (HTTPException, URLError, OSError, ValueError, UnicodeError):
+                raise DiscoveryError(
+                    "GITHUB_INVALID_RESPONSE_OR_NETWORK", self.retry_at
+                ) from None
+            finally:
+                self.last_completed = time.monotonic()
+
+    def _request(self, path: str, credential: str) -> tuple[Any, Mapping[str, str]]:
         req = Request(
             BASE + path,
             headers={
@@ -104,7 +160,10 @@ class GitHub:
             },
         )
         try:
-            with self.opener.open(req, timeout=15) as response:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT")
+            with self.opener.open(req, timeout=min(15, remaining)) as response:
                 body = bytearray()
                 while True:
                     if time.monotonic() >= self.deadline:
@@ -120,11 +179,12 @@ class GitHub:
             return data, headers
         except HTTPError as error:
             with error:
+                headers = {name.lower(): value for name, value in error.headers.items()}
                 rate = error.code == 429 or (
                     error.code == 403
                     and (
-                        error.headers.get("X-RateLimit-Remaining") == "0"
-                        or bool(error.headers.get("Retry-After"))
+                        headers.get("x-ratelimit-remaining") == "0"
+                        or bool(headers.get("retry-after"))
                         or b"rate limit" in error.read(4096).lower()
                     )
                 )
@@ -137,12 +197,12 @@ class GitHub:
                         404: "GITHUB_NOT_ACCESSIBLE",
                     }.get(error.code, "GITHUB_HTTP_ERROR")
                 )
-                retry = (
-                    retry_time(dict(error.headers.items()), time.time()) if rate else 0
-                )
+                if rate:
+                    self.retry_at = max(
+                        self.retry_at, retry_time(error.headers, time.time())
+                    )
+                retry = self.retry_at if rate else 0
             raise DiscoveryError(code, retry) from None
-        except (URLError, OSError, ValueError, UnicodeError):
-            raise DiscoveryError("GITHUB_INVALID_RESPONSE_OR_NETWORK") from None
 
     def discover(self, provider: Provider) -> list[Observation]:
         user, _ = self.request("/user", provider.credential)

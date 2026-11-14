@@ -1,12 +1,17 @@
 import copy
 import errno
+import io
 from dataclasses import replace
+from unittest.mock import Mock
+from urllib.error import HTTPError
 
 import pytest
 from conftest import raw_repo
 from test_crash_corrections import kill_at
 
+from repoharbor.config import Discovery, Source
 from repoharbor.errors import HarborError
+from repoharbor.github import GitHub
 from repoharbor.persistence import read_json
 from repoharbor.recovery import recover
 from repoharbor.selection import Selection
@@ -86,3 +91,49 @@ def test_orphan_metadata_directory_after_io_failure_fails_closed(
         pass
     assert (env.config.root / "data.json").read_bytes() == before
     assert not list(env.config.root.rglob("repository.git"))
+
+
+def test_sigkill_after_rate_limit_keeps_long_cooldown_and_existing_mirrors(
+    github_env, monkeypatch, github_clock
+):
+    env = github_env
+    cfg = replace(
+        env.config,
+        sources=(Source("demo", "https://example.org/repo.git"),),
+        discovery=Discovery(0),
+    )
+    with env.create(cfg, git_instance=env.git()) as engine:
+        engine.run()
+        meta_path = engine.path(env.key) / "metadaten.json"
+        before = meta_path.read_bytes()
+        mirror = engine.path(env.key) / "repository.git"
+        inode = mirror.stat().st_ino
+    until = github_clock.time() + 172800
+    monkeypatch.setattr("time.time", github_clock.time)
+    monkeypatch.setattr("repoharbor.engine.GitHub", GitHub)
+    opener = Mock()
+    opener.open.side_effect = HTTPError(
+        "", 429, "", {"retry-after": "172800"}, io.BytesIO()
+    )
+    monkeypatch.setattr("repoharbor.github.build_opener", lambda *args: opener)
+
+    def create(**kwargs):
+        return env.create(cfg, git_instance=env.git(), **kwargs)
+
+    def discover_and_pause(engine):
+        engine.discover()
+        assert engine.store.data["discovery"]["retry_at"] == until
+        engine.checkpoint("cooldown_persisted")
+
+    kill_at(create, discover_and_pause, "cooldown_persisted")
+    assert read_json(cfg.root / "data.json")["discovery"]["retry_at"] == until
+    github_clock.elapsed = 90000
+    with create() as engine:
+        recover(engine)
+        engine.run()
+        opener.open.assert_not_called()
+        assert engine.store.data["discovery"]["retry_at"] == until
+        assert engine.sources == cfg.sources
+        assert meta_path.read_bytes() == before
+        assert mirror.stat().st_ino == inode and engine.git.healthy(mirror)
+        assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
