@@ -13,6 +13,7 @@ import yaml
 
 from repoharbor.errors import HarborError
 from repoharbor.scheduler import Cron
+from repoharbor.selection import Selection, repository_key, selector
 
 
 def identifier(value: Any) -> str:
@@ -79,6 +80,20 @@ class Storage:
 
 
 @dataclass(frozen=True)
+class Provider:
+    id: str
+    credential: str
+    include_owned: bool = True
+    include_organizations: bool = True
+    include_collaborators: bool = True
+
+
+@dataclass(frozen=True)
+class Discovery:
+    request_delay_ms: int = 1000
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
     credentials: tuple[str, ...]
@@ -90,6 +105,76 @@ class Config:
     storage: Storage = field(default_factory=Storage)
     automatic_repair: bool = True
     repair_attempts: int = 3
+    providers: tuple[Provider, ...] = ()
+    selection: Selection = field(default_factory=Selection)
+    discovery: Discovery = field(default_factory=Discovery)
+
+
+def discovery_settings(
+    d: dict[str, Any], names: list[str]
+) -> tuple[tuple[Provider, ...], Selection]:
+    raw = d.get("providers", [])
+    if not isinstance(raw, list):
+        raise HarborError("providers must be a list")
+    providers: list[Provider] = []
+    for value in raw:
+        p = keys(
+            value,
+            {
+                "id",
+                "type",
+                "host",
+                "credential",
+                "include_owned",
+                "include_organizations",
+                "include_collaborators",
+            },
+        )
+        name = identifier(p.get("id"))
+        credential = p.get("credential")
+        if p.get("type") != "github" or p.get("host", "github.com") != "github.com":
+            raise HarborError("Only GitHub.com discovery is supported")
+        if credential not in names or any(x.id == name for x in providers):
+            raise HarborError("Invalid provider credential or duplicate provider ID")
+        flags = [
+            p.get(k, True)
+            for k in ("include_owned", "include_organizations", "include_collaborators")
+        ]
+        if any(type(x) is not bool for x in flags):
+            raise HarborError("Provider scope flags must be booleans")
+        providers.append(Provider(name, credential, *flags))
+    s = keys(
+        d.get("selection", {}),
+        {
+            "mode",
+            "visibility",
+            "include_forks",
+            "include_archived",
+            "selected",
+            "excluded",
+        },
+    )
+    mode, visibility = (
+        s.get("mode", "selected"),
+        s.get("visibility", ["public", "private"]),
+    )
+    if (
+        mode not in ("all", "selected", "all_except")
+        or not isinstance(visibility, list)
+        or not visibility
+        or any(v not in ("public", "private") for v in visibility)
+    ):
+        raise HarborError("Invalid selection mode or visibility")
+    forks, archived = s.get("include_forks", False), s.get("include_archived", False)
+    if type(forks) is not bool or type(archived) is not bool:
+        raise HarborError("Selection flags must be booleans")
+    lists = []
+    for key in ("selected", "excluded"):
+        values = s.get(key, [])
+        if not isinstance(values, list):
+            raise HarborError("Repository selectors must be lists")
+        lists.append(tuple(selector(v) for v in values))
+    return tuple(providers), Selection(mode, tuple(visibility), forks, archived, *lists)
 
 
 def load(env: dict[str, str]) -> Config:
@@ -110,6 +195,9 @@ def load(env: dict[str, str]) -> Config:
             "storage",
             "recovery",
             "features",
+            "providers",
+            "selection",
+            "discovery",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -128,6 +216,13 @@ def load(env: dict[str, str]) -> Config:
     # Both '-' and '_' map to '_' in environment variable names.
     if len({n.upper().replace("-", "_") for n in names}) != len(names):
         raise HarborError("Duplicate credential names")
+    providers, selection = discovery_settings(d, names)
+    discovery = keys(d.get("discovery", {}), {"request_delay_ms"})
+    delay = discovery.get("request_delay_ms", 1000)
+    if type(delay) is not int or not 0 <= delay <= 60000:
+        raise HarborError(
+            "discovery.request_delay_ms must be an integer from 0 to 60000"
+        )
     raw_sources = d.get("manual_git_urls", [])
     if not isinstance(raw_sources, list):
         raise HarborError("manual_git_urls must be a list")
@@ -164,8 +259,11 @@ def load(env: dict[str, str]) -> Config:
         },
     )
     overrides = st.get("overrides", {})
-    if not isinstance(overrides, dict) or set(overrides) - {s.alias for s in sources}:
-        raise HarborError("Storage overrides must reference source aliases")
+    if not isinstance(overrides, dict):
+        raise HarborError("Storage overrides must be a mapping")
+    for key in overrides:
+        if key not in {s.alias for s in sources}:
+            repository_key(key)
     transfer = st.get("during_transfer", "finish")
     reserve = gib(st.get("min_free_gib", 2))
     if transfer not in ("finish", "abort") or reserve is None:
@@ -212,4 +310,7 @@ def load(env: dict[str, str]) -> Config:
         storage,
         repair,
         attempts,
+        providers,
+        selection,
+        Discovery(delay),
     )

@@ -2,6 +2,7 @@
 
 import fcntl
 import json
+import math
 import os
 import stat
 import tempfile
@@ -102,6 +103,17 @@ def validate_state(data: dict[str, Any]) -> None:
             raise ValueError
         if "last_checked_at" not in data["recovery"]:
             raise ValueError
+        if "discovery" in data:
+            discovery = data["discovery"]
+            if (
+                not isinstance(discovery, dict)
+                or discovery.get("state") not in ("running", "failed", "completed")
+                or not isinstance(discovery.get("started_at"), str)
+                or type(discovery.get("retry_at", 0)) not in (int, float)
+                or not math.isfinite(discovery.get("retry_at", 0))
+                or discovery.get("retry_at", 0) < 0
+            ):
+                raise ValueError
         for key in ("active_run", "active_operation"):
             value = data[key]
             if value is None:

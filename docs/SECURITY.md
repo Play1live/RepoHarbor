@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-RepoHarbor `0.1.0` is an **unreleased development build**. This document describes the implemented protections and their limits. Passing local or CI tests does not certify a production NAS/Portainer installation.
+This document covers RepoHarbor `0.2.0`. This document describes the implemented protections and their limits. Passing local or CI tests does not certify a production NAS/Portainer installation.
 
 ## Trusted storage boundary
 
@@ -19,6 +19,16 @@ The service refuses symlinks and special files within the backup-root tree. Do n
 
 Local Git transports are enabled **only in test fixtures**, not as a production configuration option. Python static analysis blocks medium/high severity findings. The shell-free Git subprocess boundary is still a subprocess and needs continued review as dependencies and Git versions change.
 
+## GitHub API and identity boundary
+
+Discovery uses the official `https://api.github.com` REST endpoint with TLS verification enabled. Tokens are resolved through the same exclusive env/file credential system and sent only in an Authorization header. The API client rejects redirects; pagination is validated against the fixed host/path and expected next page. Git clone targets are reconstructed from validated GitHub owner/name fields and must match the API's canonical GitHub URLs. Remote errors and response bodies are not logged or stored; only fixed error codes are exposed.
+
+Requests have socket/deadline, response-size and page-count bounds. HTTP 401, 403, 404, server failures, malformed responses and primary/secondary rate limits remain distinct from a confirmed deletion. Rate-limit cooldowns are persisted. API visibility is limited by each token's grants; metadata access does not itself prove Git contents access. Successful discovery updates only `source.last_seen_at` and the separate `source.discovery_status`; it preserves the Git `source.status`, diagnostics and source extensions. New repositories retain unknown Git status until actual successful Git access. Absence from complete discovery changes the API status only; incomplete discovery leaves both observations unchanged. Excluded or storage-limited repositories receive no false Git success confirmation. These additive metadata fields retain schema version 1 and use the existing atomic persistence/recovery path. Git uses the first in-scope configured token and the existing isolated Askpass/HTTPS boundary. There is no automatic Git credential fallback.
+
+The registry deduplicates by provider, host and immutable repository ID, retaining confirmed address history. Contradictory IDs/properties or reuse of a retained address by another ID fail closed. Stable numeric directories avoid moving mirrors on rename/transfer. Arbitrary manual sources keep their original identity contracts. URL equality or a newly resolved API ID does not prove ownership of an old manual mirror: conflicts block automatic assignment and never authorize adoption or overwrite.
+
+A failed or incomplete token discovery suspends the entire GitHub part of that run. No incomplete selection is applied and no stale selection permits remote repair. Independent manual sources remain eligible. Manual address resolution is conservative; unresolved or redirected GitHub addresses pause automatic discovery rather than risk a duplicate. Full rules and the limitation around unknown historical manual aliases are documented in [configuration](CONFIGURATION.md#stable-paths-and-manual-conflicts).
+
 ## Journaling and crash consistency
 
 The single-writer lock prevents two active RepoHarbor instances from mutating the same root. The central `data.json` journal is persisted **before Git mutations**, using temporary-file writes, flush/`fsync`, atomic replacement, and parent-directory synchronization. Repository metadata is written before marking an operation complete. Scheduler overlap events and worker journal transitions use serialized, durable read-modify-write transactions.
@@ -27,13 +37,15 @@ Crash recovery reconciles interrupted operations, records proven completion only
 
 An existing valid mirror is **never automatically deleted or replaced by a fresh clone**. Removing a source from configuration preserves its local backup. A remote disappearance or authentication failure does not prove that the repository was deleted.
 
+Discovery records its own state in the existing central `data.json` without replacing the active Git-operation slot. Repository metadata is atomically written, but the catalog is **not** a multi-file atomic filesystem transaction. Runnable GitHub sources are published in memory only after all metadata writes and the completion marker are durable. A crash during catalog publication may leave some metadata updated; startup permits no GitHub remote work from that partial catalog, and a fresh complete discovery must recompute selection. Missing metadata in a newly created directory fails closed and may require operator review; it is never silently overwritten or re-cloned. Existing Git journals and completion markers continue to govern backup recovery.
+
 ## Interrupted initial clones and quarantine
 
 A temporary `repository.git.partial/` becomes a valid `repository.git/` **only** when completion is supported by a durable journal marker and a fresh integrity check. Structural health by itself does not establish that the initial network clone completed.
 
 An identified interrupted first clone may be moved through a journaled rename into **one reserved slot** per source: `quarantine/initial-clone/`. Quarantined bytes remain preserved and count toward both repository and global size budgets. Startup reconciliation does **not** start a new clone; retry is permitted no earlier than the next normal cron tick.
 
-Unknown or unowned partials, excluded sources, a second partial while quarantine is occupied, missing quarantine content, and conflicting paths set persistent `backup.manual_attention_required` and prevent further automatic downloads. The service does not rotate or delete quarantines automatically. Missing/corrupt journal or metadata files fail closed rather than being silently reset. Only schema version `1` is accepted.
+Unknown or unowned partials, excluded sources, a second partial while quarantine is occupied, missing quarantine content, and conflicting paths set persistent `backup.manual_attention_required` and prevent further automatic downloads. The service does not rotate or delete quarantines automatically. Missing/corrupt journal or metadata files fail closed rather than being silently reset. Only schema version `1` is accepted. GitHub metadata and the `data.json.discovery` marker are additive extensions; existing manual state is not migrated.
 
 ### Operator procedure for `manual_attention_required`
 
@@ -52,7 +64,7 @@ Interrupted or suspect mirrors receive an on-demand local `git fsck --full` inte
 
 At most three genuine failed repair attempts are counted per incident; a successful repair resets the incident counter. Completed repair operation IDs make success/error counters idempotent after crashes. SIGTERM/SIGINT, interruption and capacity pauses do **not** consume a repair-failure attempt. A needed repair blocked by storage is `repair_paused` with `repair_deferred`, then reevaluated at the next scheduled run without a service restart. Exhausted genuine attempts stay `repair_failed`, even if space is also low.
 
-Remote repair downloads require an included repository, enabled automatic repair, adequate capacity, and permitted Git access. **Excluded repositories receive no remote repair download**. If objects were deleted upstream or packs are irrecoverable, `repair_failed` can require manual operator action. The service keeps the old refs; it does not automatically replace the mirror.
+Remote repair downloads require an included repository, enabled automatic repair, adequate capacity, and permitted Git access. GitHub repair additionally requires a fresh, complete selection in the current scheduled run. Boot reconciliation is local for GitHub sources, and needed remote repairs wait with `DISCOVERY_REQUIRED`. **Excluded repositories receive no remote repair download**. If objects were deleted upstream or packs are irrecoverable, `repair_failed` can require manual operator action. The service keeps the old refs; it does not automatically replace the mirror.
 
 ## Signals and failure handling
 

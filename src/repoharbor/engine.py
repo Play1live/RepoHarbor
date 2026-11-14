@@ -9,6 +9,7 @@ from typing import Any
 from repoharbor.config import Config, Source, canonical_url, identifier
 from repoharbor.errors import GitError, HarborError
 from repoharbor.git_backup import Git
+from repoharbor.github import DiscoveryError, GitHub
 from repoharbor.persistence import (
     Store,
     atomic_json,
@@ -19,6 +20,13 @@ from repoharbor.persistence import (
     sync_directory,
     utcnow,
 )
+from repoharbor.registry import (
+    manual_addresses,
+    manual_identities,
+    plan,
+    stored_repository,
+)
+from repoharbor.selection import repository_key
 from repoharbor.storage import Budget, usage
 
 Checkpoint = Callable[[str], None]
@@ -40,8 +48,12 @@ class Engine:
         self.budget = Budget(config.root, config.storage)
         self.checkpoint = checkpoint
         self.repos: dict[str, dict[str, Any]] = {}
+        self.sources = config.sources
 
     def path(self, alias: str) -> Path:
+        if ":" in alias:
+            repository_key(alias)
+            return self.config.root / "github" / "github.com" / alias.rsplit(":", 1)[1]
         return self.config.root / "manual" / identifier(alias)
 
     def save_meta(self, alias: str) -> None:
@@ -50,69 +62,79 @@ class Engine:
     def inventory(self) -> None:
         safe_tree(self.config.root)
         parent = self.config.root / "manual"
-        if parent.exists():
-            for folder in sorted(parent.iterdir()):
-                alias = identifier(folder.name)
-                meta = read_json(folder / "metadaten.json")
-                try:
-                    # Validate structure before mutation; never reset unknown schemas.
-                    template = metadata(
-                        alias, "https://example.org/repo.git", None, None
-                    )
-                    for section, expected in template.items():
-                        if isinstance(expected, dict) and (
-                            not isinstance(meta[section], dict)
-                            or not set(expected) <= meta[section].keys()
-                        ):
-                            raise ValueError
-                    repo, backup, errors = (
-                        meta["repository"],
-                        meta["backup"],
-                        meta["errors"],
-                    )
+        entries = (
+            [(identifier(f.name), f) for f in sorted(parent.iterdir())]
+            if parent.exists()
+            else []
+        )
+        github = self.config.root / "github"
+        if github.exists():
+            if any(p.name != "github.com" or not p.is_dir() for p in github.iterdir()):
+                raise HarborError("Unknown provider directory; preserving data")
+            instance = github / "github.com"
+            if instance.exists():
+                entries.extend(
+                    (repository_key(f"github:github.com:{f.name}"), f)
+                    for f in sorted(instance.iterdir())
+                )
+        for alias, folder in entries:
+            meta = read_json(folder / "metadaten.json")
+            try:
+                # Validate structure before mutation; never reset unknown schemas.
+                template = metadata(alias, "https://example.org/repo.git", None, None)
+                for section, expected in template.items():
+                    if isinstance(expected, dict) and (
+                        not isinstance(meta[section], dict)
+                        or not set(expected) <= meta[section].keys()
+                    ):
+                        raise ValueError
+                repo, backup, errors = (
+                    meta["repository"],
+                    meta["backup"],
+                    meta["errors"],
+                )
+                if ":" in alias:
+                    stored_repository(meta, alias)
+                elif repo["id"] != alias or repo["provider"] != "manual":
+                    raise ValueError
+                if backup["format"] != "mirror":
+                    raise ValueError
+                canonical_url(repo["clone_url"])
+                if "partial_operation" in backup and not isinstance(
+                    backup["partial_operation"], str
+                ):
+                    raise ValueError
+                if "quarantine" in backup:
+                    q = backup["quarantine"]
                     if (
-                        repo["id"] != alias
-                        or repo["provider"] != "manual"
-                        or backup["format"] != "mirror"
+                        not isinstance(q, dict)
+                        or q.get("state") not in ("pending", "preserved")
+                        or not isinstance(q.get("operation_id"), str)
+                        or q.get("relative_path") != "quarantine/initial-clone"
                     ):
                         raise ValueError
-                    canonical_url(repo["clone_url"])
-                    if "partial_operation" in backup and not isinstance(
-                        backup["partial_operation"], str
-                    ):
-                        raise ValueError
-                    if "quarantine" in backup:
-                        q = backup["quarantine"]
-                        if (
-                            not isinstance(q, dict)
-                            or q.get("state") not in ("pending", "preserved")
-                            or not isinstance(q.get("operation_id"), str)
-                            or q.get("relative_path") != "quarantine/initial-clone"
-                        ):
-                            raise ValueError
-                    if (
-                        not isinstance(errors["recent"], list)
-                        or len(errors["recent"]) > 20
-                    ):
-                        raise ValueError
-                    if any(
-                        type(errors[k]) is not int or errors[k] < 0
-                        for k in ("total", "consecutive")
-                    ):
-                        raise ValueError
-                    if (
-                        type(backup["successful_updates"]) is not int
-                        or type(meta["integrity"]["repair_attempts"]) is not int
-                    ):
-                        raise ValueError
-                except (KeyError, TypeError, ValueError):
-                    raise HarborError(
-                        "Invalid repository metadata; preserving data"
-                    ) from None
-                self.repos[alias] = meta
+                if not isinstance(errors["recent"], list) or len(errors["recent"]) > 20:
+                    raise ValueError
+                if any(
+                    type(errors[k]) is not int or errors[k] < 0
+                    for k in ("total", "consecutive")
+                ):
+                    raise ValueError
+                if (
+                    type(backup["successful_updates"]) is not int
+                    or type(meta["integrity"]["repair_attempts"]) is not int
+                ):
+                    raise ValueError
+            except (KeyError, TypeError, ValueError, DiscoveryError):
+                raise HarborError(
+                    "Invalid repository metadata; preserving data"
+                ) from None
+            self.repos[alias] = meta
         configured = {s.alias: s for s in self.config.sources}
         # Verify identity conflicts for the entire catalog before changing any metadata.
         for alias, meta in self.repos.items():
+            if ":" in alias:
+                continue
             if (
                 alias in configured
                 and meta["repository"]["clone_url"] != configured[alias].url
@@ -126,6 +148,14 @@ class Engine:
                     "Existing URL has another alias; keep its stable alias"
                 )
         for alias, meta in self.repos.items():
+            if ":" in alias:
+                if not self.config.providers:
+                    meta["selection"] = {
+                        "status": "excluded",
+                        "reason": "provider_disabled",
+                    }
+                    self.save_meta(alias)
+                continue
             included = alias in configured
             meta["selection"] = {
                 "status": "included" if included else "excluded",
@@ -145,7 +175,96 @@ class Engine:
             self.repos[source.alias]["repository"]["web_url"] = source.web_url
             self.save_meta(source.alias)
 
+    def discover(self) -> None:
+        import time
+
+        self.sources = self.manual_sources()
+        if not self.config.providers and not any(":" in k for k in self.repos):
+            return
+        previous = self.store.data.get("discovery", {})
+        if self.config.providers and previous.get("retry_at", 0) > time.time():
+            return
+        with self.store.transaction() as data:
+            data["discovery"] = {"state": "running", "started_at": utcnow()}
+        client: GitHub | None = None
+        try:
+            client = GitHub(
+                self.git.credentials,
+                request_delay_ms=self.config.discovery.request_delay_ms,
+                stop=self.git.stop,
+            )
+            observations = []
+            for provider in self.config.providers:
+                if self.git.stop.is_set():
+                    raise DiscoveryError("INTERRUPTED")
+                observations.extend(client.discover(provider))
+            manual_ids = (
+                manual_identities(
+                    client, self.config, manual_addresses(self.config, self.repos)
+                )
+                if self.config.providers
+                else set()
+            )
+            proposed, sources = plan(self.config, self.repos, observations, manual_ids)
+        except DiscoveryError as error:
+            with self.store.transaction() as data:
+                data["discovery"].update(
+                    state="failed",
+                    code=str(error),
+                    retry_at=max(error.retry_at, client.retry_at if client else 0),
+                )
+            logging.warning("GitHub discovery skipped: %s", error)
+            return
+        if client.retry_at:
+            # Keep a known server cooldown even if metadata publication crashes.
+            with self.store.transaction() as data:
+                data["discovery"]["retry_at"] = client.retry_at
+        # Publish no runnable sources until every metadata write is durable. On a
+        # crash, startup performs local recovery only; next discovery recomputes all.
+        for alias, meta in proposed.items():
+            folder = self.path(alias)
+            if alias not in self.repos:
+                folder.parent.mkdir(parents=True, exist_ok=True)
+                sync_directory(self.config.root)
+                sync_directory(folder.parent.parent)
+                folder.mkdir(exist_ok=False)
+                sync_directory(folder.parent)
+            self.repos[alias] = meta
+            self.save_meta(alias)
+            self.checkpoint("discovery_metadata")
+        with self.store.transaction() as data:
+            data["discovery"].update(
+                state="completed", completed_at=utcnow(), retry_at=client.retry_at
+            )
+        self.sources = self.manual_sources() + sources
+
+    def manual_sources(self) -> tuple[Source, ...]:
+        """Do not clone a new manual copy over a known provider-owned URL."""
+        from repoharbor.selection import address
+
+        result = []
+        for source in self.config.sources:
+            if not (self.path(source.alias) / "repository.git").exists():
+                try:
+                    name = address(source.url)
+                except HarborError:
+                    name = ""
+                if any(
+                    name in meta["repository"].get("aliases", [])
+                    and (self.path(key) / "repository.git").exists()
+                    for key, meta in self.repos.items()
+                    if ":" in key
+                ):
+                    logging.warning(
+                        "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
+                        source.alias,
+                    )
+                    continue
+            result.append(source)
+        return tuple(result)
+
     def run(self) -> None:
+        self.sources = self.manual_sources()
         safe_tree(self.config.root)
         if any(
             (
@@ -165,10 +284,15 @@ class Engine:
             from repoharbor.recovery import recover
 
             recover(self)
+        self.discover()
+        if any(":" in s.alias for s in self.sources):
+            from repoharbor.recovery import recover
+
+            recover(self)
         with self.store.transaction() as data:
             data["active_run"] = {"state": "running", "started_at": utcnow()}
             data["scheduler"]["last_run_started_at"] = utcnow()
-        for source in self.config.sources:
+        for source in self.sources:
             if self.git.stop.is_set():
                 break
             self.backup(source)

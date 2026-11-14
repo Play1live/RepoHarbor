@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.1.0 — Development build (not released)
+## 0.2.0
+
+- Added scheduled GitHub.com repository discovery with multiple classic/fine-grained tokens, ID-based deduplication, owned/organization/collaborator scopes, explicit selection/exclusion and visibility/fork/archive filters.
+- Added stable ID paths and rename/transfer address history, conservative manual-source conflict handling, bounded REST pagination and persisted rate-limit cooldowns. Incomplete discovery pauses all GitHub updates and remote repairs while independent manual sources continue.
+- Separated API observation from Git transport availability: discovery preserves existing source fields and Git errors, new repositories remain unknown until successful Git access, and API absence changes only the discovery status.
+
+## 0.1.0
 
 - Introduced manually configured HTTPS Git mirror backups, named file/environment credentials, scheduled synchronization without catch-up or overlapping runs, and soft global/per-repository storage budgets with a minimum free-space reserve.
 - Added durable JSON journaling and single-writer locking, crash reconciliation, bounded non-destructive repair, and preservation of incomplete initial clones. Storage-blocked repairs are reported as `repair_paused`, separately from exhausted `repair_failed` attempts.

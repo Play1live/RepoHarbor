@@ -17,7 +17,7 @@ def docker(*args):
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.1.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.2.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
@@ -55,11 +55,11 @@ def smoke():
             == "Configuration valid"
         )
         assert list(Path(directory).iterdir()) == []
-        for _ in range(2):
+        for init_args in ([], ["--init"]):
             container = docker(
                 "run",
                 "-d",
-                "--init",
+                *init_args,
                 *env,
                 "--mount",
                 f"type=bind,src={directory},dst=/backups",
