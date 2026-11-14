@@ -231,6 +231,7 @@ class Engine:
             stop=self.git.stop,
         )
         client.bind(host)
+        client.retry_at = previous.get("retry_at", 0)
 
         def persist_cooldown(until: float) -> None:
             with self.store.transaction() as data:

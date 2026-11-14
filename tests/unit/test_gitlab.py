@@ -589,3 +589,21 @@ def test_unbound_client_cannot_send_private_token_to_inherited_github_base():
     with pytest.raises(DiscoveryError, match="GITLAB_UNBOUND_INSTANCE"):
         c.request("/user", "first")
     c.opener.open.assert_not_called()
+
+
+def test_disabling_and_reenabling_provider_preserves_known_cooldown(gitlab_env):
+    env = gitlab_env
+    until = time.time() + 3600
+    env.client.discover.side_effect = DiscoveryError("GITLAB_RATE_LIMIT", until)
+    state_key = "gitlab:" + HOST
+    with env.create(env.config, git_instance=env.git()) as engine:
+        engine.discover()
+        assert engine.store.data["provider_discovery"][state_key]["retry_at"] == until
+    env.client.discover.reset_mock()
+    with env.create(replace(env.config, providers=()), git_instance=env.git()) as engine:
+        engine.discover()
+        assert engine.store.data["provider_discovery"][state_key]["retry_at"] == until
+    with env.create(env.config, git_instance=env.git()) as engine:
+        engine.discover()
+        env.client.discover.assert_not_called()
+        assert not engine.sources
