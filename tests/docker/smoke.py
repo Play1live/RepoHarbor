@@ -1,6 +1,7 @@
 """Standalone Docker smoke harness; run after building repoharbor:local-test."""
 
 import json
+import select
 import subprocess
 import tempfile
 import threading
@@ -14,6 +15,211 @@ def docker(*args):
     return subprocess.check_output(
         ["docker", *args], text=True, stderr=subprocess.STDOUT, timeout=60
     ).strip()
+
+
+def exec_result(container, *args):
+    return subprocess.run(
+        ["docker", "exec", container, "repoharbor", *args],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+def wait_ready(container):
+    deadline = time.monotonic() + 30
+    while "ready;" not in docker("logs", container):
+        state = json.loads(docker("inspect", container))[0]["State"]
+        if not state["Running"] or time.monotonic() >= deadline:
+            raise AssertionError(docker("logs", container))
+        threading.Event().wait(0.1)
+
+
+def no_tcp_listener(container):
+    check = "from pathlib import Path; " + (
+        "assert not any(line.split()[3]=='0A' "
+        "for p in ('/proc/net/tcp','/proc/net/tcp6') "
+        "for line in Path(p).read_text().splitlines()[1:])"
+    )
+    docker("exec", container, "python", "-c", check)
+
+
+def manual_smoke(mount):
+    # A real bare Git remote served over TLS on the test container's loopback.
+    with tempfile.TemporaryDirectory() as directory:
+        fixture = Path(directory)
+        fixture.chmod(0o755)
+
+        def git(*args):
+            subprocess.run(
+                ["git", "-C", directory, *args],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+
+        git("init", "-b", "main", "work")
+        (fixture / "work/hello.txt").write_text("test fixture\n")
+        git("-C", "work", "add", "hello.txt")
+        git("-C", "work", "config", "user.name", "Example")
+        git("-C", "work", "config", "user.email", "test@example.org")
+        git("-C", "work", "commit", "-m", "fixture")
+        git("clone", "--bare", "work", "remote.git")
+        git("-C", "remote.git", "update-server-info")
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-out",
+                "cert.pem",
+                "-keyout",
+                "key.pem",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1",
+            ],
+            cwd=fixture,
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        # The test host can have umask 077 while the service uses UID 10001.
+        for path in [
+            fixture / "cert.pem",
+            fixture / "key.pem",
+            fixture / "remote.git",
+            *(fixture / "remote.git").rglob("*"),
+        ]:
+            path.chmod(0o755 if path.is_dir() else 0o644)
+        config = (
+            "schema_version: 1\nschedule: '0 0 29 2 *'\nfeatures: {manual_run: true}\n"
+            "manual_git_urls:\n  - alias: demo\n"
+            "    url: https://127.0.0.1:8443/remote.git\n"
+            "storage: {min_free_gib: 0}\n"
+        )
+        env = ["-e", "REPOHARBOR_TOKEN_SOURCE=env", "-e", f"REPOHARBOR_CONFIG={config}"]
+        container = docker(
+            "run",
+            "-d",
+            "--network",
+            "none",
+            *env,
+            "-e",
+            "SSL_CERT_FILE=/fixture/cert.pem",
+            "--mount",
+            mount,
+            "--mount",
+            f"type=bind,src={fixture},dst=/fixture,readonly",
+            IMAGE,
+        )
+        fixture_process = None
+        try:
+            wait_ready(container)
+            no_tcp_listener(container)
+            status = json.loads(
+                docker("exec", container, "repoharbor", "status", "--json")
+            )
+            assert (
+                status["service_status"] == "running"
+                and status["last_run_started_at"] is None
+            )
+            duplicate = subprocess.run(
+                ["docker", "run", "--rm", *env, "--mount", mount, IMAGE],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert duplicate.returncode == 1
+            assert "startup/state operation failed" in duplicate.stderr
+            fixture_code = """
+import http.server, os, ssl
+os.chdir('/fixture')
+server = http.server.ThreadingHTTPServer(
+    ('127.0.0.1', 8443), http.server.SimpleHTTPRequestHandler
+)
+tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+tls.load_cert_chain('cert.pem', 'key.pem')
+server.socket = tls.wrap_socket(server.socket, server_side=True)
+print("TLS fixture ready", flush=True)
+server.serve_forever()
+"""
+            fixture_process = subprocess.Popen(
+                ["docker", "exec", container, "python", "-c", fixture_code],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            assert select.select([fixture_process.stdout], [], [], 15)[0]
+            ready = fixture_process.stdout.readline().strip()
+            if ready != "TLS fixture ready":
+                fixture_process.wait(timeout=15)
+                raise AssertionError(ready + fixture_process.stdout.read())
+            first = exec_result(container, "backup", "run", "--all")
+            assert first.returncode == 0, (first.stderr, docker("logs", container))
+            before = json.loads(
+                docker(
+                    "exec",
+                    container,
+                    "repoharbor",
+                    "repositories",
+                    "show",
+                    "demo",
+                    "--json",
+                )
+            )
+            assert before["successful_updates"] == 1
+            again = exec_result(container, "backup", "run", "--repository", "demo")
+            assert again.returncode == 0, again.stderr
+            after = json.loads(
+                docker(
+                    "exec",
+                    container,
+                    "repoharbor",
+                    "repositories",
+                    "show",
+                    "demo",
+                    "--json",
+                )
+            )
+            assert after["successful_updates"] == 1
+            assert after["last_updated_at"] == before["last_updated_at"]
+            docker(
+                "exec",
+                container,
+                "git",
+                "clone",
+                "--no-hardlinks",
+                "/backups/manual/demo/repository.git",
+                "/tmp/restore",
+            )
+            assert (
+                docker("exec", container, "cat", "/tmp/restore/hello.txt")
+                == "test fixture"
+            )
+            docker("stop", "-t", "15", container)
+            assert json.loads(docker("inspect", container))[0]["State"]["ExitCode"] == 0
+        finally:
+            docker("rm", "-f", container)
+            if fixture_process is not None:
+                fixture_process.communicate(timeout=15)
+            docker(
+                "run",
+                "--rm",
+                "--mount",
+                mount,
+                "--entrypoint",
+                "python",
+                IMAGE,
+                "-c",
+                "import shutil; shutil.rmtree('/backups/manual', ignore_errors=True)",
+            )
 
 
 def smoke():
@@ -66,19 +272,14 @@ def smoke():
                 IMAGE,
             )
             try:
-                deadline = time.monotonic() + 30
-                while "ready;" not in docker("logs", container):
-                    state = json.loads(docker("inspect", container))[0]["State"]
-                    if not state["Running"] or time.monotonic() >= deadline:
-                        raise AssertionError(docker("logs", container))
-                    threading.Event().wait(0.1)
-                # No TCP listening socket (state 0A), including IPv6.
-                check = "from pathlib import Path; " + (
-                    "assert not any(line.split()[3]=='0A' "
-                    "for p in ('/proc/net/tcp','/proc/net/tcp6') "
-                    "for line in Path(p).read_text().splitlines()[1:])"
+                wait_ready(container)
+                no_tcp_listener(container)
+                status = json.loads(
+                    docker("exec", container, "repoharbor", "status", "--json")
                 )
-                docker("exec", container, "python", "-c", check)
+                assert status["service_status"] == "running"
+                assert status["last_successful_run_at"] is None
+                assert exec_result(container, "backup", "run", "--all").returncode == 4
                 docker("stop", "-t", "15", container)
                 state = json.loads(docker("inspect", container))[0]["State"]
                 assert state["ExitCode"] == 0
@@ -101,7 +302,8 @@ def smoke():
             finally:
                 docker("rm", "-f", container)
         assert (Path(directory) / ".repoharbor.lock").exists()
-    print("Docker smoke passed: CLI, mount, non-root, headless, SIGTERM, recreate")
+        manual_smoke(f"type=bind,src={directory},dst=/backups")
+    print("Docker smoke passed: CLI, mount, non-root, headless, SIGTERM, manual backup")
 
 
 if __name__ == "__main__":

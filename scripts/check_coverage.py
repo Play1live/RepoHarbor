@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 
 CRITICAL = {
+    "catalog",
+    "control",
     "persistence",
     "recovery",
     "storage",

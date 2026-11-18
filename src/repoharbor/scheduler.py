@@ -2,7 +2,7 @@
 
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from repoharbor.errors import HarborError
@@ -41,20 +41,35 @@ class Cron:
             raise HarborError("Invalid cron field or range") from None
 
     def matches(self, local: datetime) -> bool:
-        minute, hour, day, month, weekday = self.fields
+        minute, hour, *_ = self.fields
+        return (
+            local.minute in minute and local.hour in hour and self.matches_date(local)
+        )
+
+    def matches_date(self, local: datetime) -> bool:
+        _, _, day, month, weekday = self.fields
         dom = local.day in day
         dow = (local.weekday() + 1) % 7 in {v % 7 for v in weekday}
-        # Vixie cron: a day field beginning with '*' (including steps/lists)
-        # selects AND semantics. Explicit ranges/lists retain OR semantics,
-        # even when their expanded values cover every possible day.
+        # Vixie cron uses AND if either day field starts with a wildcard.
         wildcard_day = self.raw[2].startswith("*") or self.raw[4].startswith("*")
-        date_match = (dom and dow) if wildcard_day else (dom or dow)
-        return (
-            local.minute in minute
-            and local.hour in hour
-            and local.month in month
-            and date_match
+        return local.month in month and (
+            (dom and dow) if wildcard_day else (dom or dow)
         )
+
+    def next_after(self, now: datetime, zone: ZoneInfo) -> datetime | None:
+        day = now.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes, hours, *_ = self.fields
+        times = [(hour, minute) for hour in sorted(hours) for minute in sorted(minutes)]
+        # A Gregorian cycle covers every possible combination of calendar fields.
+        for _ in range(146097):
+            if self.matches_date(day):
+                for hour, minute in times:
+                    local = day.replace(hour=hour, minute=minute, fold=0)
+                    instant = local.astimezone(UTC)
+                    if instant > now and instant.astimezone(zone) == local:
+                        return local
+            day += timedelta(days=1)
+        return None
 
 
 class Scheduler:
@@ -73,7 +88,7 @@ class Scheduler:
         self.on_skip = on_skip
         self._ticks = threading.Lock()
 
-    def tick(self, now: datetime, run: Callable[[], None]) -> bool:
+    def tick(self, now: datetime, run: Callable[[], object]) -> bool:
         with self._ticks:
             minute = int(now.timestamp() // 60)
             if minute <= self.last_minute:

@@ -199,11 +199,18 @@ def test_missing_metadata_never_reclones(factory):
 
 @pytest.mark.parametrize("kind", ["clone", "update"])
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGKILL])
-def test_signal_while_git_command_active(factory, remote, kind, sig):
+@pytest.mark.parametrize("manual", [False, True])
+def test_signal_while_git_command_active(factory, remote, kind, sig, manual):
     """A real upload-pack process blocks at an IPC barrier during Git transfer."""
+    import socket
     import subprocess
+    from dataclasses import replace
+    from datetime import UTC, datetime
 
     from conftest import LocalGit
+
+    from repoharbor import control
+    from repoharbor.scheduler import Cron, Scheduler
 
     if kind == "update":
         with factory() as engine:
@@ -211,6 +218,8 @@ def test_signal_while_git_command_active(factory, remote, kind, sig):
         git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
     ctx = multiprocessing.get_context("fork")
     parent, child = ctx.Pipe()
+    ready = ctx.Event()
+    config = replace(factory.config, manual_run=manual)
     # The upload-pack wrapper signals readiness through a separate inherited FD.
     read_fd, write_fd = os.pipe()
     wrapper = factory.root.parent / "blocked-upload-pack"
@@ -234,7 +243,10 @@ def test_signal_while_git_command_active(factory, remote, kind, sig):
                     f"--upload-pack={wrapper}",
                     *args[index + 1 :],
                 ]
-                kwargs["pass_fds"] = (write_fd,)
+                if manual:
+                    kwargs["pass_fds"] = (*kwargs["pass_fds"], write_fd)
+                else:
+                    kwargs["pass_fds"] = (write_fd,)
             process = real_popen(args, **kwargs)
             if "clone" in args or "fetch" in args:
                 active_pid = process.pid
@@ -244,13 +256,27 @@ def test_signal_while_git_command_active(factory, remote, kind, sig):
         subprocess.Popen = popen
         git_instance = LocalGit(remote[1])
         signal.signal(signal.SIGTERM, lambda *_: git_instance.stop.set())
-        with factory(git_instance=git_instance) as engine:
-            engine.run()
+        with factory(config, git_instance=git_instance) as engine:
+            if not manual:
+                engine.run()
+                return
+            scheduler = Scheduler(
+                Cron(config.schedule), config.timezone, datetime.now(UTC)
+            )
+            with control.Control(engine, scheduler, git_instance.stop).start():
+                ready.set()
+                assert git_instance.stop.wait(30)
 
     process = ctx.Process(target=child_run)
     process.start()
     git_pid = None
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    connection.settimeout(10)
     try:
+        if manual:
+            assert ready.wait(10)
+            connection.connect(control.endpoint(config.root))
+            connection.sendall(b"repo demo")
         assert parent.poll(15)
         git_pid = parent.recv()
         import select
@@ -262,19 +288,39 @@ def test_signal_while_git_command_active(factory, remote, kind, sig):
         assert not process.is_alive()
         if sig == signal.SIGKILL:
             assert process.exitcode == -sig
+            if manual:
+                assert not connection.recv(8)
+                with pytest.raises(OSError), factory(config):
+                    pass
         else:
             assert process.exitcode == 0
+            if manual:
+                assert connection.recv(8) == b"9"
     finally:
+        connection.close()
         if process.is_alive():
             process.kill()
             process.join()
         if git_pid:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(git_pid, signal.SIGKILL)
-        os.close(read_fd)
         os.close(write_fd)
+        if manual and sig == signal.SIGKILL and git_pid is not None:
+            assert select.select([read_fd], [], [], 10)[0], (
+                "orphan Git group did not exit"
+            )
+            assert os.read(read_fd, 1) == b""
+        os.close(read_fd)
+    if manual and sig == signal.SIGKILL:
+        with control.listen(config.root):
+            pass
     with factory() as engine:
         recover(engine)
+        if manual:
+            assert engine.store.data["active_run"]["trigger"] == "manual"
+            assert engine.store.data["active_run"]["state"] == "interrupted"
+            if kind == "clone":
+                assert "last_successful_run_at" not in engine.store.data["scheduler"]
         assert engine.repos["demo"]["backup"]["status"] in ("error", "interrupted")
         if kind == "update":
             assert engine.git.healthy(engine.path("demo") / "repository.git")
