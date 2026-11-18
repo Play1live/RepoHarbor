@@ -207,3 +207,74 @@ def api_response(value, headers=None):
     response = io.BytesIO(json.dumps(value).encode())
     response.headers = headers or {}
     return response
+
+
+def raw_project(
+    rid=17,
+    owner="fictional",
+    name="project",
+    host="gitlab.example.org",
+    kind="user",
+    **extra,
+):
+    return {
+        "id": rid,
+        "namespace": {"id": 90, "kind": kind, "full_path": owner},
+        "path": name,
+        "path_with_namespace": f"{owner}/{name}",
+        "http_url_to_repo": f"https://{host}/{owner}/{name}.git",
+        "web_url": f"https://{host}/{owner}/{name}",
+        "visibility": "public",
+        "archived": False,
+        "default_branch": "main",
+        "created_at": "2026-01-01T00:00:00.000Z",
+        **extra,
+    }
+
+
+@pytest.fixture
+def gitlab_env(factory, remote, monkeypatch):
+    from repoharbor.gitlab import parse_project
+
+    cfg = replace(
+        factory.config,
+        sources=(),
+        credentials=("first", "second"),
+        providers=(
+            Provider("one", "first", type="gitlab", host="gitlab.example.org"),
+            Provider("two", "second", type="gitlab", host="gitlab.example.org"),
+        ),
+        selection=Selection(mode="all"),
+    )
+    results = {"first": [raw_project()], "second": [raw_project()]}
+    client = Mock(retry_at=0.0)
+    client.discover.side_effect = lambda p: [
+        Observation(parse_project(r, p.host), p.credential, True)
+        for r in results[p.credential]
+    ]
+    client.manual_identity.return_value = "gitlab:gitlab.example.org:17"
+    monkeypatch.setattr("repoharbor.engine.GitLab", lambda *a, **kw: client)
+
+    class MappedGit(LocalGit):
+        def __init__(self):
+            super().__init__(remote[1])
+            self.credentials.values.update(
+                first="fictional-first", second="fictional-second"
+            )
+
+        def run(self, args, credential=None, interrupt=lambda: False):
+            self.calls.append(args.copy())
+            args = [
+                str(self.bare) if a.startswith("https://gitlab.example.org/") else a
+                for a in args
+            ]
+            return super().run(args, credential, interrupt)
+
+    return SimpleNamespace(
+        config=cfg,
+        create=factory,
+        client=client,
+        results=results,
+        git=MappedGit,
+        key="gitlab:gitlab.example.org:17",
+    )

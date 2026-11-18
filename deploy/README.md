@@ -1,6 +1,6 @@
-# RepoHarbor 0.2.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.3.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.2.0**. No real NAS/Portainer deployment has yet been accepted. The commands below are operator instructions, not claims that deployment or a production restore has already been performed. All example hosts, source repositories, paths, and credential names are fictional and must be checked for your environment.
+This guide covers RepoHarbor **0.3.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,13 +38,13 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.2.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.3.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
 ```
 
-Do not disable certificate validation. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. Do **not** add an application port, healthcheck, or `INITIALIZE_*` environment variable. Docker init is intentionally omitted for NAS compatibility: on the tested NAS it prevents startup with `/sbin/docker-init: permission denied`.
+Do not disable certificate validation. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. Do **not** add an application port, healthcheck, or `INITIALIZE_*` environment variable. The example omits Docker init for NAS compatibility. RepoHarbor handles signals and Git child processes directly.
 
 ## 3. Configure sources and credentials
 
@@ -123,17 +123,19 @@ Supply the interpolated variable through a protected local mechanism or the Port
 
 Multiple named credentials are supported. Each configured source may reference one credential name; for example, `example_primary` maps to `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`. If a private Git server uses its own CA, mount a trusted certificate bundle read-only and set `SSL_CERT_FILE` to its path. TLS verification must remain enabled. See the [configuration reference](../docs/CONFIGURATION.md) for normalization rules, supported fields, and defaults.
 
-### GitHub sources alongside manual sources
+### GitHub and GitLab alongside manual sources
 
-GitHub.com REST discovery is available in this development build. Use the complete [GitHub configuration example](../docs/CONFIGURATION.md#github-discovery-and-selection) as the value of `REPOHARBOR_CONFIG`; retain the existing Compose mount, non-root user, restart policy and credential mode. No extra application port, init setting, config-file mount or service is required. GitLab, Enterprise servers, SSH and the dashboard remain unimplemented.
+Use the [combined configuration example](../docs/CONFIGURATION.md#combined-github-and-gitlab-example) as the value of `REPOHARBOR_CONFIG`. It configures GitHub.com, two tokens for GitLab.com, a Self-Managed GitLab instance at `gitlab.example.org:8443`, and a manual HTTPS source. Retain the Compose mounts, non-root user, restart policy, and credential mode.
 
-For the example's two credential names, file mode expects `example_personal` and `example_team` in the protected read-only secrets mount. In env mode, supply `REPOHARBOR_TOKEN_EXAMPLE_PERSONAL` and `REPOHARBOR_TOKEN_EXAMPLE_TEAM` securely and omit the secret mount. Do not configure both sources. Never paste real tokens into committed YAML or URLs.
+In file mode, provision `example_github`, `example_gitlab`, `example_gitlab_team`, and `example_self_managed` as separate protected files using the procedure above. In env mode, supply `REPOHARBOR_TOKEN_EXAMPLE_GITHUB`, `REPOHARBOR_TOKEN_EXAMPLE_GITLAB`, `REPOHARBOR_TOKEN_EXAMPLE_GITLAB_TEAM`, and `REPOHARBOR_TOKEN_EXAMPLE_SELF_MANAGED` securely and omit the secrets mount. Declare only credential names used by your adapted configuration.
 
-Classic PATs need sufficient repository read access; fine-grained PATs need access to each selected repository plus metadata and contents read permissions. Organization approval or SSO may also be required. Restricted fine-grained tokens do not discover repositories outside their grants, even with `mode: all`. Multiple provider entries reference these existing named credentials; the first in-scope configured provider determines Git authentication.
+GitHub classic PATs need sufficient repository read access; fine-grained PATs need access to each selected repository plus metadata and contents read permissions. Organization approval or SSO may also be required. Restricted fine-grained tokens do not discover repositories outside their grants, even with `mode: all`. Multiple provider entries reference these existing named credentials; the first in-scope configured provider determines Git authentication.
 
-The default selection is `selected` with an empty list. Choose repositories explicitly or deliberately opt into `all`/`all_except`; configure visibility, forks and archived repositories as needed. Explicit exclusion and property/scope filters always take precedence. Changes take effect after restart and are applied at future scheduled runs.
+GitLab requires a human user's personal access token with `read_api` for discovery and `read_repository` for Git-over-HTTPS. The user's membership and project permissions must allow the intended operations. Group and project tokens and bot accounts are unsupported. Use separate credential names per authority. A Self-Managed instance must serve the API at `/api/v4` and advertise HTTPS project URLs matching its configured lowercase DNS or IPv4 authority and port. For a private CA, mount a trusted CA bundle read-only and set `SSL_CERT_FILE` inside the container. Keep TLS verification enabled.
 
-GitHub mirrors live under `/backups/github/github.com/<repository-id>/`; manual paths remain under `/backups/manual/<alias>/`. Restore an intact discovered mirror offline using the same procedure, for example:
+The default selection is `selected` with an empty list. Choose repositories explicitly or deliberately opt into `all`/`all_except`; configure visibility, forks and archived repositories as needed. Include `internal` explicitly to select internal GitLab projects. Explicit exclusion and property/scope filters always take precedence. Changes take effect after restart and are applied at future scheduled runs.
+
+GitHub mirrors live under `/backups/github/github.com/<repository-id>/`. GitLab.com uses `/backups/gitlab/gitlab.com/<project-id>/`. Self-Managed GitLab uses `/backups/gitlab/<host>/<project-id>/`, or `<host>~<port>` for an explicit port. Manual paths remain under `/backups/manual/<alias>/`. For an offline GitHub restore, use the local mirror:
 
 ```sh
 git clone --no-hardlinks /path/to/backups/github/github.com/654321/repository.git ./restored-example
@@ -145,11 +147,21 @@ Inspect `data.json.discovery` when GitHub sources do not run. `GITHUB_UNAUTHORIZ
 
 Manual/API identity collisions block automatic assignment (`manual_identity_conflict`). An unresolved manual GitHub address pauses discovery, and a new manual alias for a known provider mirror is withheld (`PROVIDER_IDENTITY_CONFLICT`). Resolve the source configuration without deleting or transferring backup data. Details and limitations are in the [identity rules](../docs/CONFIGURATION.md#stable-paths-and-manual-conflicts).
 
+For GitLab, inspect `data.json.provider_discovery["gitlab:<authority>"]` after a scheduled run. Check that the authority's `completed_at` and the project's `source.last_seen_at` match the scheduled run you are reviewing. The project should report `source.discovery_status: available`. For each expected project, also check that `repository.git/` exists and that `metadaten.json` shows `backup.status` of `updated` or `up_to_date` with a recent successful `last_checked_at`. Test a local restore to verify the mirror. GitLab metadata may have an unknown `default_branch` when the API omits it. The Git result still determines source availability.
+
+| GitLab diagnostic | Check |
+|---|---|
+| `GITLAB_UNAUTHORIZED` or `GITLAB_FORBIDDEN` | Check token validity, expiry, API scope, and project/group access. A 403 identified as throttling is reported as a rate limit. |
+| `GITLAB_MANUAL_IDENTITY_UNRESOLVED` | Check that a manual URL on the affected authority is discoverable through at least one configured token for that authority. |
+| `GITLAB_RATE_LIMIT` | Inspect `retry_at` for the authority. Discovery can resume on a scheduled tick after that time. Cooldowns survive restarts and temporary provider removal. |
+| GitLab API response, network, pagination, or identity failure | Check TLS trust, authority/port, canonical GitLab URLs, and API compatibility. Incomplete discovery withholds the affected authority's Git work. |
+| `GIT_FAILED` after complete discovery | Check `read_repository` and the first in-scope token's project permissions. RepoHarbor records the Git failure without trying another token. |
+
 ## 4. Scheduling, limits, and status
 
 `0 3 * * *` means 03:00 every day in `TZ`. Cron uses five fields with numbers, ranges, lists, and steps. Following Vixie cron, when either day field begins with `*`, including `*/1`, `*/2`, or a wildcard-leading list, **both** day fields must match. For example, `0 3 */2 * 1` matches Mondays with an odd month day. If neither day field begins with `*`, matching uses **OR**, including explicit full ranges such as `1-31` and `0-7`. See the [configuration reference](../docs/CONFIGURATION.md#scheduling-and-storage-behavior). Nonexistent DST wall-clock minutes do not run; the repeated minute is run at most once. Missed ticks after downtime are **not** replayed; a scheduled tick during an active run is skipped and recorded durably.
 
-Storage values are in GiB (`1 GiB = 1,073,741,824 bytes`). `null` disables an individual soft size budget and `0` prevents starting new operations. Per-repository overrides use stable source aliases. The global budget includes all data in the backup root, including excluded repositories, metadata, journals, partial clones, and quarantine. A per-repository budget counts its entire source directory.
+Storage values are in GiB (`1 GiB = 1,073,741,824 bytes`). `null` disables an individual soft size budget and `0` prevents starting new operations. Per-repository overrides use manual aliases or stable GitHub/GitLab keys. The global budget includes all data in the backup root, including excluded repositories, metadata, journals, partial clones, and quarantine. A per-repository budget counts its entire source directory.
 
 **These are soft budgets, not filesystem quotas.** With `during_transfer: finish` (the default), a running transfer may exceed the configured size budget; `abort` can interrupt it when a limit is detected. The physical free-space reserve takes priority in either mode. Git stop signals are polled frequently, while capacity checks run at most every five seconds. Real disk exhaustion is still possible without host-side quotas. Storage is measured before and after operations and rechecked on the next regular run; valid backups are never deleted automatically to reclaim capacity.
 
@@ -180,7 +192,7 @@ docker compose -f deploy/compose.example.yaml up -d --no-build
 docker compose -f deploy/compose.example.yaml logs --tail 100 repoharbor
 ```
 
-The first start safely initializes missing state in an empty root, inventories existing data, performs necessary crash reconciliation, and then waits for **future** cron ticks. Startup recovery may repair a damaged existing mirror, but it does not catch up with missed scheduled backups. A `ready; waiting for future schedule` log entry **does not mean a backup has completed**. This development build has no supported `run-now` command. For supervised acceptance, temporarily schedule a small fictional test repository with `* * * * *`, confirm a successful run, then restore the intended schedule and restart.
+The first start safely initializes missing state in an empty root, inventories existing data, performs necessary crash reconciliation, and then waits for **future** cron ticks. Startup recovery can reconcile provider mirrors locally. Remote repairs for discovered repositories require complete discovery on a future scheduled run. Missed backups are skipped. A `ready; waiting for future schedule` log entry **does not mean a backup has completed**. This development build has no supported `run-now` command. For supervised acceptance, temporarily schedule a small test repository under your control with `* * * * *`, confirm a successful run, then restore the intended schedule and restart.
 
 To inspect scheduler/global storage state without loosening host permissions:
 
@@ -189,7 +201,7 @@ docker compose -f deploy/compose.example.yaml exec -T repoharbor python -c \
   'import json; from pathlib import Path; d=json.loads(Path("/backups/data.json").read_text()); print(d["global_storage"]); print(d["scheduler"])'
 ```
 
-Each `manual/<alias>/metadaten.json` records identity, selected status, source availability, timestamps, errors (the most recent 20 plus counters), storage, and integrity/repair state. An active container and a successful Docker restart **do not demonstrate backup freshness**.
+Each source directory's `metadaten.json` records identity, selected status, source availability, timestamps, errors (the most recent 20 plus counters), storage, and integrity/repair state. An active container and a successful Docker restart **do not demonstrate backup freshness**.
 
 ## 6. Portainer and controlled updates
 
@@ -212,7 +224,7 @@ docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor
 docker compose -f deploy/compose.example.yaml up -d --no-build --force-recreate
 ```
 
-SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. When rolling back, verify that the older version understands the existing state schema. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
+SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references, even though the schema remains version 1. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
 
 ## 7. Quarantine and troubleshooting
 
@@ -240,7 +252,15 @@ git clone --no-hardlinks \
   ./restored-example
 ```
 
-This restore does not need access to the original server or its token. Git project files and ordinary Git history are available if the mirror is valid and the default branch exists. For a different existing branch, use `git clone -b <branch> --no-hardlinks ...`. An empty repository or missing default branch will not automatically produce a checked-out working tree. Never modify the mirror to perform a restore.
+For a GitLab mirror, substitute its local project ID path. This example uses the Self-Managed authority with a non-default port:
+
+```sh
+git clone --no-hardlinks \
+  /srv/repoharbor/backups/gitlab/gitlab.example.org~8443/345678/repository.git \
+  ./restored-gitlab-demo
+```
+
+An offline restore needs only the local mirror and Git. Git project files and ordinary Git history are available if the mirror is valid and the default branch exists. For a different existing branch, use `git clone -b <branch> --no-hardlinks ...`. An empty repository or missing default branch will not automatically produce a checked-out working tree. Never modify the mirror to perform a restore.
 
 A mirror follows remote branch/tag deletion and force-pushes. It does **not** provide historical snapshots or preserve Git LFS payloads, submodule contents, issues, pull/merge requests, or hosting metadata. Plan separate protection for any of those requirements.
 

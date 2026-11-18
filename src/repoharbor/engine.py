@@ -3,6 +3,7 @@
 import logging
 import os
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from repoharbor.config import Config, Source, canonical_url, identifier
 from repoharbor.errors import GitError, HarborError
 from repoharbor.git_backup import Git
 from repoharbor.github import DiscoveryError, GitHub
+from repoharbor.gitlab import GitLab
 from repoharbor.persistence import (
     Store,
     atomic_json,
@@ -21,6 +23,7 @@ from repoharbor.persistence import (
     utcnow,
 )
 from repoharbor.registry import (
+    gitlab_manual_identities,
     manual_addresses,
     manual_identities,
     plan,
@@ -53,7 +56,9 @@ class Engine:
     def path(self, alias: str) -> Path:
         if ":" in alias:
             repository_key(alias)
-            return self.config.root / "github" / "github.com" / alias.rsplit(":", 1)[1]
+            kind, identity = alias.split(":", 1)
+            host, rid = identity.rsplit(":", 1)
+            return self.config.root / kind / host.replace(":", "~") / rid
         return self.config.root / "manual" / identifier(alias)
 
     def save_meta(self, alias: str) -> None:
@@ -75,6 +80,14 @@ class Engine:
             if instance.exists():
                 entries.extend(
                     (repository_key(f"github:github.com:{f.name}"), f)
+                    for f in sorted(instance.iterdir())
+                )
+        gitlab = self.config.root / "gitlab"
+        if gitlab.exists():
+            for instance in sorted(gitlab.iterdir()):
+                host = instance.name.replace("~", ":")
+                entries.extend(
+                    (repository_key(f"gitlab:{host}:{f.name}"), f)
                     for f in sorted(instance.iterdir())
                 )
         for alias, folder in entries:
@@ -176,10 +189,114 @@ class Engine:
             self.save_meta(source.alias)
 
     def discover(self) -> None:
+        github_config = replace(
+            self.config,
+            providers=tuple(p for p in self.config.providers if p.type == "github"),
+        )
+        original = self.config
+        try:
+            self.config = github_config
+            self.discover_github()
+        finally:
+            self.config = original
+        sources = self.sources
+        hosts = {p.host for p in original.providers if p.type == "gitlab"} | {
+            m["repository"]["host"]
+            for m in self.repos.values()
+            if m["repository"]["provider"] == "gitlab"
+        }
+        for host in sorted(hosts):
+            providers = tuple(
+                p for p in original.providers if p.type == "gitlab" and p.host == host
+            )
+            config = replace(original, providers=providers)
+            sources += self.discover_gitlab(config, host)
+        self.sources = sources
+
+    def discover_gitlab(self, config: Config, host: str) -> tuple[Source, ...]:
+        import time
+
+        state_key = "gitlab:" + host
+        previous = self.store.data.get("provider_discovery", {}).get(state_key, {})
+        if config.providers and previous.get("retry_at", 0) > time.time():
+            return ()
+        with self.store.transaction() as data:
+            data.setdefault("provider_discovery", {})[state_key] = {
+                "state": "running",
+                "started_at": utcnow(),
+                "retry_at": previous.get("retry_at", 0),
+            }
+        client = GitLab(
+            self.git.credentials,
+            request_delay_ms=config.discovery.request_delay_ms,
+            stop=self.git.stop,
+        )
+        client.bind(host)
+        client.retry_at = previous.get("retry_at", 0)
+
+        def persist_cooldown(until: float) -> None:
+            with self.store.transaction() as data:
+                data["provider_discovery"][state_key]["retry_at"] = until
+
+        client.on_cooldown = persist_cooldown
+        try:
+            observations = []
+            for provider in config.providers:
+                observations.extend(client.discover(provider))
+            manual_ids = (
+                gitlab_manual_identities(
+                    client, config, manual_addresses(config, self.repos, host), host
+                )
+                if config.providers
+                else set()
+            )
+            proposed, sources = plan(
+                config,
+                self.repos,
+                observations,
+                manual_ids,
+                provider_type="gitlab",
+                host=host,
+            )
+        except DiscoveryError as error:
+            with self.store.transaction() as data:
+                data["provider_discovery"][state_key].update(
+                    state="failed",
+                    code=str(error),
+                    retry_at=max(error.retry_at, client.retry_at),
+                )
+            logging.warning(
+                "GitLab discovery skipped: %s", str(error).replace("GITHUB_", "GITLAB_")
+            )
+            return ()
+        with self.store.transaction() as data:
+            data["provider_discovery"][state_key]["retry_at"] = client.retry_at
+        for alias, meta in proposed.items():
+            folder = self.path(alias)
+            if alias not in self.repos:
+                folder.parent.mkdir(parents=True, exist_ok=True)
+                sync_directory(config.root)
+                sync_directory(folder.parent.parent)
+                folder.mkdir(exist_ok=False)
+                sync_directory(folder.parent)
+            self.repos[alias] = meta
+            self.save_meta(alias)
+            self.checkpoint("discovery_metadata")
+        with self.store.transaction() as data:
+            data["provider_discovery"][state_key].update(
+                state="completed",
+                completed_at=utcnow(),
+                retry_at=client.retry_at,
+            )
+        return sources
+
+    def discover_github(self) -> None:
         import time
 
         self.sources = self.manual_sources()
-        if not self.config.providers and not any(":" in k for k in self.repos):
+        if not self.config.providers and not any(
+            k.startswith("github:") for k in self.repos
+        ):
             return
         previous = self.store.data.get("discovery", {})
         if self.config.providers and previous.get("retry_at", 0) > time.time():

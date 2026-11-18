@@ -103,8 +103,19 @@ def validate_state(data: dict[str, Any]) -> None:
             raise ValueError
         if "last_checked_at" not in data["recovery"]:
             raise ValueError
+        states = data.get("provider_discovery", {})
+        if not isinstance(states, dict):
+            raise ValueError
+        for name in states:
+            from repoharbor.selection import instance_host
+
+            if not isinstance(name, str) or not name.startswith("gitlab:"):
+                raise ValueError
+            instance_host(name.removeprefix("gitlab:"))
+        discoveries = list(states.values())
         if "discovery" in data:
-            discovery = data["discovery"]
+            discoveries.append(data["discovery"])
+        for discovery in discoveries:
             if (
                 not isinstance(discovery, dict)
                 or discovery.get("state") not in ("running", "failed", "completed")

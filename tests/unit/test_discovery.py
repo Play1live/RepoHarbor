@@ -92,7 +92,7 @@ def test_config_additive_defaults_and_stable_override():
     "change",
     [
         {"providers": {}},
-        {"providers": [{"id": "one", "type": "gitlab", "credential": "first"}]},
+        {"providers": [{"id": "one", "type": "unsupported", "credential": "first"}]},
         {
             "providers": [
                 {
@@ -118,7 +118,7 @@ def test_config_additive_defaults_and_stable_override():
         {"selection": {"mode": "unknown"}},
         {"selection": {"visibility": []}},
         {"selection": {"visibility": "public"}},
-        {"selection": {"visibility": ["internal"]}},
+        {"selection": {"visibility": ["unsupported"]}},
         {"selection": {"include_forks": 1}},
         {"selection": {"include_archived": None}},
         {"selection": {"selected": "17"}},
@@ -405,9 +405,11 @@ def test_duplicate_id_and_pagination_limit():
     )
     assert len(client.discover(Provider("one", "first"))) == 1
     client.request = Mock(
-        side_effect=lambda path, credential: ({"login": "fictional"}, {})
-        if path == "/user"
-        else ([raw_repo()] * 100, {})
+        side_effect=lambda path, credential: (
+            ({"login": "fictional"}, {})
+            if path == "/user"
+            else ([raw_repo()] * 100, {})
+        )
     )
     with pytest.raises(DiscoveryError, match="PAGINATION_LIMIT"):
         client.discover(Provider("one", "first"))

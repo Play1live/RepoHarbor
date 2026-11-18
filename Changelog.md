@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Added discovery for GitLab.com and compatible Self-Managed GitLab instances, including HTTPS authorities with non-default ports. Multiple personal access tokens and provider entries can cover personal, group, subgroup, and shared projects.
+- Extended explicit repository selection, exclusions, and fork/archive/visibility filters to GitLab. GitLab's `internal` visibility is opt-in through the visibility list. The empty `selected` default remains safe.
+- Added stable GitLab project identities scoped by authority. Overlapping token results are deduplicated, and renames and namespace transfers keep one mirror and its confirmed address history. Manual identity checks try the next same-authority token only after an API 404 and block ambiguous assignments.
+- Added bounded GitLab keyset and offset pagination, strict validation of continuations and clone URLs, configurable request pacing, and persistent cooldowns that survive restarts and temporary provider removal.
+- Isolated discovery failures and cooldowns by GitLab authority. GitHub keeps its existing discovery scope, and eligible manual sources keep running. GitLab publishes runnable selections only after complete instance discovery and durable metadata writes.
+- Integrated GitLab with mirror backup, offline restore, crash recovery, and storage limits using schema 1. Missing GitLab default branches are recorded as unknown, and API visibility remains independent of Git read access.
+
 ## 0.2.0
 
 - Added scheduled GitHub.com repository discovery with multiple classic/fine-grained tokens, ID-based deduplication, owned/organization/collaborator scopes, explicit selection/exclusion and visibility/fork/archive filters.
