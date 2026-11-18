@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document covers RepoHarbor `0.2.0`. This document describes the implemented protections and their limits. Passing local or CI tests does not certify a production NAS/Portainer installation.
+This document describes the security and recovery guarantees of RepoHarbor `0.3.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -29,6 +29,20 @@ The registry deduplicates by provider, host and immutable repository ID, retaini
 
 A failed or incomplete token discovery suspends the entire GitHub part of that run. No incomplete selection is applied and no stale selection permits remote repair. Independent manual sources remain eligible. Manual address resolution is conservative; unresolved or redirected GitHub addresses pause automatic discovery rather than risk a duplicate. Full rules and the limitation around unknown historical manual aliases are documented in [configuration](CONFIGURATION.md#stable-paths-and-manual-conflicts).
 
+## GitLab API and instance boundary
+
+The GitLab v4 client requires an explicit HTTPS authority before it can send requests. It supplies the token in the `PRIVATE-TOKEN` header. Use a human user's personal access token with `read_api` and sufficient project/group visibility for discovery, plus `read_repository` and project read access for Git. Group and project access tokens and bot accounts are unsupported. Credential references are bound to a provider type and authority. A manual source can reuse a bound credential only at its matching authority. Git uses the first in-scope credential via isolated Askpass with username `oauth2`; a Git failure does not trigger token fallback.
+
+TLS verification applies to the API and Git. For an instance with a private CA, mount a trusted CA bundle read-only and set `SSL_CERT_FILE`. A Self-Managed instance must expose its API at the root `/api/v4` path and return canonical HTTPS project URLs for the same lowercase DNS or IPv4 authority, including any configured non-default port. The API client rejects redirects. RepoHarbor constructs clone and web URLs from the configured authority and validated namespace and project paths and requires exact agreement with the API fields. Git also disables redirects.
+
+Pagination validates the authority, endpoint, fixed parameters, and cursor or page progression. Requests are built locally within page-count, response-size, socket, and discovery deadline bounds. These checks constrain API-supplied destinations. The operator still controls the configured authorities and manual URLs, and the application does not filter resolved addresses or pin DNS resolutions. Configured servers may resolve to private networks. Control configuration, DNS, and outbound network access accordingly. See [API pacing and rate limits](CONFIGURATION.md#api-pacing-and-rate-limits) for the bounds and headers.
+
+Complete discovery on one authority requires all of its configured tokens and manual identity lookups to succeed. API errors, a cooldown, incomplete pagination, and ambiguous identities withhold its Git work and remote repairs. Other GitLab authorities, GitHub, and eligible manual sources remain independent. GitLab stores cooldowns in the central journal, including a zero-quota HTTP 200 cooldown before the response body is read. GitLab hosts retain their stored cooldowns across restart and temporary removal.
+
+A successful API discovery does not guarantee a successful mirror backup. API presence updates `source.discovery_status` and `source.last_seen_at`. Only Git access can confirm Git availability. Git may fail despite API visibility, for example if the token lacks Git read permission. GitLab can omit `default_branch` or return null with limited access. RepoHarbor records it as unknown. The field establishes neither an empty project nor permission to read Git data.
+
+Stable identity includes the provider, authority, and project ID. Conflicting observations or reuse of a confirmed address by a different ID suspend the affected discovery. Manual collisions block automatic assignment and do not authorize adopting a manual mirror. Manual identity queries use only same-authority GitLab credentials, in configuration order, advancing only after HTTP 404. See [manual identity handling](CONFIGURATION.md#stable-paths-and-manual-conflicts).
+
 ## Journaling and crash consistency
 
 The single-writer lock prevents two active RepoHarbor instances from mutating the same root. The central `data.json` journal is persisted **before Git mutations**, using temporary-file writes, flush/`fsync`, atomic replacement, and parent-directory synchronization. Repository metadata is written before marking an operation complete. Scheduler overlap events and worker journal transitions use serialized, durable read-modify-write transactions.
@@ -37,7 +51,7 @@ Crash recovery reconciles interrupted operations, records proven completion only
 
 An existing valid mirror is **never automatically deleted or replaced by a fresh clone**. Removing a source from configuration preserves its local backup. A remote disappearance or authentication failure does not prove that the repository was deleted.
 
-Discovery records its own state in the existing central `data.json` without replacing the active Git-operation slot. Repository metadata is atomically written, but the catalog is **not** a multi-file atomic filesystem transaction. Runnable GitHub sources are published in memory only after all metadata writes and the completion marker are durable. A crash during catalog publication may leave some metadata updated; startup permits no GitHub remote work from that partial catalog, and a fresh complete discovery must recompute selection. Missing metadata in a newly created directory fails closed and may require operator review; it is never silently overwritten or re-cloned. Existing Git journals and completion markers continue to govern backup recovery.
+Discovery records its own state in the existing central `data.json` without replacing the active Git-operation slot. Repository metadata is atomically written, but the catalog is **not** a multi-file atomic filesystem transaction. Runnable GitHub sources and the runnable sources for each GitLab authority are published in memory only after all metadata writes and the completion marker are durable. A crash during catalog publication may leave some metadata updated; startup permits no discovered-source remote work from that partial catalog, and a fresh complete discovery must recompute selection. Missing metadata in a newly created directory fails closed and may require operator review; it is never silently overwritten or re-cloned. Existing Git journals and completion markers continue to govern backup recovery.
 
 ## Interrupted initial clones and quarantine
 
@@ -45,7 +59,7 @@ A temporary `repository.git.partial/` becomes a valid `repository.git/` **only**
 
 An identified interrupted first clone may be moved through a journaled rename into **one reserved slot** per source: `quarantine/initial-clone/`. Quarantined bytes remain preserved and count toward both repository and global size budgets. Startup reconciliation does **not** start a new clone; retry is permitted no earlier than the next normal cron tick.
 
-Unknown or unowned partials, excluded sources, a second partial while quarantine is occupied, missing quarantine content, and conflicting paths set persistent `backup.manual_attention_required` and prevent further automatic downloads. The service does not rotate or delete quarantines automatically. Missing/corrupt journal or metadata files fail closed rather than being silently reset. Only schema version `1` is accepted. GitHub metadata and the `data.json.discovery` marker are additive extensions; existing manual state is not migrated.
+Unknown or unowned partials, excluded sources, a second partial while quarantine is occupied, missing quarantine content, and conflicting paths set persistent `backup.manual_attention_required` and prevent further automatic downloads. The service does not rotate or delete quarantines automatically. Missing/corrupt journal or metadata files fail closed rather than being silently reset. Only schema version `1` is accepted. GitHub and GitLab metadata and the journal's `discovery` and `provider_discovery` entries are additive extensions. Existing manual state needs no migration.
 
 ### Operator procedure for `manual_attention_required`
 
@@ -64,7 +78,7 @@ Interrupted or suspect mirrors receive an on-demand local `git fsck --full` inte
 
 At most three genuine failed repair attempts are counted per incident; a successful repair resets the incident counter. Completed repair operation IDs make success/error counters idempotent after crashes. SIGTERM/SIGINT, interruption and capacity pauses do **not** consume a repair-failure attempt. A needed repair blocked by storage is `repair_paused` with `repair_deferred`, then reevaluated at the next scheduled run without a service restart. Exhausted genuine attempts stay `repair_failed`, even if space is also low.
 
-Remote repair downloads require an included repository, enabled automatic repair, adequate capacity, and permitted Git access. GitHub repair additionally requires a fresh, complete selection in the current scheduled run. Boot reconciliation is local for GitHub sources, and needed remote repairs wait with `DISCOVERY_REQUIRED`. **Excluded repositories receive no remote repair download**. If objects were deleted upstream or packs are irrecoverable, `repair_failed` can require manual operator action. The service keeps the old refs; it does not automatically replace the mirror.
+Remote repair downloads require an included repository, enabled automatic repair, adequate capacity, and permitted Git access. GitHub and GitLab repairs additionally require a fresh, complete selection for their discovery scope in the current scheduled run. Boot reconciliation for discovered sources is local. Needed remote repairs wait with `DISCOVERY_REQUIRED`. **Excluded repositories receive no remote repair download**. If objects were deleted upstream or packs are irrecoverable, `repair_failed` can require manual operator action. The service keeps the old refs; it does not automatically replace the mirror.
 
 ## Signals and failure handling
 

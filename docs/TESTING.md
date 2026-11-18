@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-This document covers RepoHarbor `0.2.0`. The test suite checks mocked GitHub REST responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash/recovery behavior, and a Linux Docker image. Tests do **not** certify an actual NAS or Portainer deployment.
+RepoHarbor `0.3.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -28,7 +28,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 |---|---:|
 | Total line coverage | **90%** |
 | Total branch coverage | **85%** |
-| Line coverage for **each** critical module (`credentials`, `persistence`, `git_backup`, `recovery`, `storage`, `selection`) | **95%** |
+| Line coverage for **each** critical module (`credentials`, `persistence`, `git_backup`, `recovery`, `storage`, `selection`, `gitlab`) | **95%** |
 
 `scripts/check_coverage.py` enforces these independently using `coverage.json`, including a check that branch-coverage data is present. A green pytest result alone does not replace the separate coverage gate.
 
@@ -37,6 +37,10 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | Test area | Covered scenarios |
 |---|---|
 | GitHub discovery | Multiple overlapping/restricted token lists, configured scopes, all selection modes, filter precedence, fork/archive handling, pagination and rate limits, malformed responses, token/network failures, and manual identity conflicts. |
+| GitLab configuration and authentication | Provider fields and scope defaults, DNS/IPv4 authorities and ports, credential binding, Private-Token headers, human account requirements, and refusal to send an API request before instance binding. |
+| GitLab discovery and selection | Personal, member-group, subgroup and shared projects, keyset/offset pagination, missing/inconsistent page evidence, invalid API fields, missing or null default branches, fork/archive/internal visibility filters, explicit selection and exclusion precedence. |
+| GitLab identity and mirrors | Overlapping tokens deduplicate by project ID, renames retain history and mirror paths, ports stay distinct, manual collisions with 404-only API fallback, and local clone, update, and offline restore. Simulated Git read denial leaves the API observation available and preserves an existing mirror. |
+| GitLab pacing and recovery | Request pacing and shutdown, quota headers and durable cooldowns, cooldown across temporary provider removal, isolation of token failures by authority alongside GitHub/manual sources, interrupted metadata publication, SIGKILL while reading a throttled response or publishing metadata, and injected persistence errors. |
 | Git integration | First mirror clone, no-op checks, default-branch changes, annotated tags, branch deletion/pruning, force-pushes, remote outages, and offline restore. |
 | HTTPS and credentials | Real local Git smart-HTTP over loopback TLS, a temporary trusted certificate, `GIT_ASKPASS` challenges, both `env` and `file` modes, redaction and token rotation behavior. |
 | Git/API status separation | Git failures survive API rediscovery/restart; new repositories remain unknown; exclusions, visibility filters and global/repository limits cannot confirm Git success; completed Git fetch restores availability; source extensions and timestamps survive discovery. |
@@ -46,7 +50,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | State and security | Corrupt/missing metadata, OS locking, unknown configuration fields, URL validation, secret handling, and error-code redaction. |
 | Docker | CLI/version/config validation, required bind mount, non-root execution, no listening socket or healthcheck, graceful shutdown, and recreation with retained data. |
 
-Tests use synthetic repositories and fictional credentials, not production tokens, live user repositories, or NAS data. An isolated test Git transport may enable local file access; the production product has HTTPS-only transport.
+Tests use fictional API payloads and credentials, local repositories, and a synthetic loopback TLS service. GitLab tests mock the provider API and exercise local Git mirrors. The suite does not contact a production GitLab instance or establish permissions, API behavior, or connectivity for a deployed instance. An isolated test Git transport may enable local file access; the production product has HTTPS-only transport.
 
 ## Docker and Compose smoke tests
 
@@ -85,13 +89,13 @@ These are the six **required check names** to select in branch protection:
 
 The workflow uploads test/coverage artifacts for review. They are **generated reports**, not product source files and should not be committed. The repository administrator must configure required checks and deletion/force-push protection in GitHub **Settings → Rules → Rulesets**; CI cannot grant itself branch-protection permissions.
 
-### Verified baseline (not a permanent guarantee)
+### Historical baseline before provider discovery
 
 For the reviewed development commit `d3d8080` on 2026-11-12, the associated [GitHub Actions run](https://github.com/Play1live/RepoHarbor/actions/runs/43288735934) reported **201 passed tests** on each of Python 3.12 and 3.13, **99.30% line coverage**, **98.30% branch coverage**, and 49 passed fault-injection tests. The six CI checks were successful at that commit. Future commits must be validated using their **own** completed CI runs; local and CI coverage values can vary slightly with timing.
 
-### GitHub discovery validation
+### Historical GitHub discovery validation
 
-The implementation commit `0b54760` was validated locally on Python 3.12.14 and 3.13.5 with **359 passing tests on each**, **98.90% line coverage** and **97.56% branch coverage**. All six critical module gates passed (the lowest was `git_backup` at 97.92% lines). This is a local result, not a claim about a future PR/CI run. The existing historical CI baseline above refers to its own earlier commit.
+The implementation commit `0b54760` was validated locally on Python 3.12.14 and 3.13.5 with **359 passing tests on each**, **98.90% line coverage** and **97.56% branch coverage**. All six critical module gates then in force passed (the lowest was `git_backup` at 97.92% lines). This is a local result, not a claim about a future PR/CI run. The existing historical CI baseline above refers to its own earlier commit.
 
 The source-status correction adds 14 regression cases covering actual Git access failure followed by successful API discovery, exclusion/visibility/storage skips, unknown initial Git status, successful local Git fetch, retained source extensions and timestamps, API absence/failure, and restart with schema-1 metadata. The corrected code passed **373 tests** on Python 3.12 before the version/documentation completion, with **98.90% line** and **97.56% branch coverage** and all coverage gates satisfied. The earlier 359-test result above remains a historical snapshot of its named commit; the final PR commit must pass its own CI run.
 
@@ -103,7 +107,7 @@ COVERAGE_FILE=/tmp/repoharbor-312.coverage .venv/bin/pytest --cov \
 .venv/bin/python scripts/check_coverage.py /tmp/repoharbor-312.json
 ```
 
-The new tests use fictional API payloads and real local Git mirrors. They verify deterministic credential association, partial-token failure with independent manual processing, persisted cooldowns, URL/ID conflicts, non-destructive restart recovery, and offline restore after rename. Fault injection includes interrupted discovery metadata publication, interrupted provider clones, and ENOSPC/EIO before metadata creation. No live GitHub token or provider contract test is required by the suite; actual organization permissions, SSO and fine-grained grants still require operator validation.
+The GitHub discovery tests use fictional API payloads and real local Git mirrors. They verify deterministic credential association, partial-token failure with independent manual processing, persisted cooldowns, URL/ID conflicts, non-destructive restart recovery, and offline restore after rename. Fault injection includes interrupted discovery metadata publication, interrupted provider clones, and ENOSPC/EIO before metadata creation. No live GitHub token or provider contract test is required by the suite; actual organization permissions, SSO and fine-grained grants still require operator validation.
 
 Ruff, format checks, strict mypy, Bandit at the CI medium/high threshold, dependency audit, Gitleaks, Compose validation, local Docker build and smoke tests were also run successfully for this implementation. None establishes real NAS/Portainer acceptance or authorizes image publication.
 
