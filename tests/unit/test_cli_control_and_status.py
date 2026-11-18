@@ -321,3 +321,73 @@ def test_catalog_rejects_untrusted_directories(factory, tmp_path, entry):
         root.symlink_to(factory.root)
     with pytest.raises(HarborError):
         catalog_entries(root)
+
+
+@pytest.mark.parametrize(
+    "integrity,backup,markers,excluded,consecutive,expected",
+    [
+        ("corrupt", "up_to_date", {}, False, 0, 1),
+        ("suspect", "up_to_date", {}, True, 0, 1),
+        ("repair_failed", "up_to_date", {}, False, 0, 1),
+        ("unchecked", "repair_paused", {}, False, 0, 1),
+        ("repairing", "up_to_date", {}, False, 0, 1),
+        ("unchecked", "repairing", {}, False, 0, 1),
+        ("unchecked", "pending", {"manual_attention_required": "PARTIAL"}, False, 0, 1),
+        ("healthy", "updated", {"repair_deferred": "DISCOVERY_REQUIRED"}, False, 0, 1),
+        (
+            "unchecked",
+            "pending",
+            {
+                "quarantine": {
+                    "state": "pending",
+                    "operation_id": "test",
+                    "relative_path": "quarantine/initial-clone",
+                }
+            },
+            False,
+            0,
+            1,
+        ),
+        ("repair_failed", "repair_failed", {"repair_deferred": "LIMIT"}, True, 2, 1),
+        ("unchecked", "pending", {}, True, 0, 0),
+        ("unchecked", "pending", {}, False, 0, 0),
+        ("healthy", "up_to_date", {}, False, 0, 0),
+        ("healthy", "updated", {}, False, 0, 0),
+        ("healthy", "up_to_date", {}, False, 1, 1),
+        ("unchecked", "error", {}, False, 0, 1),
+        ("unchecked", "interrupted", {}, False, 0, 1),
+    ],
+)
+def test_global_status_counts_current_repository_problems(
+    factory,
+    monkeypatch,
+    capsys,
+    integrity,
+    backup,
+    markers,
+    excluded,
+    consecutive,
+    expected,
+):
+    monkeypatch.setattr(cli, "load", lambda _: factory.config)
+    with factory() as engine:
+        meta = engine.repos["demo"]
+        meta["integrity"]["status"] = integrity
+        meta["backup"].update(status=backup, **markers)
+        meta["errors"]["consecutive"] = consecutive
+        meta["selection"]["status"] = "excluded" if excluded else "included"
+        engine.save_meta("demo")
+        paths = (factory.root / "data.json", engine.path("demo") / "metadaten.json")
+        before = [path.read_bytes() for path in paths]
+
+        monkeypatch.setattr(sys, "argv", ["repoharbor", "status", "--json"])
+        assert cli.main() == Result.SUCCESS
+        repos = json.loads(capsys.readouterr().out)["repositories"]
+        assert repos["with_errors"] == expected
+        assert repos["unreadable"] == 0
+        assert repos["excluded"] == int(excluded)
+
+        monkeypatch.setattr(sys, "argv", ["repoharbor", "status"])
+        assert cli.main() == Result.SUCCESS
+        assert f"with errors  {expected}" in capsys.readouterr().out
+        assert [path.read_bytes() for path in paths] == before

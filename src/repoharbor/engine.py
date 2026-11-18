@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from repoharbor.catalog import catalog_entries, directory, read_metadata
 from repoharbor.config import Config, Source
@@ -354,17 +355,27 @@ class Engine:
             recover(self, during_run=True)
 
         failures = self.discover()
+        failed_hosts = {key.partition(":")[2] for key in failures}
+        # An established manual mirror is authorized by its configured URL and
+        # durable backup history. A first clone on a failed provider instance
+        # must wait until discovery can rule out a duplicate provider mirror.
+        blocked_manual = {
+            source.alias
+            for source in self.sources
+            if ":" not in source.alias
+            and urlsplit(source.url).netloc in failed_hosts
+            and (
+                not (self.path(source.alias) / "repository.git").is_dir()
+                or self.repos[source.alias]["backup"]["successful_updates"] <= 0
+            )
+        }
+        self.sources = tuple(s for s in self.sources if s.alias not in blocked_manual)
         if repository is not None:
             provider = repository.rpartition(":")[0]
-            if provider in failures:
+            if provider in failures or repository in blocked_manual:
                 return Result.DISCOVERY_FAILED
             if repository not in self.repos:
                 return Result.UNKNOWN_REPOSITORY
-            if not provider:
-                url = self.repos[repository]["repository"]["clone_url"]
-                host = url.split("/", 3)[2]
-                if any(key.partition(":")[2] == host for key in failures):
-                    return Result.DISCOVERY_FAILED
             sources = tuple(s for s in self.sources if s.alias == repository)
             if not sources:
                 return Result.NOT_SELECTED

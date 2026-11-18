@@ -300,9 +300,23 @@ def print_status(config: Config, args: Namespace) -> Result:
             continue
         view = repo_view(config, alias, meta, False)
         if args.command == "status":
-            view["has_error"] = meta["errors"]["consecutive"] > 0 or view[
-                "backup_status"
-            ] in ("error", "repair_failed", "interrupted")
+            backup = meta["backup"]
+            view["has_error"] = (
+                meta["errors"]["consecutive"] > 0
+                or backup["status"]
+                in (
+                    "error",
+                    "interrupted",
+                    "repair_failed",
+                    "repair_paused",
+                    "repairing",
+                )
+                or meta["integrity"]["status"]
+                in ("corrupt", "suspect", "repair_failed", "repairing")
+                or "manual_attention_required" in backup
+                or bool(backup.get("repair_deferred"))
+                or backup.get("quarantine", {}).get("state") == "pending"
+            )
         views.append(view)
 
     result = Result.SUCCESS if unreadable == 0 else Result.STATE_UNAVAILABLE

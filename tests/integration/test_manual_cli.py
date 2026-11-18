@@ -215,3 +215,82 @@ def test_full_manual_run_keeps_independent_source_on_discovery_failure(
         assert engine.repos["demo"]["backup"]["successful_updates"] == 1
         assert "last_successful_run_at" not in engine.store.data["scheduler"]
         assert not engine.path(env.key).exists()
+
+
+@pytest.mark.parametrize("fixture", ["github_env", "gitlab_env"])
+@pytest.mark.parametrize("target", ["demo", None])
+def test_existing_same_host_manual_mirror_updates_during_discovery_failure(
+    request, remote, fixture, target
+):
+    env = request.getfixturevalue(fixture)
+    host = env.config.providers[0].host
+    config = replace(
+        env.config,
+        sources=(Source("demo", f"https://{host}/fictional/project.git"),),
+    )
+    with env.create(config, git_instance=env.git()) as engine:
+        assert engine.run() == Result.SUCCESS
+        mirror = engine.path("demo") / "repository.git"
+        assert (
+            engine.repos[env.key]["selection"]["reason"] == "manual_identity_conflict"
+        )
+        git("update-ref", "refs/heads/new", "HEAD", cwd=remote[1])
+        env.client.discover.side_effect = DiscoveryError("INTERRUPTED")
+
+        expected = Result.SUCCESS if target else Result.DISCOVERY_FAILED
+        assert engine.run(manual=True, repository=target) == expected
+        assert git("rev-parse", "refs/heads/new", cwd=mirror) == git(
+            "rev-parse", "HEAD", cwd=remote[1]
+        )
+        assert not (engine.path(env.key) / "repository.git").exists()
+
+
+@pytest.mark.parametrize("fixture", ["github_env", "gitlab_env"])
+@pytest.mark.parametrize("target", ["demo", None])
+@pytest.mark.parametrize("existing_directory", [False, True])
+def test_new_same_host_source_waits_for_discovery(
+    request, fixture, target, existing_directory
+):
+    env = request.getfixturevalue(fixture)
+    host = env.config.providers[0].host
+    config = replace(
+        env.config,
+        sources=(Source("demo", f"https://{host}/fictional/project.git"),),
+    )
+    env.client.discover.side_effect = DiscoveryError("INTERRUPTED")
+    with env.create(config, git_instance=env.git()) as engine:
+        mirror = engine.path("demo") / "repository.git"
+        if existing_directory:
+            git("init", "--bare", mirror)
+        before = sorted(mirror.rglob("*"))
+        assert engine.run(manual=True, repository=target) == Result.DISCOVERY_FAILED
+        assert not engine.git.calls
+        assert mirror.exists() == existing_directory
+        assert sorted(mirror.rglob("*")) == before
+
+
+@pytest.mark.parametrize("fixture", ["github_env", "gitlab_env"])
+def test_failed_discovery_keeps_conflicting_and_removed_manual_sources_blocked(
+    request, fixture
+):
+    env = request.getfixturevalue(fixture)
+    host = env.config.providers[0].host
+    url = f"https://{host}/fictional/project.git"
+    with env.create(env.config, git_instance=env.git()) as engine:
+        assert engine.run() == Result.SUCCESS
+        assert (engine.path(env.key) / "repository.git").is_dir()
+
+    config = replace(env.config, sources=(Source("demo", url),))
+    env.client.discover.side_effect = DiscoveryError("INTERRUPTED")
+    with env.create(config, git_instance=env.git()) as engine:
+        assert engine.run(manual=True, repository="demo") == Result.NOT_SELECTED
+        assert engine.run(manual=True) == Result.DISCOVERY_FAILED
+        assert not engine.git.calls
+
+    with env.create(env.config, git_instance=env.git()) as engine:
+        assert engine.repos["demo"]["selection"]["status"] == "excluded"
+        assert engine.run(manual=True, repository="demo") == Result.NOT_SELECTED
+        assert (
+            engine.run(manual=True, repository="unknown") == Result.UNKNOWN_REPOSITORY
+        )
+        assert not engine.git.calls
