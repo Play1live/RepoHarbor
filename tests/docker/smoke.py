@@ -414,7 +414,7 @@ for p in sorted(root.rglob('*')):
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.5.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.6.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")

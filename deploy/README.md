@@ -1,6 +1,6 @@
-# RepoHarbor 0.5.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.6.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.5.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.6.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.5.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.6.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -178,6 +178,24 @@ Storage values are in GiB (`1 GiB = 1,073,741,824 bytes`). `null` disables an in
 
 Selection, remote availability, and integrity are separate metadata dimensions. `last_checked_at` is only advanced by a successful remote check; `last_updated_at` only by a proven successful changed mirror. A skipped or failed run must not be reported as a successful backup.
 
+### Enable periodic integrity checks
+
+Add these settings inside the existing `REPOHARBOR_CONFIG` YAML. Merge `integrity_check` into the existing `features` mapping and apply the updated Compose or Portainer stack.
+
+```yaml
+features:
+  integrity_check: true
+integrity:
+  schedule: "0 4 * * 0"
+  include_excluded: true
+```
+
+The feature defaults to disabled. When enabled, the example checks existing mirrors every Sunday at 04:00 in `TZ`, independently of the backup cron. Set `include_excluded: false` to skip excluded mirrors. The existing service container performs the checks without additional ports or containers.
+
+A full Git check reads the object database and can use substantial CPU, memory, and NAS I/O on large mirrors. Repositories are checked sequentially. Choose a quiet window that leaves room for the entire run. Backups and checks share a lock, and overlapping scheduled runs are skipped. Manual backup requests can return exit `6` (`BUSY`) while a check runs.
+
+Use `repoharbor status` or `repoharbor status --json` to see the next check, current progress, previous result, and counts. Use `repoharbor repositories show example-demo` to inspect the mirror's current integrity status, last periodic result, and diagnostic code. After a restart, a previously running check is recorded as interrupted, and the service waits for the next future tick. A check that did not finish leaves the repository's previous completed result in place.
+
 ## 5. Validate, start, and inspect
 
 ```sh
@@ -194,7 +212,7 @@ docker compose -f deploy/compose.example.yaml up -d --no-build
 docker compose -f deploy/compose.example.yaml logs --tail 100 repoharbor
 ```
 
-The first start safely initializes missing state in an empty root, inventories existing data, performs necessary crash reconciliation, and then waits for **future** cron ticks. Startup recovery can reconcile provider mirrors locally. Remote repairs for discovered repositories require fresh, complete discovery in a subsequent backup run. Missed backups are skipped. To verify a backup, check its recorded timestamps and test an offline restore.
+The first start safely initializes missing state in an empty root, inventories existing data, performs necessary crash reconciliation, and then waits for **future** cron ticks. Startup recovery can reconcile provider mirrors locally. Remote repairs for discovered repositories require fresh, complete discovery in a subsequent backup run. Missed backups and periodic checks are skipped. Startup still performs needed recovery with periodic verification disabled. To verify a backup, check its recorded timestamps and test an offline restore.
 
 ### Inspect status and run manual backups
 
@@ -207,7 +225,7 @@ docker compose -f deploy/compose.example.yaml exec -T repoharbor repoharbor repo
 docker compose -f deploy/compose.example.yaml exec -T repoharbor repoharbor repositories show example-demo --json
 ```
 
-Use the ID shown by `repositories list`. For a configured manual source, this is its alias. For a discovered repository, use its stable key, for example `gitlab:gitlab.com:234567`. The read-only commands also work with manual backups disabled. `status` shows service reachability, current and recent runs, the next cron time, recorded storage usage and limits, and provider discovery. Use repository details to check selection, Git access, last successful check and update, errors, integrity, and pending repairs.
+Use the ID shown by `repositories list`. For a configured manual source, this is its alias. For a discovered repository, use its stable key, for example `gitlab:gitlab.com:234567`. The read-only commands also work with manual backups disabled. `status` shows service reachability, current and recent runs, the next cron time, recorded storage usage and limits, and provider discovery. The periodic integrity section shows its independent schedule, state, and counts. Use repository details to check selection, Git access, backup timestamps, the most recent completed integrity finding, and repair state.
 
 To enable manual backups, edit the existing `features` block **inside the multiline `REPOHARBOR_CONFIG`**.
 
@@ -234,7 +252,7 @@ docker exec "$container" repoharbor backup run --all
 docker exec "$container" repoharbor backup run --repository example-demo
 ```
 
-The backup command waits for the result. Exit `0` confirms a successful operation or a successful check with no changes. Exit `4` means the feature is disabled, `5` means the service could not be reached or the connection was lost, and `6` means another run already holds the shared lock. Requests do not queue. A disconnected CLI leaves the outcome unconfirmed for that client. Check status and repository timestamps before retrying.
+The backup command waits for the result. Exit `0` confirms a successful operation or a successful check with no changes. Exit `4` means the feature is disabled, `5` means the service could not be reached or the connection was lost, and `6` means a backup or integrity check already holds the shared lock. Requests do not queue. A disconnected CLI leaves the outcome unconfirmed for that client. Check status and repository timestamps before retrying.
 
 Exit `8` can mean that discovery failed or is in cooldown even if an unaffected source succeeded in a full run. Discovered repositories on the affected authority require fresh discovery. An established eligible manual mirror can continue, while an unproven or new same-authority mirror waits. For exit `9`, check repository backup, error, and repair states and the storage limits. See the [full exit-code table](../docs/CONFIGURATION.md#cli-commands-and-exit-codes).
 
@@ -269,13 +287,24 @@ For `manual_attention_required`, **stop the service before touching backup data*
 
 | Symptom | Safe checks |
 |---|---|
-| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names; `features.manual_run` and `features.restore_helper` must be booleans. `web_ui`, `integrity_check`, `auto_retry`, and `extended_logging` must remain disabled. |
+| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, and `integrity.include_excluded` must be booleans. Verify both cron expressions. `web_ui`, `auto_retry`, and `extended_logging` must remain disabled. |
 | Git access denied / token expired | Source permission, credential mode, token rotation; never put credentials into a remote URL or debug output. |
 | TLS error | Server certificate and trusted CA bundle; never disable verification. |
 | Mount / `EACCES` | Actual host filesystem, ACLs, UID/GID 10001, read-only secret bind; do not switch to a privileged container. |
 | `ENOSPC` or a budget pause | Free space and every preserved directory, including quarantine and operator archives; do not mass-delete mirrors. |
 | Process lock | Stop the other running instance. After a forced stop, wait for any surviving Git process to exit. An existing lock file alone does not indicate a held lock. |
-| `repair_failed` / invalid JSON | Preserve data and investigate manually; missing objects can only be recovered if the source still supplies them. |
+| `corrupt` or `repair_failed` | Preserve the data. A later eligible backup can attempt bounded repair if configured. If the required objects are available from a verified copy, follow the offline procedure below. |
+| `uncheckable` | Use the periodic error code to check the mount, read access, Git timeout, or repository layout. Keep the existing mirror and metadata while investigating. |
+| Invalid JSON | Preserve the journal and repository data for inspection. |
+
+### Verify an offline mirror repair
+
+1. Stop RepoHarbor and any other writer. For Compose, use `docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor`. In Portainer, stop the RepoHarbor service. Wait for surviving Git children to exit before touching the backup root.
+2. Preserve the affected mirror, its metadata, the central journal, and any partial or quarantine data before changing files. Verify the target directory and repair only the confirmed damage using objects from a trusted, independently verified source. Work on a separate copy first if the repair is uncertain. Keep the previous data available for review.
+3. Restart RepoHarbor after validating the repaired mirror. Leave the journal and metadata for RepoHarbor to reconcile. Wait for the next enabled periodic tick and compare `integrity_status` with the latest `periodic_integrity` result in `repositories show example-demo --json`.
+4. A full healthy recheck can clear obsolete damage-related repair blocks. An unresolved operation, manual-attention marker, or partial or pending quarantine still needs its own resolution. Excluded sources remain excluded. Backup success timestamps change only through the normal backup flow.
+
+See the [security and recovery rules](../docs/SECURITY.md#integrity-checks-and-bounded-repair) for the conditions governing a return to healthy status.
 
 ## 8. Offline restoration and acceptance
 

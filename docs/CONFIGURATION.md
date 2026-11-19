@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.5.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.6.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,9 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. Both flags are booleans, default to `false`, and operate independently. `web_ui`, `integrity_check`, `auto_retry`, and `extended_logging` must be `false` if supplied. |
+| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. Each is an independent boolean and defaults to `false`. `web_ui`, `auto_retry`, and `extended_logging` must be `false` if supplied. |
+| `integrity.schedule` | Independent five-field cron expression. Default `0 4 * * 0` (Sunday at 04:00 in `TZ`). |
+| `integrity.include_excluded` | Boolean. Default `true`. Set to `false` to skip excluded mirrors. |
 
 An example configuration with invented sources and values:
 
@@ -50,6 +52,7 @@ recovery:
 features:
   manual_run: false
   restore_helper: false
+  integrity_check: false
 ```
 
 `REPOHARBOR_CONFIG` can be provided in a Docker Compose multiline environment entry as in the [example stack](../deploy/compose.example.yaml). Use `repoharbor config validate` to validate the configuration and referenced credentials; this command does **not** download from a remote or create backup state.
@@ -222,11 +225,29 @@ Configuration and persisted state still use schema version `1`. GitLab adds prov
 
 ## Scheduling and storage behavior
 
-Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts stars, values, lists, ranges, and positive steps. Sunday is `0` or `7`. Following Vixie cron, if either day field begins with `*` (including `*/1`, `*/2`, or a list beginning with a wildcard), day-of-month and day-of-week must **both** match. Thus `0 3 */1 * 1` runs on Mondays, like `0 3 * * 1`; `0 3 1 * */1` runs on the first of the month, like `0 3 1 * *`. Larger steps still filter their day field: `0 3 */2 * 1` runs only on Mondays with an odd month day. If neither day field begins with `*`, they use traditional **OR** semantics, including explicit full ranges such as `1-31` or `0-7`. An IANA timezone determines local firing times. Missing DST minutes are skipped; a repeated local minute fires at most once. Missed execution times during downtime are not replayed, and ticks during an active backup are skipped without a queue.
+Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts stars, values, lists, ranges, and positive steps. Sunday is `0` or `7`. Following Vixie cron, if either day field begins with `*` (including `*/1`, `*/2`, or a list beginning with a wildcard), day-of-month and day-of-week must **both** match. Thus `0 3 */1 * 1` runs on Mondays, like `0 3 * * 1`; `0 3 1 * */1` runs on the first of the month, like `0 3 1 * *`. Larger steps still filter their day field: `0 3 */2 * 1` runs only on Mondays with an odd month day. If neither day field begins with `*`, they use traditional **OR** semantics, including explicit full ranges such as `1-31` or `0-7`. An IANA timezone determines local firing times. Missing DST minutes are skipped. A repeated local minute fires at most once. Missed execution times during downtime are not replayed, and backup or integrity ticks that overlap active work are skipped without a queue.
 
 Budgets use binary GiB (`1 GiB = 1,073,741,824 bytes`); fractional inputs are truncated to whole bytes. `0` means no new transfer may start. An override replaces the default per-repository budget; it does not add to it. Global usage includes **all** backup-root data, including excluded sources, journals, metadata, partials, and quarantines.
 
 With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh during subsequent backup runs. No existing backup is automatically deleted to free space.
+
+## Periodic integrity checks
+
+To enable the check, merge these settings into the existing service YAML.
+
+```yaml
+features:
+  integrity_check: true
+integrity:
+  schedule: "0 4 * * 0"
+  include_excluded: true
+```
+
+The check is disabled by default. The two fields under `integrity` are optional and the example shows their defaults. Cron expressions, unknown keys and non-boolean flag values are validated even when verification is disabled. The check cron is independent of the backup cron and uses the same IANA `TZ` timezone, Vixie day matching, and daylight-saving behavior. Startup waits for a future cron tick. The existing recovery checks still run when needed with this feature disabled.
+
+RepoHarbor checks existing, complete mirrors from its local catalog one at a time, including manual HTTPS, GitHub and GitLab sources. This works for retained mirrors when an upstream repository becomes unavailable or a source is removed from configuration. With `include_excluded: false`, it skips excluded repositories and applies current local selection filters for discovered repositories. Partial first clones and pending quarantines are skipped. The check uses structure and pack checks plus `git fsck --full`. It reads local Git data without discovery, remote requests or changes to objects and refs. A clean result establishes local Git integrity within the scope of the check. Upstream reachability and previously deleted content are outside that scope.
+
+Backup and integrity runs share a lock. Overlapping scheduled runs are skipped and counted for the corresponding schedule. No missed run is queued or retried automatically. A manual backup can return `BUSY` (exit `6`) during a check. See [integrity checks and bounded repair](SECURITY.md#integrity-checks-and-bounded-repair) for how a later eligible backup can handle recorded damage.
 
 ## CLI commands and exit codes
 
@@ -238,17 +259,30 @@ repoharbor status --json
 repoharbor repositories list
 repoharbor repositories list --json
 repoharbor repositories show example-demo
+repoharbor repositories show example-demo --json
 repoharbor repositories show gitlab:gitlab.com:234567 --json
 repoharbor backup run --all
 repoharbor backup run --repository example-demo
 repoharbor backup run --repository gitlab:gitlab.com:234567
 ```
 
-`show` and `--repository` accept a configured manual alias or a stable provider key from `repositories list`. Addresses and URLs used in selection configuration are invalid CLI selectors. `backup run` requires exactly one of `--all` and `--repository`. It requires `features.manual_run: true` and a reachable service. The flag leaves the cron schedule in place. Scheduled and manual work share a run lock. Manual requests during an active run receive exit `6`. A cron tick during a run is skipped and recorded, with no queue or backfill.
+`show` and `--repository` accept a configured manual alias or a stable provider key from `repositories list`. Addresses and URLs used in selection configuration are invalid CLI selectors. `backup run` requires exactly one of `--all` and `--repository`. It requires `features.manual_run: true` and a reachable service. The flag leaves the cron schedule in place. Scheduled and manual backups share the run lock with periodic integrity checks. When manual backups are enabled, an active backup or integrity check causes a new manual request to return exit `6`.
 
 The inspection commands are read-only and work with manual backups disabled. In text output, missing values are shown as `unknown`; JSON uses `null`. A reachable service only confirms that the control socket answered. The global view includes the most recent started and completed runs, the last successful full run, the next cron time in the configured timezone, provider discovery and cooldowns, and the last recorded storage measurement. A single-repository success updates that repository's metadata without advancing the last successful full-run timestamp.
 
-The repository list shows identity, selection, Git source availability, backup status, last check and update, recorded size, and the last error code. Details include the selection reason, API observation, error counters and recent events, integrity and repair state, storage limit, and the relative mirror path. `repositories.with_errors` counts a repository once if it has consecutive errors, a failed/interrupted backup, a corrupt or suspect mirror, a running, paused, or failed repair, pending quarantine, or a manual-attention marker. An exclusion alone contributes no error. Unreadable metadata is counted separately and can make the included, excluded, and error totals unknown.
+The repository list shows identity, selection, Git source availability, backup status, last check and update, recorded size, and the last error code. Details include the selection reason, API observation, error counters and recent events, integrity and repair state, storage limit, and the relative mirror path. `repositories.with_errors` counts a repository once if it has consecutive errors, a failed/interrupted backup, a corrupt or suspect mirror, a running, paused, or failed repair, pending quarantine, a manual-attention marker, or a last periodic result of `uncheckable`. An exclusion alone contributes no error. Unreadable metadata is counted separately and can make the included, excluded, and error totals unknown.
+
+The status commands never start a check or repair. For `status --json`, all integrity fields in the table belong to the `periodic_integrity` object.
+
+| Command | JSON fields |
+|---|---|
+| `status --json` | `enabled` and `next_scheduled_at` (null when disabled). |
+| `status --json` | `state` (`idle`, `running`, `completed`, or `interrupted`) and `current_repository` (the catalog ID under inspection, or null). |
+| `status --json` | `last_started_at`, `last_completed_at`, and `last_result` (`healthy`, `issues`, or `no_candidates` after a completed run). The counters `checked`, `healthy`, `corrupt`, `skipped`, and `uncheckable` track the most recent run or its progress. `checked` counts the `healthy` and `corrupt` findings. `skipped_overlaps` and `last_overlap_at` record schedule collisions. |
+| `repositories list --json` and `repositories show … --json` | `integrity_status` is the current metadata status. `periodic_integrity` contains `last_started_at`, `last_completed_at`, `last_result`, `damaged_at`, and `error_code` for that repository. |
+| `repositories show … --json` | The `integrity` object includes `status`, `last_checked_at`, `last_check_kind` (`periodic`, `recovery`, or `repair` when known), and repair details. The top-level `last_checked_at` is a backup timestamp. |
+
+A repository's last periodic result is `healthy` after a complete clean probe, `corrupt` when Git damage is detected, or `uncheckable` when a reliable result is unavailable, for example with a missing established mirror, unsupported layout, filesystem error, or Git timeout. Harmless dangling objects do not constitute corruption. A run interrupted by service shutdown has state `interrupted`. An unfinished repository check leaves its previous completion and result intact. A clean periodic finding can coexist with a blocked current status while a journal or another safety restriction remains unresolved.
 
 | Exit | Meaning |
 |---:|---|
@@ -258,7 +292,7 @@ The repository list shows identity, selection, Git source availability, backup s
 | `3` | Unknown repository in the catalog. |
 | `4` | The requested optional feature is disabled. |
 | `5` | Service unreachable or connection lost. The client cannot confirm the backup result. |
-| `6` | A backup run is already in progress, or the backup-root lock is held for another operation. |
+| `6` | A backup or integrity check is already in progress, or the backup-root lock is held for another operation. |
 | `7` | No eligible backup target or the target is excluded. |
 | `8` | Discovery failed or is in cooldown. A full run may have completed some unaffected backups. |
 | `9` | Backup failed, was interrupted, or could not complete, for example because of a storage or recovery block. |
@@ -288,8 +322,8 @@ Both commands require a new output path with an existing writable parent outside
 
 ## Runtime state and recovery
 
-- `data.json` is the central, durable run/operation journal and scheduler state. Its `discovery` section records GitHub discovery, and `provider_discovery` records GitLab discovery by authority. These records track running, completed, or failed discovery and any cooldown separately from the Git operation journal.
-- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror.
+- `data.json` is the central, durable run/operation journal and scheduler state. Its `discovery` section records GitHub discovery, and `provider_discovery` records GitLab discovery by authority. These records track running, completed, or failed discovery and any cooldown separately from the Git operation journal. The optional `integrity` section records the periodic run state, counters, and overlap history.
+- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`.
 - Each source directory's `repository.git/` contains the valid bare mirror when available. A partial first clone can exist as `repository.git.partial/`; an interrupted partial may be preserved in `quarantine/initial-clone/`.
 
 | State | Meaning |
@@ -297,6 +331,7 @@ Both commands require a new output path with an existing writable parent outside
 | `updated` / `up_to_date` | Successful changed mirror or successful no-op remote check. |
 | `global_limit_paused`, `repo_limit_reached`, `FREE_SPACE_RESERVE` | A new operation was withheld by a capacity condition. |
 | `repair_paused` + `repair_deferred` | Repair deferred for storage or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
+| `pending` | Backup work is pending. This can also follow a clean periodic check that cleared an obsolete repair status. |
 | `repair_failed` | Genuine exhausted repair attempts or an unrecoverable/unavailable repair condition. |
 | `interrupted` | Operation was interrupted or not proven complete. |
 | `manual_attention_required` | Data-preservation conflict, unknown partial, or occupied/missing quarantine requiring explicit operator action. |

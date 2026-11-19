@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.5.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.6.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -82,15 +82,33 @@ Do not use broad `rm -rf`, permission resets, or lock-file deletion as a trouble
 
 ## Integrity checks and bounded repair
 
-Interrupted or suspect mirrors receive an on-demand local `git fsck --full` integrity check. Unreachable/dangling Git objects alone are not corruption. For confirmed damaged mirrors, repair attempts to refetch **existing ref-tip object IDs** without destination refspecs or implicit ref mappings, then checks integrity again. This is intentionally not a general-purpose Git repair system.
+Recovery checks interrupted or suspect mirrors locally with `git fsck --full`. Unreachable/dangling Git objects alone are not corruption. For confirmed damaged mirrors, repair attempts to refetch **existing ref-tip object IDs** without destination refspecs or implicit ref mappings, then checks integrity again. This is intentionally not a general-purpose Git repair system.
 
 At most three genuine failed repair attempts are counted per incident; a successful repair resets the incident counter. Completed repair operation IDs make success/error counters idempotent after crashes. SIGTERM/SIGINT, interruption and capacity pauses do **not** consume a repair-failure attempt. A needed repair blocked by storage is `repair_paused` with `repair_deferred`, then reevaluated during a later eligible backup run without a service restart. Exhausted genuine attempts stay `repair_failed`, even if space is also low.
 
 Remote repair downloads require an included repository, enabled automatic repair, adequate capacity, and permitted Git access. GitHub and GitLab repairs additionally require a fresh, complete selection for their discovery scope in the current backup run. Boot reconciliation for discovered sources is local. Needed remote repairs wait with `DISCOVERY_REQUIRED`. **Excluded repositories receive no remote repair download**. If objects were deleted upstream or packs are irrecoverable, `repair_failed` can require manual operator action. The service keeps the old refs; it does not automatically replace the mirror.
 
+### Periodic local verification
+
+With `features.integrity_check: true`, RepoHarbor inspects existing mirrors sequentially from its on-disk catalog. It shares the service run lock with backups and does not run alongside their recovery or repair work. Startup recovery precedes scheduled work. The backup-root lock also excludes another service or an offline restore.
+
+Periodic Git probes run without provider credentials, network transports, lazy fetching, or optional Git locks. The Git environment isolates global and system configuration, credential helpers, hooks, and filesystem-monitor integration. Checks read the bare repository structure, verify pack/index pairs, and run `git fsck --full --no-dangling` without changing refs or objects. They refuse shallow or externally linked stores, promisor packs, and configurations that can redirect lookup or override the check. The backup root remains a trusted storage boundary.
+
+Each Git probe has a time limit. Output is streamed in bounded chunks. RepoHarbor retains a bounded amount of configuration or structure output and stores only classified findings and error codes. Missing or unsupported mirrors, permission or other filesystem failures, and timeouts are `uncheckable`. Confirmed object, pack or structure damage is `corrupt`. Dangling objects alone do not indicate damage.
+
+Periodic checks do not initiate repair or discovery. A new confirmed damage finding can block the mirror and make it eligible for the existing bounded repair flow during a later authorized backup. Selection, upstream authorization, capacity, and fresh provider discovery still govern that flow.
+
+### Return to healthy status after offline repair
+
+Stop RepoHarbor and preserve the existing data before [repairing a mirror offline](../deploy/README.md#verify-an-offline-mirror-repair). A subsequent successful full check can set the current integrity status to `healthy`, including for an excluded mirror. It clears a resolved incident's `repair_pending`, resets its active attempt count, and clears obsolete repair-only blockers. A former `repair_failed` or `repair_paused` backup status can become `pending` or retain a recorded capacity restriction. Exclusion still applies.
+
+Open journal operations, unfinished repairs, partial clones, pending quarantine, manual-attention markers and unrelated safety conditions retain their independent meaning. A clean Git finding does not reconcile an operation or authorize a backup. The check retains the damage timestamp, total and recent error history, and previous repair results. It clears a consecutive error count only when the retained events show that the entire streak was repair-related. Backup timestamps, successful update counters, and the count of successful automatic repairs are unaffected.
+
 ## Signals and failure handling
 
-SIGTERM/SIGINT stop new Git work, terminate the active Git process group, and escalate to SIGKILL after five seconds if needed. The process reaps its children; a forced SIGKILL cannot execute cleanup, so the next startup must reconcile the durable journal. A surviving Git process retains the backup-root lock until it exits. Fatal persistence errors stop the worker/service, preserving recoverable state rather than proceeding with an unjournaled mutation.
+SIGTERM/SIGINT stop new Git work, terminate the active Git process group, and escalate to SIGKILL after five seconds if needed. The process reaps its children; a forced SIGKILL cannot execute cleanup, so the next startup must reconcile the durable journal. A surviving Git process retains the backup-root lock until it exits. Fatal persistence errors stop the worker/service and preserve the last durable state.
+
+Periodic runs record their start and progress in `data.json` and store per-mirror findings in `metadaten.json` through atomic file updates. A stop during an unfinished check retains its previous completed finding and timestamp. A completed repository finding can survive a crash before the run counters are written. After a forced stop, startup marks an unfinished periodic run as `interrupted`. The next check starts at a future scheduled tick.
 
 Stored error history preserves total and consecutive counters plus at most the last 20 events, without raw remote stderr or token values. Storage measurements are point-in-time observations, not enforced filesystem quotas. A physical free-space reserve reduces risk but cannot guarantee protection from concurrent writers or sudden disk exhaustion.
 

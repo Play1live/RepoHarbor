@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Add opt-in periodic Git integrity checks with a separate cron schedule for existing mirrors, including excluded repositories by default. Local, read-only checks distinguish corruption from unavailable results and interruptions.
+- Persist periodic findings and progress for the status CLI. Share the backup execution lock and record skipped overlaps without replaying missed runs.
+- Route confirmed damage into the existing eligibility and recovery rules. A clean check after offline repair can restore healthy status and clear obsolete repair blocks while preserving independent safety restrictions and backup history.
+
 ## 0.5.0
 
 - Added an opt-in offline restore assistant for local Git mirrors, including excluded, removed, and unreachable sources with valid backups.
