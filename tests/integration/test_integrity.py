@@ -1,4 +1,6 @@
+import json
 import threading
+from argparse import Namespace
 from copy import deepcopy
 from dataclasses import replace
 from unittest.mock import Mock
@@ -6,13 +8,13 @@ from unittest.mock import Mock
 import pytest
 from conftest import git, raw_project, raw_repo
 
-from repoharbor import integrity
+from repoharbor import integrity, status
 from repoharbor.credentials import Credentials
 from repoharbor.errors import HarborError, Result
 from repoharbor.git_backup import Git
 from repoharbor.github import DiscoveryError, parse_repository
 from repoharbor.gitlab import parse_project
-from repoharbor.persistence import utcnow
+from repoharbor.persistence import record_error, utcnow
 from repoharbor.providers import Observation
 from repoharbor.recovery import recover
 from repoharbor.registry import plan
@@ -364,3 +366,284 @@ def test_uncertain_periodic_recovery_cannot_replace_an_unresolved_journal(
             recover(engine)
         assert engine.store.data["active_operation"]["id"] == journal
         assert engine.store.data["active_operation"]["state"] == "running"
+
+
+@pytest.mark.parametrize("excluded", [False, True])
+def test_offline_object_restoration_clears_periodic_damage(
+    factory,
+    monkeypatch,
+    excluded,
+):
+    config = replace(factory.config, sources=()) if excluded else factory.config
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        mirror = engine.path("demo") / "repository.git"
+        blob = blob_path(mirror)
+        contents = blob.read_bytes()
+        blob.unlink()
+        integrity.run(engine)
+        state = engine.repos["demo"]["integrity"]
+        assert state["status"] == "corrupt"
+        assert state["periodic"]["repair_pending"]
+        damage = state["periodic"]["damaged_at"]
+    # Repair the real object while RepoHarbor has released the root lock.
+    blob.write_bytes(contents)
+    before_files = snapshot(mirror)
+    with factory(config) as engine:
+        before = deepcopy(engine.repos["demo"])
+        scheduler = deepcopy(engine.store.data["scheduler"])
+        with monkeypatch.context() as local:
+            for method in ("fetch", "remote_refs", "clone"):
+                local.setattr(
+                    engine.git, method, Mock(side_effect=AssertionError(method))
+                )
+            local.setattr(
+                engine, "discover", Mock(side_effect=AssertionError("discovery"))
+            )
+            integrity.run(engine)
+        after = engine.repos["demo"]
+        state = after["integrity"]
+        assert state["status"] == "healthy"
+        assert state["last_check_kind"] == "periodic"
+        assert state["last_checked_at"] == state["periodic"]["last_completed_at"]
+        assert state["periodic"]["last_result"] == "healthy"
+        assert not state["periodic"]["repair_pending"]
+        assert state["periodic"]["damaged_at"] == damage
+        assert state["successful_repairs"] == 0
+        for key in ("backup", "errors", "selection", "source"):
+            assert after[key] == before[key]
+        assert after["selection"]["status"] == ("excluded" if excluded else "included")
+        assert engine.store.data["scheduler"] == scheduler
+        assert snapshot(mirror) == before_files
+        if not excluded:
+            assert engine.run() == Result.SUCCESS
+            assert after["backup"]["status"] == "up_to_date"
+
+
+@pytest.mark.parametrize("previous", ["repair_failed", "repair_paused", "suspect"])
+def test_verified_restore_retires_repair_state_only(
+    factory,
+    previous,
+    capsys,
+    monkeypatch,
+):
+    config = replace(factory.config, repair_attempts=1)
+    with factory(config) as engine:
+        assert engine.run() == Result.SUCCESS
+        mirror = engine.path("demo") / "repository.git"
+        blob = blob_path(mirror)
+        contents = blob.read_bytes()
+        blob.unlink()
+        integrity.run(engine)
+        meta = engine.repos["demo"]
+        if previous == "repair_failed":
+            # Exhaust a real repair incident by making the source unreachable.
+            with monkeypatch.context() as local:
+                local.setattr(
+                    engine.git, "fetch", Mock(side_effect=HarborError("GIT_FAILED"))
+                )
+                assert engine.run() == Result.BACKUP_FAILED
+            assert meta["integrity"]["status"] == "repair_failed"
+            assert meta["backup"]["status"] == "repair_failed"
+        elif previous == "repair_paused":
+            meta["backup"].update(
+                status="repair_paused",
+                repair_deferred="repo_limit_reached",
+                storage_status="repo_limit_reached",
+            )
+        else:
+            meta["integrity"]["status"] = "suspect"
+            record_error(meta, "GIT_FAILED")
+        engine.save_meta("demo")
+        before = deepcopy(meta)
+        scheduler = deepcopy(engine.store.data["scheduler"])
+    blob.write_bytes(contents)
+    with factory(config) as engine:
+        integrity.run(engine)
+        actual = engine.repos["demo"]
+        state = actual["integrity"]
+        assert state["status"] == "healthy"
+        assert state["periodic"]["repair_pending"] is False
+        assert state["repair_attempts"] == 0
+        for key in (
+            "last_repair_at",
+            "last_repair_result",
+            "completed_repair_operation",
+            "successful_repairs",
+        ):
+            assert state.get(key) == before["integrity"].get(key)
+        for key in ("total", "last", "recent"):
+            assert actual["errors"][key] == before["errors"][key]
+        assert actual["errors"]["consecutive"] == int(previous == "suspect")
+        for key in (
+            "last_checked_at",
+            "last_updated_at",
+            "last_attempt_at",
+            "successful_updates",
+        ):
+            assert actual["backup"][key] == before["backup"][key]
+        assert "repair_deferred" not in actual["backup"]
+        assert (
+            actual["backup"]["status"]
+            == {
+                "repair_failed": "pending",
+                "repair_paused": "repo_limit_reached",
+                "suspect": "updated",
+            }[previous]
+        )
+        assert engine.store.data["scheduler"] == scheduler
+
+        if previous == "repair_failed":
+            for command, action in (
+                ("status", None),
+                ("repositories", "list"),
+                ("repositories", "show"),
+            ):
+                args = Namespace(
+                    command=command, action=action, repository="demo", json=False
+                )
+                assert status.print_status(config, args) == Result.SUCCESS
+                output = capsys.readouterr().out
+                assert "repair_failed" not in output
+                assert "healthy" in output
+                args.json = True
+                assert status.print_status(config, args) == Result.SUCCESS
+                view = json.loads(capsys.readouterr().out)
+                if command == "status":
+                    assert view["repositories"]["with_errors"] == 0
+                    assert view["periodic_integrity"]["healthy"] == 1
+                else:
+                    if action == "list":
+                        view = view["repositories"][0]
+                    assert view["integrity_status"] == "healthy"
+                    assert view["backup_status"] == "pending"
+                    assert view["last_error_code"] == "REPAIR_FAILED"
+            blob.unlink()
+            integrity.run(engine)
+            assert state["status"] == "corrupt"
+            assert state["periodic"]["repair_pending"]
+            assert engine.run() == Result.SUCCESS
+            assert state["successful_repairs"] == 1
+        elif previous == "repair_paused":
+            engine.budget.config = replace(engine.config.storage, repo_bytes=0)
+            before_calls = len(engine.git.calls)
+            assert engine.run() == Result.BACKUP_FAILED
+            assert actual["backup"]["status"] == "repo_limit_reached"
+            assert engine.git.calls[before_calls:] == []
+
+
+@pytest.mark.parametrize(
+    "block, finding",
+    [
+        ("journal", "healthy"),
+        ("backup-run", "healthy"),
+        ("quarantine", None),
+        ("manual-attention", "healthy"),
+        ("repair-journal", "healthy"),
+        ("repairing", "healthy"),
+        ("interrupted", "healthy"),
+        ("partial", "healthy"),
+        ("partial-access", "healthy"),
+        ("partial-operation", None),
+        ("unknown-deferral", "healthy"),
+        ("uncheckable", "uncheckable"),
+        ("corrupt", "corrupt"),
+    ],
+)
+def test_recheck_preserves_unresolved_state(factory, monkeypatch, block, finding):
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        folder = engine.path("demo")
+        mirror = folder / "repository.git"
+        partial = folder / "repository.git.partial"
+        blob = blob_path(mirror)
+        contents = blob.read_bytes()
+        blob.unlink()
+        integrity.run(engine)
+        meta = engine.repos["demo"]
+        state = meta["integrity"]
+        assert state["periodic"]["repair_pending"]
+        state["repair_attempts"] = 2
+        if block != "corrupt":
+            blob.write_bytes(contents)
+        if block in {"journal", "repair-journal"}:
+            engine.store.begin(
+                "demo", "repair" if block == "repair-journal" else "mirror_update"
+            )
+            if block == "repair-journal":
+                engine.store.update_operation(state="interrupted")
+        elif block == "backup-run":
+            with engine.store.transaction() as data:
+                data["active_run"].update(state="running")
+        elif block == "quarantine":
+            meta["backup"]["quarantine"] = {
+                "state": "pending",
+                "operation_id": "old-operation",
+                "relative_path": "quarantine/initial-clone",
+            }
+        elif block == "manual-attention":
+            meta["backup"]["manual_attention_required"] = "QUARANTINE_CONFLICT"
+        elif block in {"repairing", "interrupted"}:
+            meta["backup"]["status"] = block
+        elif block == "partial":
+            partial.mkdir()
+            (partial / "precious").write_text("preserve")
+        elif block == "partial-access":
+            original = type(partial).lstat
+
+            def lstat(path):
+                if path == partial:
+                    raise PermissionError("partial state unavailable")
+                return original(path)
+
+            monkeypatch.setattr(type(partial), "lstat", lstat)
+        elif block == "partial-operation":
+            meta["backup"]["partial_operation"] = "old-operation"
+        elif block == "unknown-deferral":
+            meta["backup"]["repair_deferred"] = "UNRESOLVED_CONFLICT"
+        elif block == "uncheckable":
+            (mirror / "objects/info/alternates").write_text("/unavailable\n")
+
+        journal = deepcopy(engine.store.data["active_operation"])
+        backup_run = deepcopy(engine.store.data["active_run"])
+        before = deepcopy(meta["backup"])
+        previous = deepcopy(state["periodic"])
+        backup_errors = deepcopy(meta["errors"])
+        integrity.run(engine)
+        assert state["status"] == "corrupt"
+        assert state["repair_attempts"] == 2
+        assert state["periodic"]["repair_pending"]
+        if finding is None:
+            assert state["periodic"] == previous
+        else:
+            assert state["periodic"]["last_result"] == finding
+        assert meta["backup"] == before
+        assert meta["errors"] == backup_errors
+        assert engine.store.data["active_operation"] == journal
+        assert engine.store.data["active_run"] == backup_run
+        if block == "partial":
+            assert (partial / "precious").read_text() == "preserve"
+
+
+def test_recheck_resolves_legacy_repair_block_after_reconciliation(factory):
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        meta = engine.repos["demo"]
+        meta["backup"].update(
+            status="repair_failed", repair_deferred="DISCOVERY_REQUIRED"
+        )
+        meta["integrity"].update(status="repair_failed", repair_attempts=3)
+        record_error(meta, "GIT_FAILED")
+        record_error(meta, "REPAIR_FAILED")
+        engine.store.begin("demo", "repair")
+        engine.store.update_operation(state="reconciled")
+        journal = deepcopy(engine.store.data["active_operation"])
+        assert "periodic" not in meta["integrity"]
+        integrity.run(engine)
+        assert meta["integrity"]["status"] == "healthy"
+        assert meta["backup"]["status"] == "pending"
+        assert "repair_deferred" not in meta["backup"]
+        assert meta["integrity"]["repair_attempts"] == 0
+        assert meta["errors"]["consecutive"] == 2
+        assert meta["errors"]["total"] == 2
+        assert engine.store.data["active_operation"] == journal

@@ -712,3 +712,62 @@ def test_integrity_persistence_faults_stop_writes_and_preserve_journal(
         assert (periodic is None) == (phase == "before-metadata")
         if periodic:
             assert periodic["last_result"] == "healthy"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_signal_before_recheck_cannot_clear_a_repaired_mirror(factory, signum):
+    from repoharbor import integrity
+
+    with factory() as engine:
+        engine.run()
+        mirror = engine.path("demo") / "repository.git"
+        oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
+        blob = mirror / "objects" / oid[:2] / oid[2:]
+        contents = blob.read_bytes()
+        blob.unlink()
+        integrity.run(engine)
+        previous = engine.repos["demo"]["integrity"]["periodic"].copy()
+        assert previous["last_result"] == "corrupt"
+    blob.write_bytes(contents)
+
+    if signum == signal.SIGKILL:
+        kill_at(factory, integrity.run, "integrity_started")
+    else:
+        ctx = multiprocessing.get_context("fork")
+        started = ctx.Event()
+
+        def child():
+            with factory() as engine:
+                signal.signal(signal.SIGTERM, lambda *_: engine.git.stop.set())
+
+                def pause(point):
+                    if point == "integrity_started":
+                        started.set()
+                        assert engine.git.stop.wait(10)
+
+                engine.checkpoint = pause
+                integrity.run(engine)
+
+        process = ctx.Process(target=child)
+        process.start()
+        try:
+            assert started.wait(15)
+            os.kill(process.pid, signal.SIGTERM)
+            process.join(15)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+    with factory() as engine:
+        integrity.reconcile(engine.store)
+        state = engine.repos["demo"]["integrity"]
+        periodic = state["periodic"]
+        assert state["status"] == "corrupt"
+        assert periodic["last_started_at"] != previous.pop("last_started_at")
+        assert {k: periodic[k] for k in previous} == previous
+        assert engine.store.data["integrity"]["state"] == "interrupted"
+        integrity.run(engine)
+        assert state["status"] == "healthy"
+        assert not periodic["repair_pending"]

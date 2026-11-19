@@ -2,6 +2,7 @@
 
 import logging
 import stat
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Literal
 
@@ -133,6 +134,64 @@ def excluded(config: Config, alias: str, meta: dict[str, Any]) -> bool:
     )
 
 
+REPAIR_BLOCKS = ("repair_paused", "repair_failed")
+CAPACITY_BLOCKS = ("FREE_SPACE_RESERVE", "global_limit_paused", "repo_limit_reached")
+
+
+def clear_resolved_damage(
+    meta: dict[str, Any], folder: Path, journal: dict[str, Any] | None
+) -> None:
+    """Publish a healthy mirror without reconciling an unfinished write."""
+    backup, integrity = meta["backup"], meta["integrity"]
+    periodic = integrity["periodic"]
+    deferred = backup.get("repair_deferred")
+    if (
+        integrity["status"]
+        not in ("healthy", "unchecked", "corrupt", "suspect", *REPAIR_BLOCKS)
+        or backup["status"] in ("initializing", "interrupted", "repairing")
+        or "manual_attention_required" in backup
+        or (journal and journal["state"] in ("running", "interrupted"))
+        or deferred not in (None, "DISCOVERY_REQUIRED", *CAPACITY_BLOCKS)
+    ):
+        return
+    # A partial can exist without metadata. Any filesystem error other than an
+    # absent path leaves the operation state unverified.
+    try:
+        with suppress(FileNotFoundError):
+            (folder / "repository.git.partial").lstat()
+            return
+    except OSError:
+        return
+
+    resolved = (
+        integrity["status"] in ("corrupt", "suspect", *REPAIR_BLOCKS)
+        or periodic["repair_pending"]
+        or backup["status"] in REPAIR_BLOCKS
+        or deferred is not None
+    )
+    integrity["status"] = "healthy"
+    if not resolved:
+        return
+    periodic["repair_pending"] = False
+    integrity["repair_attempts"] = 0
+    backup.pop("repair_deferred", None)
+    if backup["status"] in REPAIR_BLOCKS:
+        storage = backup.get("storage_status")
+        if storage not in CAPACITY_BLOCKS:
+            storage = deferred if deferred in CAPACITY_BLOCKS else "pending"
+        backup["status"] = storage
+
+    # Clear the streak only when every failure is attributable to this repair.
+    # A mixed or truncated streak can still contain unresolved backup errors.
+    errors = meta["errors"]
+    count, recent = errors["consecutive"], errors["recent"]
+    if 0 < count <= len(recent) and all(
+        isinstance(event, dict) and event.get("code") == "REPAIR_FAILED"
+        for event in recent[-count:]
+    ):
+        errors["consecutive"] = 0
+
+
 def run(engine: Engine) -> None:
     store = engine.store
     with store.transaction(fatal=True) as data:
@@ -196,8 +255,8 @@ def run(engine: Engine) -> None:
                 if integrity["status"] in ("unchecked", "healthy"):
                     integrity["status"] = "corrupt"
                     periodic["repair_pending"] = True
-            elif integrity["status"] == "unchecked":
-                integrity["status"] = "healthy"
+            elif (store.data["active_run"] or {}).get("state") != "running":
+                clear_resolved_damage(meta, folder, active)
         engine.save_meta(alias, fatal=True)
         engine.checkpoint("integrity_metadata")
         with store.transaction(fatal=True) as data:
