@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.3.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.4.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,7 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | Recognizes `web_ui`, `integrity_check`, `auto_retry`, `manual_run`, `restore_helper`, and `extended_logging`; every specified value must be `false` in this build. |
+| `features` | Set the boolean `manual_run` to `true` to enable CLI-triggered backups. It defaults to `false`. If supplied, `web_ui`, `integrity_check`, `auto_retry`, `restore_helper`, and `extended_logging` must be `false`. |
 
 An example configuration with invented sources and values:
 
@@ -48,7 +48,7 @@ recovery:
   automatic_repair: true
   max_repair_attempts_per_incident: 3
 features:
-  web_ui: false
+  manual_run: false
 ```
 
 `REPOHARBOR_CONFIG` can be provided in a Docker Compose multiline environment entry as in the [example stack](../deploy/compose.example.yaml). Use `repoharbor config validate` to validate the configuration and referenced credentials; this command does **not** download from a remote or create backup state.
@@ -76,7 +76,7 @@ Each `manual_git_urls` entry needs a stable `alias` (for example `example-demo`)
 
 Source URLs are normalized conservatively: scheme/host case, default HTTPS port, and trailing slashes are normalized; path case and the `.git` suffix remain significant. Query parameters, URL-embedded username/password, unsupported protocols, and suspicious paths are rejected.
 
-Identical normalized URLs are deduplicated using the **first** alias, provided credentials do not conflict. Aliases identify persistent directories under `manual/<alias>`. Reassigning an existing alias to a different URL, or its URL to another alias, fails closed. Removing a source from the configuration marks the existing repository as excluded; it does **not** delete the mirror. Restoring the same alias/URL makes it eligible again on the next scheduled run.
+Identical normalized URLs are deduplicated using the **first** alias, provided credentials do not conflict. Aliases identify persistent directories under `manual/<alias>`. Reassigning an existing alias to a different URL, or its URL to another alias, fails closed. Removing a source from the configuration marks the existing repository as excluded; it does **not** delete the mirror. Restoring the same alias/URL makes it eligible for subsequent backup runs.
 
 Manual aliases and provider IDs identify separate storage paths. Existing manual sources retain their original aliases and mirrors.
 
@@ -182,7 +182,7 @@ Selectors accept stable keys such as `github:github.com:123456`, `gitlab:gitlab.
 
 Explicit exclusions always apply. Visibility, fork and archive filters apply before explicit selection can permit a repository; provider scopes also constrain the result. Thus explicitly selecting a private repository does not override `visibility: [public]`. `all` and `all_except` both include all in-scope, property-matching repositories except explicit exclusions; `selected` additionally requires a selector match. These provider filters do not infer visibility for arbitrary manual HTTPS sources.
 
-Selection is recomputed at each future scheduled run. New matching repositories become eligible; excluded repositories receive no Git updates or remote repair downloads. A repository absent from a **complete** discovery has `source.discovery_status: unavailable` and receives no Git access, without claiming deletion or deleting its mirror. Its last confirmed Git transport status is preserved. Explicit filters can still exclude a known unavailable repository. A later successful rediscovery reuses the same backup.
+Selection is recomputed during scheduled and manual runs. New matching repositories become eligible; excluded repositories receive no Git updates or remote repair downloads. A repository absent from a **complete** discovery has `source.discovery_status: unavailable` and receives no Git access, without claiming deletion or deleting its mirror. Its last confirmed Git transport status is preserved. Explicit filters can still exclude a known unavailable repository. A later successful rediscovery reuses the same backup.
 
 GitHub publishes a selection only after all of its configured tokens complete discovery. GitLab does the same separately for each authority. A failed token, malformed response, incomplete pagination, network failure, or uncertain identity withholds the affected selection for that run, including remote repair. Independent GitLab authorities, GitHub, and eligible manual sources retain their own selection. Fatal persistence failures stop the service.
 
@@ -199,7 +199,7 @@ GitHub publishes a selection only after all of its configured tokens complete di
 
 Both clients validate pagination against the expected HTTPS authority, endpoint, and query and construct the next request locally. GitHub accepts continuations that omit the affiliation parameter and still sends the configured affiliations on its next request. A full page without continuation headers triggers a locally constructed next-page request to verify completion. GitLab checks increasing IDs and consistent offset metadata. Both use a 4 MiB response limit, a socket timeout of up to 15 seconds, and a 120-second discovery deadline per client checked between requests and body reads. Exceeding a bound fails discovery.
 
-HTTP 429 and rate-limit responses detected on HTTP 403 trigger a cooldown. A successful HTTP 200 with a zero remaining-quota header also sets one. `Retry-After` accepts seconds or an HTTP date. Reset headers use Unix timestamps, with GitLab also accepting an HTTP date in `RateLimit-ResetTime`. The latest applicable time wins. The fallback is 60 seconds when no usable time is available, and a zero-quota success without a usable reset uses at least that fallback. Server cooldowns have no one-day cap. GitLab persists them before reading an HTTP 200 response body and retains them across restart or temporary provider removal. GitHub saves the cooldown as part of the discovery outcome. The journal records `retry_at` as Unix epoch seconds. Both resume on a future scheduled tick after the stored time, without waiting out the cooldown in the scheduler or automatically retrying in the same run.
+HTTP 429 and rate-limit responses detected on HTTP 403 trigger a cooldown. A successful HTTP 200 with a zero remaining-quota header also sets one. `Retry-After` accepts seconds or an HTTP date. Reset headers use Unix timestamps, with GitLab also accepting an HTTP date in `RateLimit-ResetTime`. The latest applicable time wins. The fallback is 60 seconds when no usable time is available, and a zero-quota success without a usable reset uses at least that fallback. Server cooldowns have no one-day cap. GitLab persists them before reading an HTTP 200 response body and retains them across restart or temporary provider removal. GitHub saves the cooldown as part of the discovery outcome. The journal records `retry_at` as Unix epoch seconds. Both can resume in a later scheduled or manual run after the stored time, without waiting out the cooldown in the scheduler or automatically retrying in the same run.
 
 ### API observation and Git source status
 
@@ -215,7 +215,7 @@ Discovery deduplicates by provider, authority, and numeric ID. For example, GitL
 
 A current or historical provider address matching a manual source, or an API-resolved matching ID, excludes the automatic source with `manual_identity_conflict`. Existing manual mirrors retain their paths and update behavior. A new manual source is also withheld if its address already belongs to an existing provider mirror (`PROVIDER_IDENTITY_CONFLICT`). RepoHarbor does not adopt or migrate manual mirrors. Unknown historical manual aliases cannot be resolved reliably.
 
-When discovery is enabled for the matching authority, RepoHarbor resolves manual addresses using that authority's API credentials. GitLab performs these lookups after all configured entries for that authority complete discovery. It uses distinct credential names in configuration order, advances only on HTTP 404, and stops at the first successful lookup. Exhausting those tokens yields `GITLAB_MANUAL_IDENTITY_UNRESOLVED`. Other errors (including 401, 403, rate limits, redirects, invalid API data, and network failures) stop the lookup and withhold the affected automatic selection. GitHub likewise pauses its automatic selection if a manual address cannot be resolved safely. Manual processing remains independent.
+When discovery is enabled for the matching authority, RepoHarbor resolves manual addresses using that authority's API credentials. GitLab performs these lookups after all configured entries for that authority complete discovery. It uses distinct credential names in configuration order, advances only on HTTP 404, and stops at the first successful lookup. Exhausting those tokens yields `GITLAB_MANUAL_IDENTITY_UNRESOLVED`. Other errors (including 401, 403, rate limits, redirects, invalid API data, and network failures) stop the lookup and withhold the affected automatic selection. GitHub likewise pauses its automatic selection if a manual address cannot be resolved safely. During a discovery failure or cooldown, manual sources on other authorities and established manual mirrors on the affected authority can still run if otherwise eligible. An established manual mirror requires a local mirror directory and a recorded successful update. A new or unproven same-authority mirror waits for successful discovery in both full and targeted runs.
 
 Configuration and persisted state still use schema version `1`. GitLab adds provider metadata and the optional `provider_discovery` journal map. Existing manual and GitHub state keeps its identity and paths. Check state compatibility before rolling back to a version without GitLab support. Storage overrides use manual aliases or stable provider keys from repository metadata.
 
@@ -225,7 +225,45 @@ Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts
 
 Budgets use binary GiB (`1 GiB = 1,073,741,824 bytes`); fractional inputs are truncated to whole bytes. `0` means no new transfer may start. An override replaces the default per-repository budget; it does not add to it. Global usage includes **all** backup-root data, including excluded sources, journals, metadata, partials, and quarantines.
 
-With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh on future scheduled runs. No existing backup is automatically deleted to free space.
+With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh during subsequent backup runs. No existing backup is automatically deleted to free space.
+
+## CLI commands and exit codes
+
+Use the service configuration when invoking these commands. For container use, run them as the service UID with [Docker or Compose exec](../deploy/README.md#inspect-status-and-run-manual-backups).
+
+```sh
+repoharbor status
+repoharbor status --json
+repoharbor repositories list
+repoharbor repositories list --json
+repoharbor repositories show example-demo
+repoharbor repositories show gitlab:gitlab.com:234567 --json
+repoharbor backup run --all
+repoharbor backup run --repository example-demo
+repoharbor backup run --repository gitlab:gitlab.com:234567
+```
+
+`show` and `--repository` accept a configured manual alias or a stable provider key from `repositories list`. Addresses and URLs used in selection configuration are invalid CLI selectors. `backup run` requires exactly one of `--all` and `--repository`. It requires `features.manual_run: true` and a reachable service. The flag leaves the cron schedule in place. Scheduled and manual work share a run lock. Manual requests during an active run receive exit `6`. A cron tick during a run is skipped and recorded, with no queue or backfill.
+
+The inspection commands are read-only and work with manual backups disabled. In text output, missing values are shown as `unknown`; JSON uses `null`. A reachable service only confirms that the control socket answered. The global view includes the most recent started and completed runs, the last successful full run, the next cron time in the configured timezone, provider discovery and cooldowns, and the last recorded storage measurement. A single-repository success updates that repository's metadata without advancing the last successful full-run timestamp.
+
+The repository list shows identity, selection, Git source availability, backup status, last check and update, recorded size, and the last error code. Details include the selection reason, API observation, error counters and recent events, integrity and repair state, storage limit, and the relative mirror path. `repositories.with_errors` counts a repository once if it has consecutive errors, a failed/interrupted backup, a corrupt or suspect mirror, a running, paused, or failed repair, pending quarantine, or a manual-attention marker. An exclusion alone contributes no error. Unreadable metadata is counted separately and can make the included, excluded, and error totals unknown.
+
+| Exit | Meaning |
+|---:|---|
+| `0` | Inspection completed, or the requested run completed successfully. An up-to-date check is a success. |
+| `1` | Configuration, credential validation, startup, or filesystem error reported by the CLI. |
+| `2` | Invalid arguments or selector. |
+| `3` | Unknown repository in the catalog. |
+| `4` | Manual backups disabled. |
+| `5` | Service unreachable or connection lost. The client cannot confirm the backup result. |
+| `6` | A backup run is already in progress. |
+| `7` | No eligible backup target or the target is excluded. |
+| `8` | Discovery failed or is in cooldown. A full run may have completed some unaffected backups. |
+| `9` | Backup failed, was interrupted, or could not complete, for example because of a storage or recovery block. |
+| `10` | State is missing, invalid, or incomplete. Status and list may still return partial output. |
+
+Use stderr for the CLI diagnostic and the read-only views for stored backup or discovery diagnostics. Stored error events expose codes and timestamps. The raw Git/API responses and credentials are kept out of that output.
 
 ## Runtime state and recovery
 
@@ -237,7 +275,7 @@ With the default `during_transfer: finish`, size budgets are evaluated before/af
 |---|---|
 | `updated` / `up_to_date` | Successful changed mirror or successful no-op remote check. |
 | `global_limit_paused`, `repo_limit_reached`, `FREE_SPACE_RESERVE` | A new operation was withheld by a capacity condition. |
-| `repair_paused` + `repair_deferred` | Repair deferred for storage, without consuming a failed attempt; reevaluated at the next regular run. |
+| `repair_paused` + `repair_deferred` | Repair deferred for storage or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
 | `repair_failed` | Genuine exhausted repair attempts or an unrecoverable/unavailable repair condition. |
 | `interrupted` | Operation was interrupted or not proven complete. |
 | `manual_attention_required` | Data-preservation conflict, unknown partial, or occupied/missing quarantine requiring explicit operator action. |

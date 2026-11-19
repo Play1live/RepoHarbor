@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0
+
+- Added global status and repository list/detail commands with read-only text and JSON output.
+- Added opt-in manual backups for all eligible repositories or one selected repository.
+- Added local, UID-verified Unix socket control with a shared run lock for scheduled and manual backups. Existing discovery, storage, journaling, and recovery rules apply.
+
 ## 0.3.0
 
 - Added discovery for GitLab.com and compatible Self-Managed GitLab instances, including HTTPS authorities with non-default ports. Multiple personal access tokens and provider entries can cover personal, group, subgroup, and shared projects.
