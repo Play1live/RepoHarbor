@@ -296,6 +296,7 @@ server.serve_forever()
                 == "test fixture"
             )
             restore_smoke(container, mount, fixture)
+            integrity_smoke(mount)
         finally:
             docker("rm", "-f", container)
             if fixture_process is not None:
@@ -311,6 +312,105 @@ server.serve_forever()
                 "-c",
                 "import shutil; shutil.rmtree('/backups/manual', ignore_errors=True)",
             )
+
+
+def integrity_smoke(mount):
+    seed = """
+from pathlib import Path
+import json, shutil, subprocess
+root = Path('/backups/manual')
+source = root / 'demo'
+target = root / 'damaged'
+shutil.copytree(source, target)
+metadata = target / 'metadaten.json'
+meta = json.loads(metadata.read_text())
+meta['repository']['id'] = 'damaged'
+metadata.write_text(json.dumps(meta))
+mirror = target / 'repository.git'
+oid = subprocess.check_output(
+    ['git', '-C', str(mirror), 'rev-parse', 'HEAD:hello.txt'], text=True
+).strip()
+(mirror / 'objects' / oid[:2] / oid[2:]).unlink()
+"""
+    args = ("--network", "none", "--mount", mount)
+    docker("run", "--rm", *args, "--entrypoint", "python", IMAGE, "-c", seed)
+    snapshot_code = """
+from pathlib import Path
+import hashlib
+root = Path('/backups')
+for p in sorted(root.rglob('*')):
+    if p.name not in ('data.json', 'metadaten.json'):
+        digest = ''
+        if p.is_file():
+            with p.open('rb') as stream:
+                digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        print(p.relative_to(root), digest)
+"""
+
+    def status(container):
+        return json.loads(docker("exec", container, "repoharbor", "status", "--json"))
+
+    for enabled in (False, True):
+        config = (
+            "schema_version: 1\nschedule: '0 0 29 2 *'\n"
+            f"features: {{integrity_check: {str(enabled).lower()}}}\n"
+            "integrity: {schedule: '* * * * *'}"
+        )
+        container = docker(
+            "run",
+            "-d",
+            "--read-only",
+            *args,
+            "-e",
+            "REPOHARBOR_TOKEN_SOURCE=env",
+            "-e",
+            f"REPOHARBOR_CONFIG={config}",
+            IMAGE,
+        )
+        try:
+            wait_ready(container)
+            no_tcp_listener(container)
+            before = status(container)
+            assert before["periodic_integrity"]["enabled"] is enabled
+            snapshot = docker("exec", container, "python", "-c", snapshot_code)
+            deadline = time.monotonic() + 70
+            start_minute = int(time.time() // 60)
+            while True:
+                after = status(container)
+                periodic = after["periodic_integrity"]
+                if enabled and periodic["state"] == "completed":
+                    break
+                if not enabled and int(time.time() // 60) > start_minute:
+                    assert periodic["state"] == "idle"
+                    assert periodic["next_scheduled_at"] is None
+                    assert periodic["last_started_at"] is None
+                    break
+                assert time.monotonic() < deadline, docker("logs", container)
+                threading.Event().wait(0.25)
+            assert after["last_successful_run_at"] == before["last_successful_run_at"]
+            assert docker("exec", container, "python", "-c", snapshot_code) == snapshot
+            if enabled:
+                assert (
+                    periodic["checked"],
+                    periodic["healthy"],
+                    periodic["corrupt"],
+                ) == (2, 1, 1)
+                assert periodic["last_result"] == "issues"
+                assert "GIT_CORRUPTION" in docker(
+                    "exec", container, "repoharbor", "repositories", "show", "damaged"
+                )
+                docker("restart", "-t", "15", container)
+                assert (
+                    status(container)["periodic_integrity"]["last_completed_at"]
+                    == periodic["last_completed_at"]
+                )
+                assert (
+                    docker("exec", container, "python", "-c", snapshot_code) == snapshot
+                )
+            docker("stop", "-t", "15", container)
+            assert json.loads(docker("inspect", container))[0]["State"]["ExitCode"] == 0
+        finally:
+            docker("rm", "-f", container)
 
 
 def smoke():
@@ -396,7 +496,7 @@ def smoke():
         manual_smoke(f"type=bind,src={directory},dst=/backups")
     print(
         "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
-        "manual backup and offline restore"
+        "manual backup, offline restore and periodic integrity"
     )
 
 

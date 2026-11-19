@@ -6,11 +6,12 @@ import logging
 import os
 import signal
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Never
 
-from repoharbor import __version__
+from repoharbor import __version__, integrity
 from repoharbor.config import load
 from repoharbor.control import Control, request
 from repoharbor.credentials import Credentials
@@ -37,38 +38,62 @@ def verify_mount(root: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> 
 
 
 def serve(engine: Engine, stop: threading.Event) -> None:
+    initial = datetime.now(UTC)
     scheduler = Scheduler(
         Cron(engine.config.schedule),
         engine.config.timezone,
-        datetime.now(UTC),
+        initial,
         on_skip=engine.update_skips,
     )
-    last_minute = scheduler.last_minute
-    workers: list[threading.Thread] = []
+    checker = (
+        Scheduler(
+            Cron(engine.config.integrity.schedule),
+            engine.config.timezone,
+            initial,
+            on_skip=lambda skipped: integrity.skip_overlap(engine.store, skipped),
+            busy=scheduler.busy,
+        )
+        if engine.config.integrity_check
+        else None
+    )
+    worker: threading.Thread | None = None
     failures: list[Exception] = []
 
-    def tick(now: datetime) -> None:
-        try:
-            scheduler.tick(now, engine.run)
-        except Exception as error:
-            failures.append(error)
-            stop.set()
+    def record_failure(error: Exception) -> None:
+        failures.append(error)
+        stop.set()
+
+    def run(operation: Callable[[], object]) -> None:
+        if not stop.is_set():
+            try:
+                operation()
+            except Exception as error:
+                record_failure(error)
+
+    def dispatch(operation: Callable[[], None]) -> None:
+        nonlocal worker
+        candidate = threading.Thread(target=operation)
+        candidate.start()
+        worker = candidate
 
     control = Control(engine, scheduler, stop)
     with control.start():
         logging.info("ready; waiting for future schedule (dashboard disabled)")
-        while not stop.is_set():
-            now = datetime.now(UTC)
-            minute = int(now.timestamp() // 60)
-            if minute > last_minute:
-                last_minute = minute
-                # Scheduler observes future ticks while the prior run is still active.
-                worker = threading.Thread(target=tick, args=(now,))
-                worker.start()
-                workers = [t for t in workers if t.is_alive()] + [worker]
-            stop.wait(0.25)
-        for worker in workers:
-            worker.join()
+        try:
+            while not stop.is_set():
+                now = datetime.now(UTC)
+                scheduler.tick(now, lambda: run(engine.run), dispatch)
+                if checker is not None and not stop.is_set():
+                    checker.tick(
+                        now, lambda: run(lambda: integrity.run(engine)), dispatch
+                    )
+                stop.wait(0.25)
+        except Exception as error:
+            record_failure(error)
+        finally:
+            stop.set()
+            if worker is not None:
+                worker.join()
     if control.failure is not None:
         failures.append(control.failure)
     if failures:
@@ -80,9 +105,9 @@ def serve(engine: Engine, stop: threading.Event) -> None:
                 errno.EACCES: "EACCES",
             }.get(failure.errno or 0, "FILESYSTEM_ERROR")
             raise HarborError(
-                f"Backup worker failed: {code}; journal preserved"
+                f"Service worker failed: {code}; journal preserved"
             ) from None
-        raise HarborError("Backup worker failed; journal preserved") from None
+        raise HarborError("Service worker failed; journal preserved") from None
 
 
 MESSAGES = {
@@ -90,7 +115,7 @@ MESSAGES = {
     Result.UNKNOWN_REPOSITORY: "Unknown repository",
     Result.FEATURE_DISABLED: "Manual backups are disabled (features.manual_run)",
     Result.SERVICE_UNREACHABLE: "Service unreachable or connection lost",
-    Result.BUSY: "A backup run is already in progress",
+    Result.BUSY: "A backup or integrity check is already in progress",
     Result.NOT_SELECTED: "No eligible backup target or repository is excluded",
     Result.DISCOVERY_FAILED: "Discovery failed or is in cooldown",
     Result.BACKUP_FAILED: "Backup failed, was interrupted or could not be completed",
@@ -203,6 +228,7 @@ def main() -> int:
             engine = Engine(config, store, Git(credentials, stop))
             engine.inventory()
             recover(engine)
+            integrity.reconcile(store)
             serve(engine, stop)
     except HarborError as error:
         logging.error("%s", error)

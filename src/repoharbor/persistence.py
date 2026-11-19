@@ -7,7 +7,7 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
@@ -15,19 +15,27 @@ from pathlib import Path
 from typing import Any
 
 from repoharbor.errors import HarborError
+from repoharbor.selection import repository_id
 
 
 def utcnow() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def safe_tree(root: Path) -> None:
+def safe_tree(
+    root: Path,
+    *,
+    onerror: Callable[[OSError], None] | None = None,
+    interrupt: Callable[[], bool] | None = None,
+) -> None:
     if root.is_symlink() or not root.is_dir():
         raise HarborError("Backup root must be an existing real directory")
     for parent in root.parents:
         if parent.is_symlink():
             raise HarborError("Symlink in backup root path")
-    for directory, dirs, files in os.walk(root):
+    for directory, dirs, files in os.walk(root, onerror=onerror):
+        if interrupt is not None and interrupt():
+            raise HarborError("INTERRUPTED")
         for name in dirs + files:
             mode = (Path(directory) / name).lstat().st_mode
             if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
@@ -80,6 +88,105 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+INTEGRITY_COUNTS = ("checked", "healthy", "corrupt", "skipped", "uncheckable")
+PERIODIC_ERRORS = {
+    "INVALID_MIRROR",
+    "GIT_CORRUPTION",
+    "MIRROR_MISSING",
+    "MIRROR_UNSUPPORTED",
+    "FILESYSTEM_ERROR",
+    "GIT_TIMEOUT",
+    "GIT_INTERRUPTED",
+    "GIT_OUTPUT_LIMIT",
+}
+
+
+def integrity_state() -> dict[str, Any]:
+    return {
+        "state": "idle",
+        "last_started_at": None,
+        "last_completed_at": None,
+        "last_result": None,
+        "current_repository": None,
+        "skipped_overlaps": 0,
+        "last_overlap_at": None,
+        **dict.fromkeys(INTEGRITY_COUNTS, 0),
+    }
+
+
+def validate_integrity_times(value: dict[str, Any], *names: str) -> None:
+    for name in names:
+        at = value[name]
+        if at is not None and (
+            not isinstance(at, str)
+            or len(at) > 40
+            or datetime.fromisoformat(at).utcoffset() is None
+        ):
+            raise ValueError
+
+
+def validate_integrity_state(value: Any) -> None:
+    if not isinstance(value, dict) or value.keys() != integrity_state().keys():
+        raise ValueError
+    validate_integrity_times(
+        value, "last_started_at", "last_completed_at", "last_overlap_at"
+    )
+    current = value["current_repository"]
+    if (
+        value["state"] not in ("idle", "running", "completed", "interrupted")
+        or value["last_result"] not in (None, "healthy", "issues", "no_candidates")
+        or (value["last_result"] is None) != (value["last_completed_at"] is None)
+        or (value["state"] == "idle") != (value["last_started_at"] is None)
+        or (value["state"] == "completed" and value["last_completed_at"] is None)
+        or (current is not None and value["state"] != "running")
+        or any(
+            type(value[key]) is not int or value[key] < 0
+            for key in (*INTEGRITY_COUNTS, "skipped_overlaps")
+        )
+        or value["checked"] != value["healthy"] + value["corrupt"]
+    ):
+        raise ValueError
+    if current is not None:
+        if not isinstance(current, str):
+            raise ValueError
+        try:
+            repository_id(current)
+        except HarborError:
+            raise ValueError from None
+
+
+def validate_periodic_metadata(value: Any) -> None:
+    if not isinstance(value, dict) or value.keys() != {
+        "last_started_at",
+        "last_completed_at",
+        "last_result",
+        "damaged_at",
+        "error_code",
+        "repair_pending",
+    }:
+        raise ValueError
+    validate_integrity_times(
+        value, "last_started_at", "last_completed_at", "damaged_at"
+    )
+    result, code = value["last_result"], value["error_code"]
+    if (
+        value["last_started_at"] is None
+        or (result is None) != (value["last_completed_at"] is None)
+        or result not in (None, "healthy", "corrupt", "uncheckable")
+        or (
+            code not in PERIODIC_ERRORS
+            if result in ("corrupt", "uncheckable")
+            else code is not None
+        )
+        or type(value["repair_pending"]) is not bool
+        or (
+            (result == "corrupt" or value["repair_pending"])
+            and value["damaged_at"] is None
+        )
+    ):
+        raise ValueError
+
+
 def validate_state(data: dict[str, Any]) -> None:
     """Reject semantically corrupt state before any startup write."""
     try:
@@ -92,6 +199,8 @@ def validate_state(data: dict[str, Any]) -> None:
         }
         if not required <= data.keys():
             raise ValueError
+        if "integrity" in data:
+            validate_integrity_state(data["integrity"])
         scheduler = data["scheduler"]
         if (
             not isinstance(scheduler, dict)
@@ -163,6 +272,7 @@ class Store:
         self.fd: int | None = None
         self.data: dict[str, Any] = {}
         self._writer = threading.RLock()
+        self._write_failed = False
 
     def __enter__(self) -> "Store":
         safe_tree(self.root)
@@ -201,18 +311,32 @@ class Store:
             os.close(self.fd)
             self.fd = None
 
-    def save(self) -> None:
+    @contextmanager
+    def writing(self, *, fatal: bool = False) -> Iterator[None]:
         with self._writer:
+            if self._write_failed:
+                raise HarborError("State write failed; restart required")
+            try:
+                yield
+            except BaseException:
+                if fatal:
+                    self._write_failed = True
+                raise
+
+    def save(self, *, fatal: bool = False) -> None:
+        with self.writing(fatal=fatal):
             atomic_json(self.root / "data.json", self.data)
 
     @contextmanager
-    def transaction(self) -> Iterator[dict[str, Any]]:
+    def transaction(self, *, fatal: bool = False) -> Iterator[dict[str, Any]]:
         """Serialize scheduler and worker changes with their durable writes."""
         with self._writer:
+            if self._write_failed:
+                raise HarborError("State write failed; restart required")
             before = deepcopy(self.data)
             try:
                 yield self.data
-                self.save()
+                self.save(fatal=fatal)
             except BaseException:
                 self.data = before
                 raise

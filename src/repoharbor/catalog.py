@@ -6,7 +6,12 @@ from typing import Any
 from repoharbor.config import canonical_url, identifier
 from repoharbor.errors import HarborError
 from repoharbor.github import DiscoveryError
-from repoharbor.persistence import metadata, read_json
+from repoharbor.persistence import (
+    metadata,
+    read_json,
+    validate_integrity_times,
+    validate_periodic_metadata,
+)
 from repoharbor.registry import stored_repository
 from repoharbor.selection import instance_host, repository_key
 
@@ -74,8 +79,17 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
             stored_repository(meta, alias)
         elif repo["id"] != alias or repo["provider"] != "manual":
             raise ValueError
-        if backup["format"] != "mirror":
+        integrity = meta["integrity"]
+        if "periodic" in integrity:
+            validate_periodic_metadata(integrity["periodic"])
+        if (
+            backup["format"] != "mirror"
+            or backup["relative_path"] != "repository.git"
+            or integrity.get("last_check_kind")
+            not in (None, "periodic", "recovery", "repair")
+        ):
             raise ValueError
+        validate_integrity_times(backup, "created_at")
         canonical_url(repo["clone_url"])
         if "partial_operation" in backup and not isinstance(
             backup["partial_operation"], str

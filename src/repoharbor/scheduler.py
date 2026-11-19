@@ -1,6 +1,7 @@
 """Minute-based cron; missed minutes are never replayed."""
 
 import threading
+from _thread import LockType
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -79,16 +80,23 @@ class Scheduler:
         timezone: str,
         initial: datetime,
         on_skip: Callable[[int], None] | None = None,
+        *,
+        busy: LockType | None = None,
     ):
         self.cron, self.zone = cron, ZoneInfo(timezone)
         self.last_minute = int(initial.timestamp() // 60)
         self.last_local: tuple[int, ...] | None = None
-        self.busy = threading.Lock()
+        self.busy = busy if busy is not None else threading.Lock()
         self.skipped = 0
         self.on_skip = on_skip
         self._ticks = threading.Lock()
 
-    def tick(self, now: datetime, run: Callable[[], object]) -> bool:
+    def tick(
+        self,
+        now: datetime,
+        run: Callable[[], object],
+        dispatch: Callable[[Callable[[], None]], None] | None = None,
+    ) -> bool:
         with self._ticks:
             minute = int(now.timestamp() // 60)
             if minute <= self.last_minute:
@@ -105,8 +113,19 @@ class Scheduler:
                     self.on_skip(1)
                 self.skipped += 1
                 return False
-        try:
-            run()
-        finally:
-            self.busy.release()
+
+        def execute() -> None:
+            try:
+                run()
+            finally:
+                self.busy.release()
+
+        if dispatch is None:
+            execute()
+        else:
+            try:
+                dispatch(execute)
+            except BaseException:
+                self.busy.release()
+                raise
         return True
