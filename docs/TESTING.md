@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.4.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.5.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -28,7 +28,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 |---|---:|
 | Total line coverage | **90%** |
 | Total branch coverage | **85%** |
-| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `git_backup`, `gitlab`, `persistence`, `recovery`, `selection`, `storage`) | **95%** |
+| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `git_backup`, `gitlab`, `persistence`, `recovery`, `restore`, `selection`, `storage`) | **95%** |
 
 `scripts/check_coverage.py` enforces these independently using `coverage.json`, including a check that branch-coverage data is present. A green pytest result alone does not replace the separate coverage gate.
 
@@ -42,6 +42,9 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | GitLab identity and mirrors | Overlapping tokens deduplicate by project ID, renames retain history and mirror paths, ports stay distinct, manual collisions with 404-only API fallback, and local clone, update, and offline restore. Simulated Git read denial leaves the API observation available and preserves an existing mirror. |
 | GitLab pacing and recovery | Request pacing and shutdown, quota headers and durable cooldowns, cooldown across temporary provider removal, isolation of token failures by authority alongside GitHub/manual sources, interrupted metadata publication, SIGKILL while reading a throttled response or publishing metadata, and injected persistence errors. |
 | Git integration | First mirror clone, no-op checks, default-branch changes, annotated tags, branch deletion/pruning, force-pushes, remote outages, and offline restore. |
+| Restore configuration and paths | Boolean flags and their independence, protected backup and secrets paths, symbolic links, traversal, and bind-mount aliases. |
+| Offline restore and bundle integration | Real Git mirrors for manual, GitHub, GitLab.com, and Self-Managed GitLab IDs. Tests cover excluded and unavailable sources, alternate branch selection, missing default branches, empty mirrors, corrupt objects, and reference preservation. They verify standalone bundles through offline clone and reject truncated or incomplete exports. |
+| Restore locking and fault injection | Active backup lock, competing restore, SIGTERM and SIGKILL during staged Git operations, inherited locks, ENOSPC/EIO, and destination races. Tests check safe retry, preservation of the original backup, and the absence of prematurely published output. |
 | HTTPS and credentials | Real local Git smart-HTTP over loopback TLS, a temporary trusted certificate, `GIT_ASKPASS` challenges, both `env` and `file` modes, redaction and token rotation behavior. |
 | Git/API status separation | Git failures survive API rediscovery/restart; new repositories remain unknown; exclusions, visibility filters and global/repository limits cannot confirm Git success; completed Git fetch restores availability; source extensions and timestamps survive discovery. |
 | GitHub persistence | Rename/transfer retains one mirror and counters; exclusion/unavailability preserves data; partial discovery suspends the whole provider; no startup remote repair; publication I/O failures and SIGKILL before/after metadata/Git/journal writes. |
@@ -52,7 +55,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | Manual backups | Full and targeted runs with real Git, discovery failure and conflict handling, overlap with cron, client disconnects, and SIGTERM/SIGKILL during Git operations. |
 | Docker | CLI/version/config validation, required bind mount, non-root execution, no TCP listener or healthcheck, manual backups through `docker exec`, graceful shutdown, and recreation with retained data. |
 
-Tests use fictional API payloads and credentials, local repositories, and a synthetic loopback TLS service. GitLab tests mock the provider API and exercise local Git mirrors. The suite does not contact a production GitLab instance or establish permissions, API behavior, or connectivity for a deployed instance. An isolated test Git transport may enable local file access; the production product has HTTPS-only transport.
+Tests use fictional API payloads and credentials, local repositories, and a synthetic loopback TLS service. GitLab tests mock the provider API and exercise local Git mirrors. The suite does not contact a production GitLab instance or establish permissions, API behavior, or connectivity for a deployed instance. An isolated test Git transport may enable local file access. Production backup sources use HTTPS. Offline restore and bundle export use local Git data.
 
 ## Docker and Compose smoke tests
 
@@ -64,7 +67,7 @@ docker build -t repoharbor:local-test .
 python3 tests/docker/smoke.py
 ```
 
-The Docker smoke test verifies the version and config CLI, the bind mount, the unprivileged user, and the absence of TCP listeners before starting the test Git fixture. It inspects status with `docker exec`, checks that a disabled manual request returns exit `4`, and exercises full and targeted runs against a local HTTPS Git fixture with manual execution enabled. It also verifies the root lock, an offline restore, graceful SIGTERM with and without Docker init, and state retention on container recreation. It is **not** an end-to-end test of a real NAS filesystem, token provider API, or Portainer installation.
+The Docker smoke test verifies the version and config CLI, the bind mount, the unprivileged user, and the absence of TCP listeners before starting the test Git fixture. It inspects status with `docker exec`, checks that a disabled manual request returns exit `4`, and exercises full and targeted runs against a local HTTPS Git fixture with manual execution enabled. It also verifies the root lock, graceful SIGTERM with and without Docker init, and state retention on container recreation. The restore smoke tests use separate `--network none` containers with a read-only root filesystem, a read-only backup bind mount, and a writable export bind mount. They verify that the running service blocks a restore, then check a restored working tree and a bundle imported in another container with only the export mount. It is **not** an end-to-end test of a real NAS filesystem, token provider API, or Portainer installation.
 
 For an authorized TLS-intercepting build proxy, the Dockerfile supports an optional BuildKit CA secret:
 
@@ -111,7 +114,7 @@ COVERAGE_FILE=/tmp/repoharbor-312.coverage .venv/bin/pytest --cov \
 
 The GitHub discovery tests use fictional API payloads and real local Git mirrors. They verify deterministic credential association, partial-token failure with independent manual processing, persisted cooldowns, URL/ID conflicts, non-destructive restart recovery, and offline restore after rename. Fault injection includes interrupted discovery metadata publication, interrupted provider clones, and ENOSPC/EIO before metadata creation. No live GitHub token or provider contract test is required by the suite; actual organization permissions, SSO and fine-grained grants still require operator validation.
 
-Ruff, format checks, strict mypy, Bandit at the CI medium/high threshold, dependency audit, Gitleaks, Compose validation, local Docker build and smoke tests were also run successfully for this implementation. None establishes real NAS/Portainer acceptance or authorizes image publication.
+Ruff, format checks, strict mypy, Bandit at the CI medium/high threshold, dependency audit, Gitleaks, Compose validation, local Docker build and smoke tests also passed during the historical GitHub discovery validation. None establishes real NAS/Portainer acceptance or authorizes image publication.
 
 ## Documentation and production acceptance
 

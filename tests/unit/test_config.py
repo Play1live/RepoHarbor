@@ -180,3 +180,26 @@ def test_bad_env_secret(tmp_path, value):
     cfg = replace(load(env({"credentials": ["demo"]})), secrets_dir=tmp_path)
     with pytest.raises(HarborError):
         Credentials.resolve(cfg, {"REPOHARBOR_TOKEN_DEMO": value})
+
+
+@pytest.mark.parametrize("manual", [True, False])
+@pytest.mark.parametrize("restore", [True, False])
+def test_restore_feature_configuration(manual, restore):
+    config = load(env({"features": {"manual_run": manual, "restore_helper": restore}}))
+    assert config.manual_run is manual
+    assert config.restore_helper is restore
+    assert load(env()).restore_helper is False
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1, None, [], {}])
+def test_restore_feature_requires_boolean(value):
+    with pytest.raises(HarborError, match="unsupported optional feature"):
+        load(env({"features": {"restore_helper": value}}))
+
+
+@pytest.mark.parametrize(
+    "feature", ["web_ui", "integrity_check", "auto_retry", "extended_logging"]
+)
+def test_restore_cannot_enable_other_features(feature):
+    with pytest.raises(HarborError, match="unsupported optional feature"):
+        load(env({"features": {"restore_helper": True, feature: True}}))

@@ -17,11 +17,21 @@ from repoharbor.errors import GitError, HarborError
 
 class Git:
     def __init__(
-        self, credentials: Credentials, stop: threading.Event, timeout: float = 3600
+        self,
+        credentials: Credentials,
+        stop: threading.Event,
+        timeout: float = 3600,
+        *,
+        extra_fds: tuple[int, ...] = (),
+        output_errors: str = "replace",
+        scratch: Path | None = None,
     ):
         self.credentials, self.stop, self.timeout = credentials, stop, timeout
         self.remote_head: str | None = None
         self.backup_lock_fd: int | None = None
+        self.extra_fds = extra_fds
+        self.output_errors = output_errors
+        self.scratch = scratch
 
     def run(
         self,
@@ -33,7 +43,10 @@ class Git:
             raise HarborError("INTERRUPTED")
         env = self.credentials.git_env(credential)
         # File output avoids pipe deadlocks and unlimited RAM for Git diagnostics.
-        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        with (
+            tempfile.TemporaryFile(dir=self.scratch) as out,
+            tempfile.TemporaryFile(dir=self.scratch) as err,
+        ):
             process = subprocess.Popen(
                 [shutil.which("git") or "/usr/bin/git", *args],
                 env=env,
@@ -41,7 +54,8 @@ class Git:
                 stderr=err,
                 start_new_session=True,
                 # Keep the root locked while Git survives a daemon SIGKILL.
-                pass_fds=() if self.backup_lock_fd is None else (self.backup_lock_fd,),
+                pass_fds=self.extra_fds
+                + (() if self.backup_lock_fd is None else (self.backup_lock_fd,)),
             )
             started = time.monotonic()
             try:
@@ -76,7 +90,7 @@ class Git:
                     )
                     raise GitError("GIT_FAILED", "unavailable" if unavailable else None)
                 out.seek(0)
-                return out.read().decode("utf-8", errors="replace")
+                return out.read().decode("utf-8", errors=self.output_errors)
             finally:
                 if process.poll() is None:
                     with contextlib.suppress(ProcessLookupError):

@@ -19,6 +19,7 @@ from repoharbor.errors import HarborError, Result
 from repoharbor.git_backup import Git
 from repoharbor.persistence import Store
 from repoharbor.recovery import recover
+from repoharbor.restore import restore
 from repoharbor.scheduler import Cron, Scheduler
 from repoharbor.selection import repository_id
 from repoharbor.status import print_status
@@ -94,6 +95,8 @@ MESSAGES = {
     Result.DISCOVERY_FAILED: "Discovery failed or is in cooldown",
     Result.BACKUP_FAILED: "Backup failed, was interrupted or could not be completed",
     Result.STATE_UNAVAILABLE: "Backup state is missing or invalid",
+    Result.RESTORE_FAILED: "Restore or bundle export failed",
+    Result.DESTINATION_FAILED: "Restore destination is unavailable",
 }
 
 
@@ -125,6 +128,30 @@ def arguments() -> argparse.Namespace:
     target = run.add_mutually_exclusive_group(required=True)
     target.add_argument("--all", action="store_true")
     target.add_argument("--repository")
+    recovery = commands.add_parser(
+        "restore", help="Restore or export a local backup while the service is stopped"
+    ).add_subparsers(dest="action", required=True)
+    clone = recovery.add_parser("clone", help="Restore a mirror to a new working tree")
+    clone.add_argument(
+        "--repository", required=True, help="Local alias or stable provider ID"
+    )
+    clone.add_argument(
+        "--destination",
+        required=True,
+        help="New directory outside backup and secret paths",
+    )
+    clone.add_argument("--branch", help="Existing branch to check out")
+    bundle = recovery.add_parser(
+        "bundle", help="Export and verify a standalone Git bundle"
+    )
+    bundle.add_argument(
+        "--repository", required=True, help="Local alias or stable provider ID"
+    )
+    bundle.add_argument(
+        "--output",
+        required=True,
+        help="New bundle file outside backup and secret paths",
+    )
     return parser.parse_args()
 
 
@@ -157,6 +184,10 @@ def main() -> int:
             return report(result)
         if args.command in ("status", "repositories"):
             return report(print_status(config, args))
+        if args.command == "restore":
+            if config.restore_helper:
+                verify_mount(config.root)
+            return restore(config, args).value
 
         credentials = Credentials.resolve(config, dict(os.environ))
         if args.command == "config":

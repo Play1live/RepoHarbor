@@ -44,6 +44,98 @@ def no_tcp_listener(container):
     docker("exec", container, "python", "-c", check)
 
 
+def restore_smoke(container, mount, fixture):
+    with tempfile.TemporaryDirectory() as output:
+        Path(output).chmod(0o777)
+        output_mount = f"type=bind,src={output},dst=/exports"
+        try:
+            args = [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--read-only",
+                "-e",
+                "REPOHARBOR_TOKEN_SOURCE=file",
+                "-e",
+                "REPOHARBOR_CONFIG=schema_version: 1\n"
+                "features: {restore_helper: true}\ncredentials: [unused]",
+                "--mount",
+                mount + ",readonly",
+                "--mount",
+                output_mount,
+                IMAGE,
+                "restore",
+            ]
+            clone = [
+                "clone",
+                "--repository",
+                "demo",
+                "--destination",
+                "/exports/restore",
+            ]
+            busy = subprocess.run(
+                ["docker", *args, *clone], capture_output=True, text=True, timeout=30
+            )
+            assert busy.returncode == 6 and "Backup root is locked" in busy.stderr
+            assert list(Path(output).iterdir()) == []
+            docker("stop", "-t", "15", container)
+            assert json.loads(docker("inspect", container))[0]["State"]["ExitCode"] == 0
+            assert docker(*args, *clone) == "Repository restored successfully"
+            assert docker(
+                *args,
+                "bundle",
+                "--repository",
+                "demo",
+                "--output",
+                "/exports/demo.bundle",
+            ) == ("Git bundle verified and exported")
+            commit = subprocess.check_output(
+                ["git", "-C", str(fixture / "work"), "rev-parse", "HEAD"], text=True
+            ).strip()
+            assert (
+                docker(
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--mount",
+                    output_mount,
+                    "--entrypoint",
+                    "python",
+                    IMAGE,
+                    "-c",
+                    "import subprocess; from pathlib import Path; "
+                    "assert Path('/exports/restore/hello.txt').read_text() == "
+                    "'test fixture\\n'; "
+                    "subprocess.run(['git', 'clone', '/exports/demo.bundle', "
+                    "'/tmp/from-bundle'], "
+                    "check=True, capture_output=True); "
+                    "print(subprocess.check_output(['git', '-C', '/tmp/from-bundle', "
+                    "'rev-parse', 'HEAD'], text=True).strip()); "
+                    "print(subprocess.check_output(['git', '-C', '/exports/restore', "
+                    "'rev-parse', 'HEAD'], text=True).strip())",
+                )
+                == f"{commit}\n{commit}"
+            )
+        finally:
+            docker(
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--mount",
+                output_mount,
+                "--entrypoint",
+                "python",
+                IMAGE,
+                "-c",
+                "from pathlib import Path; import shutil; "
+                "shutil.rmtree('/exports/restore', ignore_errors=True); "
+                "Path('/exports/demo.bundle').unlink(missing_ok=True)",
+            )
+
+
 def manual_smoke(mount):
     # A real bare Git remote served over TLS on the test container's loopback.
     with tempfile.TemporaryDirectory() as directory:
@@ -203,8 +295,7 @@ server.serve_forever()
                 docker("exec", container, "cat", "/tmp/restore/hello.txt")
                 == "test fixture"
             )
-            docker("stop", "-t", "15", container)
-            assert json.loads(docker("inspect", container))[0]["State"]["ExitCode"] == 0
+            restore_smoke(container, mount, fixture)
         finally:
             docker("rm", "-f", container)
             if fixture_process is not None:
@@ -223,7 +314,7 @@ server.serve_forever()
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.4.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.5.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
@@ -303,7 +394,10 @@ def smoke():
                 docker("rm", "-f", container)
         assert (Path(directory) / ".repoharbor.lock").exists()
         manual_smoke(f"type=bind,src={directory},dst=/backups")
-    print("Docker smoke passed: CLI, mount, non-root, headless, SIGTERM, manual backup")
+    print(
+        "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
+        "manual backup and offline restore"
+    )
 
 
 if __name__ == "__main__":

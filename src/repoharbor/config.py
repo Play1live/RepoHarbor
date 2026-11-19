@@ -113,6 +113,7 @@ class Config:
     selection: Selection = field(default_factory=Selection)
     discovery: Discovery = field(default_factory=Discovery)
     manual_run: bool = False
+    restore_helper: bool = False
 
 
 def discovery_settings(
@@ -337,7 +338,12 @@ def load(env: dict[str, str]) -> Config:
         },
     )
     manual_run = features.pop("manual_run", False)
-    if type(manual_run) is not bool or any(v is not False for v in features.values()):
+    restore_helper = features.pop("restore_helper", False)
+    if (
+        type(manual_run) is not bool
+        or type(restore_helper) is not bool
+        or any(v is not False for v in features.values())
+    ):
         raise HarborError("Invalid or unsupported optional feature")
     root = Path(env.get("REPOHARBOR_BACKUP_ROOT", "/backups"))
     secrets = Path(env.get("REPOHARBOR_SECRETS_DIR", "/run/secrets/repoharbor"))
@@ -358,4 +364,5 @@ def load(env: dict[str, str]) -> Config:
         selection,
         Discovery(delay),
         manual_run,
+        restore_helper,
     )

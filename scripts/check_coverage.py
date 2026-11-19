@@ -9,6 +9,7 @@ CRITICAL = {
     "control",
     "persistence",
     "recovery",
+    "restore",
     "storage",
     "credentials",
     "git_backup",
