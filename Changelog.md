@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Added an opt-in offline restore assistant for local Git mirrors, including excluded, removed, and unreachable sources with valid backups.
+- Added restoration to a separate working repository with optional branch selection and verified Git bundle export for portable offline recovery.
+- Added exclusive backup-root locking, mirror and bundle integrity checks, and atomic output publication that preserves the original backup and existing destinations.
+
 ## 0.4.0
 
 - Added global status and repository list/detail commands with read-only text and JSON output.

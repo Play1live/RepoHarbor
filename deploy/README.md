@@ -1,6 +1,6 @@
-# RepoHarbor 0.4.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.5.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.4.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.5.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.4.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.5.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -77,6 +77,7 @@ recovery:
   max_repair_attempts_per_incident: 3
 features:
   manual_run: false
+  restore_helper: false
 ```
 
 The service expects the token in `/run/secrets/repoharbor/example_primary`, corresponding here to the fictional host path `/srv/repoharbor/secrets/example_primary`. The file must contain **only the token**, not a URL or YAML configuration:
@@ -117,6 +118,7 @@ environment:
       max_repair_attempts_per_incident: 3
     features:
       manual_run: false
+      restore_helper: false
 ```
 
 Supply the interpolated variable through a protected local mechanism or the Portainer stack environment; do not insert real values in tracked YAML. Environment secrets are visible to authorized Docker/Portainer administrators. RepoHarbor explicitly supports **one credential mode per container**. A configured secret present in both the active environment and the opposite file mode causes a validation error; remove the old values when switching modes.
@@ -267,7 +269,7 @@ For `manual_attention_required`, **stop the service before touching backup data*
 
 | Symptom | Safe checks |
 |---|---|
-| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names; `features.manual_run` must be boolean and other optional feature flags must remain false. |
+| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names; `features.manual_run` and `features.restore_helper` must be booleans. `web_ui`, `integrity_check`, `auto_retry`, and `extended_logging` must remain disabled. |
 | Git access denied / token expired | Source permission, credential mode, token rotation; never put credentials into a remote URL or debug output. |
 | TLS error | Server certificate and trusted CA bundle; never disable verification. |
 | Mount / `EACCES` | Actual host filesystem, ACLs, UID/GID 10001, read-only secret bind; do not switch to a privileged container. |
@@ -276,6 +278,68 @@ For `manual_attention_required`, **stop the service before touching backup data*
 | `repair_failed` / invalid JSON | Preserve data and investigate manually; missing objects can only be recovered if the source still supplies them. |
 
 ## 8. Offline restoration and acceptance
+
+### Restore with the RepoHarbor CLI
+
+Use the assistant when the backup root contains a readable schema-1 `data.json`, an existing regular `.repoharbor.lock`, the repository's `metadaten.json`, and a valid `repository.git`. An unfinished backup operation for the selected mirror blocks the assistant. Stop the backup service so the restore process can obtain the exclusive root lock.
+
+For Compose, stop the service from the repository root. For Portainer, stop the running stack's RepoHarbor service and run the one-off commands below on the Docker endpoint that holds the image and mounts.
+
+```sh
+docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor
+```
+
+Use the existing backup directory as a read-only bind mount. Prepare a separate writable export directory on the verified host filesystem. For a new directory at the fictional path below, grant access to UID/GID `10001:10001`.
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0750 /srv/repoharbor/exports
+```
+
+Run the one-off container with the local image. The commands use the image entrypoint and its default UID/GID `10001:10001`, a read-only container filesystem, and no network. The minimal configuration enables restore and declares no credentials. `REPOHARBOR_TOKEN_SOURCE` selects a configuration mode and requires no token here. The container needs no ports, elevated privileges, secrets mount, or Docker socket.
+
+```sh
+docker run --rm --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  --mount type=bind,src=/srv/repoharbor/backups,dst=/backups,readonly \
+  --mount type=bind,src=/srv/repoharbor/exports,dst=/exports \
+  -e REPOHARBOR_TOKEN_SOURCE=file \
+  -e 'REPOHARBOR_CONFIG=schema_version: 1
+features: {restore_helper: true}' \
+  repoharbor:local-test restore clone \
+  --repository example-demo --destination /exports/restored-demo
+```
+
+Add `--branch development` to the clone command to check out that branch if it is present in the mirror. Use a new destination for each run. For provider repositories, use a stable key such as `github:github.com:654321`, `gitlab:gitlab.com:234567`, or `gitlab:gitlab.example.org:8443:345678`. Excluded, removed, and unreachable sources can be restored from valid local backups.
+
+### Export and use a Git bundle
+
+```sh
+docker run --rm --network none --read-only --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  --mount type=bind,src=/srv/repoharbor/backups,dst=/backups,readonly \
+  --mount type=bind,src=/srv/repoharbor/exports,dst=/exports \
+  -e REPOHARBOR_TOKEN_SOURCE=file \
+  -e 'REPOHARBOR_CONFIG=schema_version: 1
+features: {restore_helper: true}' \
+  repoharbor:local-test restore bundle \
+  --repository example-demo --output /exports/example-demo.bundle
+```
+
+Both commands need an existing, writable target parent outside the backup root and configured secrets directory. Existing files and directories are refused, even if empty. The output filesystem must support private staging, symlinks, atomic no-replace rename, and synchronization. Allow space for the staging bundle, its verification import, and the working tree for a clone. The final working directory has mode `0700` and the bundle has mode `0600`. Use an account with permission to read the output.
+
+A bundle contains Git refs and the objects needed to reconstruct their history. To create a working tree from it, run Git on a host that can read the bundle. The first example uses the bundle's default checkout when available. Use the branch example instead when selecting an existing branch explicitly. The mirror clone preserves all exported refs in a new bare repository. A bundle records symbolic refs as resolved object IDs.
+
+```sh
+git clone /srv/repoharbor/exports/example-demo.bundle ./restored-from-bundle
+git clone --branch development /srv/repoharbor/exports/example-demo.bundle ./restored-development
+git clone --mirror /srv/repoharbor/exports/example-demo.bundle ./restored-mirror.git
+```
+
+RepoHarbor verifies the bundle by comparing refs and importing into an empty Git repository before publication. A bundle requires at least one exportable ref or a valid detached `HEAD`. An empty mirror can still be restored as an empty Git repository.
+
+### Recover directly with Git
+
+Use direct Git recovery when the RepoHarbor journal or metadata is missing or invalid but an intact mirror is available. Stop any writer and verify the source is a complete mirror before cloning. Direct Git recovery bypasses the assistant's catalog checks, exclusive root lock, path checks, and atomic publication.
 
 With Git installed on the restore host and read permission on a verified local mirror, clone into a **new destination directory**:
 
@@ -293,8 +357,8 @@ git clone --no-hardlinks \
   ./restored-gitlab-demo
 ```
 
-An offline restore needs only the local mirror and Git. Git project files and ordinary Git history are available if the mirror is valid and the default branch exists. For a different existing branch, use `git clone -b <branch> --no-hardlinks ...`. An empty repository or missing default branch will not automatically produce a checked-out working tree. Never modify the mirror to perform a restore.
+Direct Git recovery needs only the intact local mirror and Git. Git project files and ordinary Git history are available if the mirror is valid and the default branch exists. For a different existing branch, use `git clone -b <branch> --no-hardlinks ...`. An empty repository or missing default branch will not automatically produce a checked-out working tree. Never modify the mirror to perform a restore.
 
-A mirror follows remote branch/tag deletion and force-pushes. It does **not** provide historical snapshots or preserve Git LFS payloads, submodule contents, issues, pull/merge requests, or hosting metadata. Plan separate protection for any of those requirements.
+A mirror follows remote branch/tag deletion and force-pushes. It does **not** provide historical snapshots or preserve Git LFS payloads, separate submodule repositories, issues, pull/merge requests, other hosting metadata, or unpushed local changes. Neither restore workflow nor bundle export retrieves those separately. Plan separate protection for any of those requirements.
 
 **Before production use**, accept the actual host mount, filesystem behavior, user permissions, chosen authentication mode, a real scheduled backup, recorded timestamps, container recreation, and an offline restore on the target NAS. Automated local tests and green CI are not a substitute for that acceptance test.

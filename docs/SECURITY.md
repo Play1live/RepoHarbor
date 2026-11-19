@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.4.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.5.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -18,14 +18,14 @@ Status and repository inspection read the on-disk state and do not trigger disco
 
 ## Git transport and credentials
 
-- Production Git operations accept credential-free **HTTPS** URLs only and invoke Git with argument vectors, not shell interpolation.
-- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. HTTPS certificate checks remain enabled, redirects are disallowed, and other transport protocols are disabled.
+- Network backup and repair operations accept credential-free **HTTPS** URLs only and invoke Git with argument vectors, not shell interpolation.
+- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. For network backups and repairs, HTTPS certificate checks remain enabled, redirects are disallowed, and other transport protocols are disabled.
 - A credential is supplied through a scoped `GIT_ASKPASS` helper environment, **not** through a URL or command-line argument. The container permits one explicit secret source, `env` or `file`.
 - Git diagnostics from remote servers are never directly forwarded into application logs or persisted failure messages; fixed internal error codes are used instead.
 - Secrets in a child process environment may still be inspected by users with sufficient OS/container privileges. Limit Docker-host access and use protected, read-only secret-file mounts where possible.
 - Configured self-hosted HTTPS endpoints remain network-reachable according to the container's network policy; repository operators must restrict trust and outbound access appropriately.
 
-Local Git transports are enabled **only in test fixtures**, not as a production configuration option. Python static analysis blocks medium/high severity findings. The shell-free Git subprocess boundary is still a subprocess and needs continued review as dependencies and Git versions change.
+Backup configuration accepts only HTTPS Git sources. The restore assistant enables local file transport only for importing its own staged bundle. Isolated test fixtures can also enable local Git transport. Python static analysis blocks medium/high severity findings. The shell-free Git subprocess boundary is still a subprocess and needs continued review as dependencies and Git versions change.
 
 ## GitHub API and identity boundary
 
@@ -93,6 +93,18 @@ Remote repair downloads require an included repository, enabled automatic repair
 SIGTERM/SIGINT stop new Git work, terminate the active Git process group, and escalate to SIGKILL after five seconds if needed. The process reaps its children; a forced SIGKILL cannot execute cleanup, so the next startup must reconcile the durable journal. A surviving Git process retains the backup-root lock until it exits. Fatal persistence errors stop the worker/service, preserving recoverable state rather than proceeding with an unjournaled mutation.
 
 Stored error history preserves total and consecutive counters plus at most the last 20 events, without raw remote stderr or token values. Storage measurements are point-in-time observations, not enforced filesystem quotas. A physical free-space reserve reduces risk but cannot guarantee protection from concurrent writers or sudden disk exhaustion.
+
+## Offline restore safety
+
+Stop the backup service before running `restore clone` or `restore bundle`. The assistant needs the existing regular `.repoharbor.lock`, valid `data.json` and repository metadata, and a complete bare mirror. It takes the same exclusive, non-blocking backup-root lock as the service, using a read-only file descriptor. A running service, another restore, or a surviving Git child holding that lock causes the command to exit with code `6`. Leave the lock file in place and wait for the holder to exit.
+
+Both commands read the original backup without network access, credentials, discovery, synchronization, recovery, or repair. An unfinished operation for the selected mirror, required metadata that cannot be validated, or a corrupt Git object causes the command to stop. RepoHarbor validates the mirror's structure and checks its objects with `git fsck --full`. It refuses shallow or externally linked stores and Git lock files. Bundle verification checks the export against the mirror's refs, imports it into an empty Git repository, and checks the imported objects.
+
+Use trusted backup and output filesystems. The assistant checks the target's parent directories for symlinks and rejects traversal, targets inside the backup root or configured secrets directory, and bind aliases of those directories. It stages output in a private `.repoharbor-restore-incomplete-*` directory under the destination parent and uses atomic no-replace rename to publish the verified result. The destination filesystem must support the required operations, including symlink creation and directory synchronization. An existing destination remains intact.
+
+SIGTERM and SIGINT stop Git work and allow staging cleanup. A forced SIGKILL can leave a private staging directory. A surviving Git process retains the root lock until it exits. Treat the staging directory as incomplete and wait for all related processes to exit before removing it. You can retry with a new output path. ENOSPC and other write failures are reported as errors. For a late failure after the atomic rename, such as a directory synchronization error, a complete result may already be present. Check the final path and verify the result before retrying.
+
+Use the [manual Git procedure](../deploy/README.md#recover-directly-with-git) if the RepoHarbor state cannot be validated but you have an independently verified, intact mirror. The operator must keep writers stopped and choose a safe separate destination for that procedure.
 
 ## Scope and operational acceptance
 

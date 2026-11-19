@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.4.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.5.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,7 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | Set the boolean `manual_run` to `true` to enable CLI-triggered backups. It defaults to `false`. If supplied, `web_ui`, `integrity_check`, `auto_retry`, `restore_helper`, and `extended_logging` must be `false`. |
+| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. Both flags are booleans, default to `false`, and operate independently. `web_ui`, `integrity_check`, `auto_retry`, and `extended_logging` must be `false` if supplied. |
 
 An example configuration with invented sources and values:
 
@@ -49,6 +49,7 @@ recovery:
   max_repair_attempts_per_incident: 3
 features:
   manual_run: false
+  restore_helper: false
 ```
 
 `REPOHARBOR_CONFIG` can be provided in a Docker Compose multiline environment entry as in the [example stack](../deploy/compose.example.yaml). Use `repoharbor config validate` to validate the configuration and referenced credentials; this command does **not** download from a remote or create backup state.
@@ -229,7 +230,7 @@ With the default `during_transfer: finish`, size budgets are evaluated before/af
 
 ## CLI commands and exit codes
 
-Use the service configuration when invoking these commands. For container use, run them as the service UID with [Docker or Compose exec](../deploy/README.md#inspect-status-and-run-manual-backups).
+Use the service configuration for status and backup commands. For container use, run them as the service UID with [Docker or Compose exec](../deploy/README.md#inspect-status-and-run-manual-backups).
 
 ```sh
 repoharbor status
@@ -251,19 +252,39 @@ The repository list shows identity, selection, Git source availability, backup s
 
 | Exit | Meaning |
 |---:|---|
-| `0` | Inspection completed, or the requested run completed successfully. An up-to-date check is a success. |
+| `0` | Inspection, backup, restore, or bundle export completed successfully. An up-to-date check is a success. |
 | `1` | Configuration, credential validation, startup, or filesystem error reported by the CLI. |
 | `2` | Invalid arguments or selector. |
 | `3` | Unknown repository in the catalog. |
-| `4` | Manual backups disabled. |
+| `4` | The requested optional feature is disabled. |
 | `5` | Service unreachable or connection lost. The client cannot confirm the backup result. |
-| `6` | A backup run is already in progress. |
+| `6` | A backup run is already in progress, or the backup-root lock is held for another operation. |
 | `7` | No eligible backup target or the target is excluded. |
 | `8` | Discovery failed or is in cooldown. A full run may have completed some unaffected backups. |
 | `9` | Backup failed, was interrupted, or could not complete, for example because of a storage or recovery block. |
 | `10` | State is missing, invalid, or incomplete. Status and list may still return partial output. |
+| `11` | Restore or bundle export failed, for example because the local state or mirror is invalid, the mirror has no exportable ref or valid detached HEAD, Git failed, or the operation was interrupted. |
+| `12` | Restore filesystem or destination operation failed, for example because the target exists or a path operation or write failed. |
 
 Use stderr for the CLI diagnostic and the read-only views for stored backup or discovery diagnostics. Stored error events expose codes and timestamps. The raw Git/API responses and credentials are kept out of that output.
+
+## Offline restore and bundle export
+
+Run the assistant with the service stopped and `features.restore_helper: true`. It opens the existing backup root read-only and requires the exclusive backup-root lock, a valid schema-1 journal, matching repository metadata, and an intact bare mirror. The configuration must specify a supported `REPOHARBOR_TOKEN_SOURCE`. The restore process needs neither credential values nor provider access. The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) gives a complete minimal Docker configuration.
+
+```sh
+repoharbor restore clone --repository example-demo --destination /exports/restored-demo
+repoharbor restore clone --repository example-demo --destination /exports/restored-demo --branch development
+repoharbor restore bundle --repository example-demo --output /exports/example-demo.bundle
+```
+
+Use either clone command for that destination. `--repository` accepts a manual alias such as `example-demo`, a GitHub key such as `github:github.com:654321`, or a GitLab key such as `gitlab:gitlab.com:234567`. A Self-Managed authority can include its port, for example `gitlab:gitlab.example.org:8443:345678`. The assistant looks up the on-disk catalog even if the source is excluded, absent from current configuration, or unreachable. URLs and selection addresses are invalid selectors.
+
+`restore clone` creates an independent working repository with the mirror's reachable Git history and available refs, including branches and tags. It checks out the mirror's current branch or detached commit unless `--branch` selects another existing branch. If the branch pointed to by `HEAD` is missing, the assistant chooses the first available local branch in lexicographic order. With no branch to check out and no detached commit, the working tree stays empty. An empty mirror can be cloned as an empty repository.
+
+`restore bundle` exports refs and their necessary objects, verifies their identities, and imports them into an empty repository to check that the bundle is self-contained. A bundle file holds Git objects and refs. Use Git to create a working tree from that file. A bundle requires at least one exportable ref or a valid detached `HEAD`. See [bundle import examples](../deploy/README.md#export-and-use-a-git-bundle).
+
+Both commands require a new output path with an existing writable parent outside the backup root and the configured secrets directory. They reject corrupt Git objects, absent or invalid required metadata, unfinished operations for that mirror, access through unsafe paths, and existing destinations. Use the [direct Git procedure](../deploy/README.md#recover-directly-with-git) when intact mirror data is available but the RepoHarbor catalog is incomplete. The [security guide](SECURITY.md#offline-restore-safety) covers interruption and filesystem errors.
 
 ## Runtime state and recovery
 
@@ -282,10 +303,4 @@ Use stderr for the CLI diagnostic and the read-only views for stored backup or d
 
 `last_attempt_at`, `last_checked_at`, and `last_updated_at` have different meanings; skipped or failed operations must not create a false successful check or update. Repairs do not themselves imply a new Git reference update. An exhausted genuine repair does not become `repair_paused` simply because free space is also low.
 
-For controlled recovery and operator actions, read [SECURITY.md](SECURITY.md). An offline restore from an intact mirror is performed with Git:
-
-```sh
-git clone --no-hardlinks /backups/manual/example-demo/repository.git ./restored-example
-```
-
-This restores regular Git objects and refs, not LFS payloads, separate submodules, issues, or hosting metadata. See the [deployment guide](../deploy/README.md) and [changelog](../Changelog.md). Production NAS acceptance remains an operator task.
+For controlled recovery and operator actions, see [SECURITY.md](SECURITY.md). The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) covers the assistant and direct Git recovery from an intact mirror. Both restore workflows and bundles use the Git data in the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, hosting metadata, and unpushed local changes require separate backups. See the [changelog](../Changelog.md) for version history. Production NAS acceptance remains an operator task.
