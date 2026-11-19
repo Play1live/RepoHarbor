@@ -62,16 +62,18 @@ def sync_directory(path: Path) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
-        if path.is_symlink():
-            raise ValueError
-        value = json.loads(path.read_text())
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags)) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise ValueError
+            value = json.load(stream)
         if (
             not isinstance(value, dict)
             or type(value.get("schema_version")) is not int
             or value["schema_version"] != 1
         ):
             raise ValueError
-    except (ValueError, OSError, UnicodeError):
+    except (ValueError, OSError, RecursionError):
         raise HarborError(
             "Invalid or unreadable state; preserving existing data"
         ) from None
@@ -151,7 +153,7 @@ def validate_state(data: dict[str, Any]) -> None:
                     or type(value.get("changed")) is not bool
                 ):
                     raise ValueError
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         raise HarborError("Invalid journal structure; preserving state") from None
 
 

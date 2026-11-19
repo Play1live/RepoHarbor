@@ -80,7 +80,9 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     engine.checkpoint("quarantine_metadata")
 
 
-def recover(engine: Engine) -> None:
+def recover(
+    engine: Engine, *, repository: str | None = None, during_run: bool = False
+) -> None:
     store = engine.store
     active = store.data["active_operation"]
     if active is not None and (
@@ -92,7 +94,7 @@ def recover(engine: Engine) -> None:
         raise HarborError("Journal references unknown repository")
     # Resolve the existing active operation before another source can journal a move.
     aliases = sorted(
-        engine.repos,
+        (repository,) if repository is not None else engine.repos,
         key=lambda alias: (not (active and active["alias"] == alias), alias),
     )
     for alias in aliases:
@@ -177,7 +179,11 @@ def recover(engine: Engine) -> None:
                 if paused_repair:
                     engine.checkpoint("repair_recovery_journal")
     with store.transaction() as data:
-        if data["active_run"] and data["active_run"]["state"] == "running":
+        if (
+            not during_run
+            and data["active_run"]
+            and data["active_run"]["state"] == "running"
+        ):
             data["active_run"]["state"] = "interrupted"
         data["recovery"]["last_checked_at"] = utcnow()
 
@@ -209,7 +215,7 @@ def repair_result(engine: Engine, alias: str, operation: str, healthy: bool) -> 
 def repair(engine: Engine, alias: str) -> None:
     meta = engine.repos[alias]
     integrity, backup = meta["integrity"], meta["backup"]
-    candidates = engine.sources if ":" in alias else engine.config.sources
+    candidates = engine.sources if ":" in alias else engine.manual_sources()
     source = next((s for s in candidates if s.alias == alias), None)
     if (
         source is None

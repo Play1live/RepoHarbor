@@ -31,7 +31,7 @@ services:
           automatic_repair: true
           max_repair_attempts_per_incident: 3
         features:
-          web_ui: false
+          manual_run: false
     volumes:
       - type: bind
         source: /srv/repoharbor/backups

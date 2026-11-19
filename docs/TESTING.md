@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.3.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.4.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -28,7 +28,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 |---|---:|
 | Total line coverage | **90%** |
 | Total branch coverage | **85%** |
-| Line coverage for **each** critical module (`credentials`, `persistence`, `git_backup`, `recovery`, `storage`, `selection`, `gitlab`) | **95%** |
+| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `git_backup`, `gitlab`, `persistence`, `recovery`, `selection`, `storage`) | **95%** |
 
 `scripts/check_coverage.py` enforces these independently using `coverage.json`, including a check that branch-coverage data is present. A green pytest result alone does not replace the separate coverage gate.
 
@@ -48,13 +48,15 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | Recovery and fault injection | SIGTERM/SIGKILL during clone/fetch/repair, journal checkpoints, metadata writes, interrupted/owned/unowned partials, quarantine replay, bounded repair, and idempotency. |
 | Storage and scheduler | Global/per-repository budgets, free-space reserve, capacity pause/resume, five-second transfer monitoring, DST behavior, missed ticks, and durable overlap counts. |
 | State and security | Corrupt/missing metadata, OS locking, unknown configuration fields, URL validation, secret handling, and error-code redaction. |
-| Docker | CLI/version/config validation, required bind mount, non-root execution, no listening socket or healthcheck, graceful shutdown, and recreation with retained data. |
+| Status and control | Read-only text/JSON inspection, problem counts, invalid metadata, exit codes, token redaction, Unix peer UID checks, and no queued backup requests. |
+| Manual backups | Full and targeted runs with real Git, discovery failure and conflict handling, overlap with cron, client disconnects, and SIGTERM/SIGKILL during Git operations. |
+| Docker | CLI/version/config validation, required bind mount, non-root execution, no TCP listener or healthcheck, manual backups through `docker exec`, graceful shutdown, and recreation with retained data. |
 
 Tests use fictional API payloads and credentials, local repositories, and a synthetic loopback TLS service. GitLab tests mock the provider API and exercise local Git mirrors. The suite does not contact a production GitLab instance or establish permissions, API behavior, or connectivity for a deployed instance. An isolated test Git transport may enable local file access; the production product has HTTPS-only transport.
 
 ## Docker and Compose smoke tests
 
-Install Docker with Compose v2 and access to a Linux/amd64 Docker endpoint. From the repository root:
+Install Docker with Compose v2, Git, and the OpenSSL CLI and use a Linux/amd64 Docker endpoint. From the repository root:
 
 ```sh
 docker compose -f deploy/compose.example.yaml config --quiet
@@ -62,7 +64,7 @@ docker build -t repoharbor:local-test .
 python3 tests/docker/smoke.py
 ```
 
-The Docker smoke test verifies the CLI, mount requirement, unprivileged user, headless operation, graceful SIGTERM both without Docker init and with explicit Docker init, and state retention after container recreation. It is **not** an end-to-end test of a real NAS filesystem, token provider API, or Portainer installation.
+The Docker smoke test verifies the version and config CLI, the bind mount, the unprivileged user, and the absence of TCP listeners before starting the test Git fixture. It inspects status with `docker exec`, checks that a disabled manual request returns exit `4`, and exercises full and targeted runs against a local HTTPS Git fixture with manual execution enabled. It also verifies the root lock, an offline restore, graceful SIGTERM with and without Docker init, and state retention on container recreation. It is **not** an end-to-end test of a real NAS filesystem, token provider API, or Portainer installation.
 
 For an authorized TLS-intercepting build proxy, the Dockerfile supports an optional BuildKit CA secret:
 

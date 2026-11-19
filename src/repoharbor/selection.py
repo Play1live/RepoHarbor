@@ -41,6 +41,12 @@ def repository_key(value: str) -> str:
     return value
 
 
+def repository_id(value: str) -> str:
+    from repoharbor.config import identifier
+
+    return repository_key(value) if ":" in value else identifier(value)
+
+
 def address(value: str) -> str:
     if not isinstance(value, str) or len(value) > 4096:
         raise HarborError("Invalid repository selector")

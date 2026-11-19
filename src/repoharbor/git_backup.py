@@ -21,6 +21,7 @@ class Git:
     ):
         self.credentials, self.stop, self.timeout = credentials, stop, timeout
         self.remote_head: str | None = None
+        self.backup_lock_fd: int | None = None
 
     def run(
         self,
@@ -39,6 +40,8 @@ class Git:
                 stdout=out,
                 stderr=err,
                 start_new_session=True,
+                # Keep the root locked while Git survives a daemon SIGKILL.
+                pass_fds=() if self.backup_lock_fd is None else (self.backup_lock_fd,),
             )
             started = time.monotonic()
             try:
