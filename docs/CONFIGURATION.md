@@ -328,7 +328,7 @@ Set `features.web_ui: true` and supply `web.origin` to enable the listener. The 
 | `REPOHARBOR_WEB_CERT_FILE` | `/run/secrets/repoharbor-web-cert` | TLS certificate chain in PEM format. |
 | `REPOHARBOR_WEB_KEY_FILE` | `/run/secrets/repoharbor-web-key` | A private, regular PEM key without a passphrase. |
 
-The service UID needs read access. The password and private key must have no group or other permission bits and must not be symlinks. Mount them read-only and restart to apply changes. If the service cannot load the files or bind the HTTPS listener, the dashboard remains unavailable and the backup service continues. The CLI `config validate` checks the YAML and Git credential settings. Listener startup verifies the web files and bind address.
+The service UID needs read access. The password and private key must have no group or other permission bits and must not be symlinks. Mount them read-only and restart to apply changes. Keep the existing password file format. The dashboard requires a Python/OpenSSL build with scrypt support and derives a new in-memory verifier at startup. If the service cannot load the files, initialise scrypt, or bind the HTTPS listener, the dashboard remains unavailable and the backup service continues. The CLI `config validate` checks the YAML and Git credential settings. Listener startup verifies the web files, scrypt support, and bind address.
 
 The optional browser backup controls require the independent `features.manual_run` flag. All settings displayed in the browser remain read-only. See the [deployment guide](../deploy/README.md#enable-the-web-dashboard).
 

@@ -309,6 +309,8 @@ For direct access on the Docker host without a proxy, set `web.origin` to `https
 
 In Portainer, create the files on the Docker endpoint host, use the same read-only bind mount and loopback publication or private proxy network, then redeploy the existing stack. For startup diagnostics, check the container log for `web.ready` or `web.unavailable` when extended logging is active. Without extended logging, look for `HTTPS dashboard ready` or `Web dashboard could not open securely`. Confirm the bind/port, exact browser origin, certificate chain, and that UID 10001 can read all three files. Sessions expire after 15 minutes and after a restart.
 
+When a proxy connects to RepoHarbor, the backend sign-in limit applies to the proxy's source address. Apply per-client limits to `POST /api/login` at the trusted proxy and keep the interface restricted to a management network or VPN. Forwarding headers do not change how RepoHarbor counts attempts. Custom images must provide OpenSSL-backed scrypt through Python's `hashlib`. The supplied Docker image verifies scrypt during dashboard startup.
+
 ### Enable automatic retries
 
 Add the following to your existing `REPOHARBOR_CONFIG` YAML. Merge `auto_retry` into your existing `features` mapping.
