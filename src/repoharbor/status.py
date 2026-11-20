@@ -14,6 +14,7 @@ from repoharbor.config import Config, canonical_url
 from repoharbor.control import request
 from repoharbor.errors import HarborError, Result
 from repoharbor.persistence import integrity_state, read_json, validate_state
+from repoharbor.retry import view as retry_view
 from repoharbor.scheduler import Cron
 from repoharbor.selection import repository_id
 
@@ -47,7 +48,7 @@ def label(value: object) -> str | None:
 def error_code(value: object) -> str | None:
     if isinstance(value, str) and re.fullmatch(
         r"(?:GITHUB_|GITLAB_)[A-Z][A-Z_]{0,50}|GIT_FAILED|INVALID_MIRROR|"
-        r"INTERRUPTED|ENOSPC|REPAIR_FAILED|PROVIDER_IDENTITY_CONFLICT|FREE_SPACE_RESERVE",
+        r"GIT_NETWORK|GIT_SERVER_TEMPORARY|GIT_TIMEOUT|INTERRUPTED|ENOSPC|REPAIR_FAILED|PROVIDER_IDENTITY_CONFLICT|FREE_SPACE_RESERVE",
         value,
     ):
         return value
@@ -100,6 +101,9 @@ def repo_view(
         "last_error_code": last["code"] if last else None,
         "integrity_status": label(integrity["status"]),
         "periodic_integrity": periodic,
+        "retry": retry_view(
+            meta.get("retry", {}), config.auto_retry, config.retry.max_retries
+        ),
     }
     if details:
         provider_host, _, provider_id = alias.rpartition(":")
@@ -225,6 +229,12 @@ def global_view(
             "enabled": config.integrity_check,
             "next_scheduled_at": next_integrity.isoformat() if next_integrity else None,
             **periodic,
+        },
+        "retry": {
+            "enabled": config.auto_retry,
+            "pending": sum(r["retry"]["pending"] for r in repos)
+            if unreadable == 0 or not config.auto_retry
+            else None,
         },
         "repositories": {
             "known": len(repos) + unreadable if unreadable is not None else None,

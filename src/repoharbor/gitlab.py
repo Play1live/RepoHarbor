@@ -153,7 +153,9 @@ class GitLab(GitHub):
             return super().request(path, credential)
         except DiscoveryError as error:
             raise DiscoveryError(
-                str(error).replace("GITHUB_", "GITLAB_"), error.retry_at
+                str(error).replace("GITHUB_", "GITLAB_"),
+                error.retry_at,
+                temporary=error.temporary,
             ) from None
 
     def listing(

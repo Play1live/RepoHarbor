@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import math
 import re
+import socket
 import sys
 import threading
 import time
 from collections.abc import Mapping
 from email.message import Message
 from email.utils import parsedate_to_datetime
-from http.client import HTTPException
+from http.client import HTTPException, IncompleteRead, RemoteDisconnected
+from ssl import SSLError
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
@@ -27,12 +30,35 @@ from repoharbor.selection import address, repository_key
 
 BASE = "https://api.github.com"
 MAX_BODY = 4 * 1024 * 1024
+TEMPORARY_HTTP_ERRORS = (500, 502, 503, 504)
 
 
 class DiscoveryError(HarborError):
-    def __init__(self, code: str, retry_at: float = 0):
+    def __init__(self, code: str, retry_at: float = 0, *, temporary: bool = False):
         super().__init__(code)
         self.retry_at = retry_at
+        self.temporary = temporary
+
+
+def temporary_transport_failure(error: Exception) -> bool:
+    cause = error.reason if isinstance(error, URLError) else error
+    if isinstance(cause, SSLError):
+        return False
+    if isinstance(cause, socket.gaierror):
+        return cause.errno == socket.EAI_AGAIN
+    return isinstance(cause, (TimeoutError, RemoteDisconnected, IncompleteRead)) or (
+        isinstance(cause, OSError)
+        and cause.errno
+        in (
+            errno.ECONNABORTED,
+            errno.ECONNREFUSED,
+            errno.ECONNRESET,
+            errno.EHOSTUNREACH,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.ETIMEDOUT,
+        )
+    )
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -177,9 +203,11 @@ class GitHub:
                 self.stop.wait(min(remaining, self.deadline - now))
             try:
                 return self._request(path, credential)
-            except (HTTPException, URLError, OSError, ValueError, UnicodeError):
+            except (HTTPException, OSError, ValueError, UnicodeError) as error:
                 raise DiscoveryError(
-                    "GITHUB_INVALID_RESPONSE_OR_NETWORK", self.retry_at
+                    "GITHUB_INVALID_RESPONSE_OR_NETWORK",
+                    self.retry_at,
+                    temporary=temporary_transport_failure(error),
                 ) from None
             finally:
                 self.last_completed = time.monotonic()
@@ -196,7 +224,9 @@ class GitHub:
             with self.opener.open(req, timeout=min(15, remaining)) as response:
                 status = getattr(response, "status", 200)
                 if type(status) is int and status != 200:
-                    raise DiscoveryError("GITHUB_HTTP_ERROR")
+                    raise DiscoveryError(
+                        "GITHUB_HTTP_ERROR", temporary=status in TEMPORARY_HTTP_ERRORS
+                    )
                 headers = response.headers
                 if self.quota_exhausted(headers):
                     self.retry_at = max(
@@ -225,7 +255,7 @@ class GitHub:
                     and (
                         self.quota_exhausted(error.headers)
                         or bool(headers.get("retry-after"))
-                        or b"rate limit" in error.read(4096).lower()
+                        or self.rate_limit_message(error)
                     )
                 )
                 code = (
@@ -244,7 +274,18 @@ class GitHub:
                 if rate:
                     self.persist_cooldown()
                 retry = self.retry_at if rate else 0
-            raise DiscoveryError(code, retry) from None
+            raise DiscoveryError(
+                code, retry, temporary=error.code in TEMPORARY_HTTP_ERRORS
+            ) from None
+
+    def rate_limit_message(self, error: HTTPError) -> bool:
+        try:
+            return b"rate limit" in error.read(4096).lower()
+        except (HTTPException, OSError, ValueError):
+            # A failed read of a 403 body cannot make the response retryable.
+            raise DiscoveryError(
+                "GITHUB_INVALID_RESPONSE_OR_NETWORK", self.retry_at
+            ) from None
 
     def discover(self, provider: Provider) -> list[Observation]:
         user, _ = self.request("/user", provider.credential)

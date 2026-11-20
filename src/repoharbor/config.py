@@ -103,6 +103,20 @@ class Integrity:
     include_excluded: bool = True
 
 
+MAX_RETRIES = 10
+MAX_RETRY_DELAY = 86400
+
+
+@dataclass(frozen=True)
+class Retry:
+    max_retries: int = 3
+    initial_delay_seconds: int = 300
+    max_delay_seconds: int = 3600
+
+    def delay(self, attempts: int) -> int:
+        return min(self.max_delay_seconds, self.initial_delay_seconds * (1 << attempts))
+
+
 @dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
@@ -122,6 +136,8 @@ class Config:
     restore_helper: bool = False
     integrity_check: bool = False
     integrity: Integrity = field(default_factory=Integrity)
+    auto_retry: bool = False
+    retry: Retry = field(default_factory=Retry)
 
 
 def discovery_settings(
@@ -248,6 +264,7 @@ def load(env: dict[str, str]) -> Config:
             "selection",
             "discovery",
             "integrity",
+            "retry",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -349,10 +366,12 @@ def load(env: dict[str, str]) -> Config:
     manual_run = features.pop("manual_run", False)
     restore_helper = features.pop("restore_helper", False)
     integrity_check = features.pop("integrity_check", False)
+    auto_retry = features.pop("auto_retry", False)
     if (
         type(manual_run) is not bool
         or type(restore_helper) is not bool
         or type(integrity_check) is not bool
+        or type(auto_retry) is not bool
         or any(v is not False for v in features.values())
     ):
         raise HarborError("Invalid or unsupported optional feature")
@@ -362,6 +381,21 @@ def load(env: dict[str, str]) -> Config:
     include_excluded = integrity.get("include_excluded", True)
     if type(include_excluded) is not bool:
         raise HarborError("Invalid integrity include_excluded setting")
+    retry = keys(
+        d.get("retry", {}),
+        {"max_retries", "initial_delay_seconds", "max_delay_seconds"},
+    )
+    retries = retry.get("max_retries", Retry.max_retries)
+    initial_delay = retry.get("initial_delay_seconds", Retry.initial_delay_seconds)
+    max_delay = retry.get("max_delay_seconds", Retry.max_delay_seconds)
+    if (
+        type(retries) is not int
+        or not 1 <= retries <= MAX_RETRIES
+        or type(initial_delay) is not int
+        or type(max_delay) is not int
+        or not 1 <= initial_delay <= max_delay <= MAX_RETRY_DELAY
+    ):
+        raise HarborError("Invalid retry settings")
     root = Path(env.get("REPOHARBOR_BACKUP_ROOT", "/backups"))
     secrets = Path(env.get("REPOHARBOR_SECRETS_DIR", "/run/secrets/repoharbor"))
     if not root.is_absolute() or not secrets.is_absolute():
@@ -384,4 +418,6 @@ def load(env: dict[str, str]) -> Config:
         restore_helper,
         integrity_check,
         Integrity(integrity_schedule, include_excluded),
+        auto_retry,
+        Retry(retries, initial_delay, max_delay),
     )

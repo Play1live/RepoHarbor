@@ -5,6 +5,9 @@ class HarborError(Exception):
     """A safe, public error message (never raw Git/YAML/OS diagnostics)."""
 
 
+TRANSIENT_GIT_ERRORS = frozenset({"GIT_NETWORK", "GIT_SERVER_TEMPORARY", "GIT_TIMEOUT"})
+
+
 class GitError(HarborError):
     """A fixed code and optional evidence about the source; never raw diagnostics."""
 

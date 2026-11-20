@@ -481,3 +481,66 @@ def test_successful_exhaustion_combines_valid_reset_and_retry_after(
     client.opener.open = Mock(return_value=api_response({}, headers))
     client.request("/user", "first")
     assert client.retry_at == github_clock.time() + expected
+
+
+@pytest.mark.parametrize(
+    ("failure", "temporary"),
+    [
+        ("socket_timeout", True),
+        ("connection_reset", True),
+        ("dns_temporary", True),
+        ("dns_permanent", False),
+        ("certificate", False),
+        ("invalid_json", False),
+        ("unclassified_os_error", False),
+        (401, False),
+        (403, False),
+        (404, False),
+        (429, False),
+        (500, True),
+        (502, True),
+        (503, True),
+        (504, True),
+        (501, False),
+    ],
+)
+@pytest.mark.parametrize("provider", ["github", "gitlab"])
+def test_discovery_temporary_classification(failure, temporary, provider):
+    import errno
+    import socket
+    import ssl
+    from urllib.error import URLError
+
+    from repoharbor.gitlab import GitLab
+
+    client = (
+        GitHub(Credentials({"first": "fictional-secret"}))
+        if provider == "github"
+        else GitLab(Credentials({"first": "fictional-secret"}))
+    )
+    if isinstance(client, GitLab):
+        client.bind("gitlab.example.org")
+    errors = {
+        "socket_timeout": TimeoutError("fictional-secret"),
+        "connection_reset": ConnectionResetError(errno.ECONNRESET, "fictional-secret"),
+        "dns_temporary": URLError(
+            socket.gaierror(socket.EAI_AGAIN, "fictional-secret")
+        ),
+        "dns_permanent": URLError(
+            socket.gaierror(socket.EAI_NONAME, "fictional-secret")
+        ),
+        "certificate": URLError(ssl.SSLCertVerificationError("fictional-secret")),
+        "invalid_json": ValueError("fictional-secret"),
+        "unclassified_os_error": OSError(errno.EIO, "fictional-secret"),
+    }
+    failure = (
+        HTTPError("", failure, "fictional-secret", Message(), io.BytesIO())
+        if isinstance(failure, int)
+        else errors[failure]
+    )
+    client.opener.open = Mock(side_effect=failure)
+    with pytest.raises(DiscoveryError) as raised:
+        client.request("/user", "first")
+    assert raised.value.temporary is temporary
+    assert str(raised.value).startswith(provider.upper() + "_")
+    assert "fictional-secret" not in str(raised.value)

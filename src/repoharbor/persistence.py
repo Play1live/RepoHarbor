@@ -231,6 +231,13 @@ def validate_state(data: dict[str, Any]) -> None:
                 not isinstance(discovery, dict)
                 or discovery.get("state") not in ("running", "failed", "completed")
                 or not isinstance(discovery.get("started_at"), str)
+                or (
+                    "temporary" in discovery
+                    and (
+                        type(discovery["temporary"]) is not bool
+                        or discovery["state"] != "failed"
+                    )
+                )
                 or type(discovery.get("retry_at", 0)) not in (int, float)
                 or not math.isfinite(discovery.get("retry_at", 0))
                 or discovery.get("retry_at", 0) < 0
@@ -255,6 +262,11 @@ def validate_state(data: dict[str, Any]) -> None:
                     or not isinstance(value.get("id"), str)
                     or value.get("type")
                     not in {"initial_clone", "mirror_update", "repair", "quarantine"}
+                ):
+                    raise ValueError
+                if "trigger" in value and (
+                    value["trigger"] != "retry"
+                    or value["type"] not in ("initial_clone", "mirror_update")
                 ):
                     raise ValueError
                 if "git_completed_at" in value and (
@@ -345,7 +357,7 @@ class Store:
         with self.transaction() as data:
             data["active_operation"].update(values)
 
-    def begin(self, alias: str, kind: str) -> str:
+    def begin(self, alias: str, kind: str, *, retry: bool = False) -> str:
         operation = {
             "id": utcnow(),
             "alias": alias,
@@ -353,6 +365,8 @@ class Store:
             "state": "running",
             "started_at": utcnow(),
         }
+        if retry:
+            operation["trigger"] = "retry"
         with self.transaction() as data:
             data["active_operation"] = operation
         return str(operation["id"])

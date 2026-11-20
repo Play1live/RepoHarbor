@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,7 @@ from repoharbor.registry import (
     manual_identities,
     plan,
 )
+from repoharbor.retry import Retries
 from repoharbor.selection import address
 from repoharbor.storage import Budget, usage
 
@@ -46,9 +48,13 @@ class Engine:
         store: Store,
         git: Git,
         checkpoint: Checkpoint = no_checkpoint,
+        *,
+        retry_clock: Callable[[], float] = time.time,
     ):
         self.config, self.store, self.git = config, store, git
         self.git.backup_lock_fd = store.fd
+        self.git.classify_transient = config.auto_retry
+        self.retries = Retries(self, retry_clock)
         self.budget = Budget(config.root, config.storage)
         self.checkpoint = checkpoint
         self.repos: dict[str, dict[str, Any]] = {}
@@ -110,26 +116,29 @@ class Engine:
             self.repos[source.alias]["repository"]["web_url"] = source.web_url
             self.save_meta(source.alias)
 
-    def discover(self) -> set[str]:
+    def discover(self, host_scope: str | None = None) -> set[str]:
         failures = set()
         github_config = replace(
             self.config,
             providers=tuple(p for p in self.config.providers if p.type == "github"),
         )
         original = self.config
-        try:
-            self.config = github_config
-            if not self.discover_github():
-                failures.add("github:github.com")
-        finally:
-            self.config = original
+        if host_scope in (None, "github.com"):
+            try:
+                self.config = github_config
+                if not self.discover_github():
+                    failures.add("github:github.com")
+            finally:
+                self.config = original
+        else:
+            self.sources = self.manual_sources()
         sources = self.sources
         hosts = {p.host for p in original.providers if p.type == "gitlab"} | {
             m["repository"]["host"]
             for m in self.repos.values()
             if m["repository"]["provider"] == "gitlab"
         }
-        for host in sorted(hosts):
+        for host in sorted(hosts if host_scope is None else hosts & {host_scope}):
             providers = tuple(
                 p for p in original.providers if p.type == "gitlab" and p.host == host
             )
@@ -143,8 +152,6 @@ class Engine:
         return failures
 
     def discover_gitlab(self, config: Config, host: str) -> tuple[Source, ...] | None:
-        import time
-
         state_key = "gitlab:" + host
         previous = self.store.data.get("provider_discovery", {}).get(state_key, {})
         if config.providers and previous.get("retry_at", 0) > time.time():
@@ -192,6 +199,7 @@ class Engine:
                 data["provider_discovery"][state_key].update(
                     state="failed",
                     code=str(error),
+                    temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at),
                 )
             logging.warning(
@@ -220,8 +228,6 @@ class Engine:
         return sources
 
     def discover_github(self) -> bool:
-        import time
-
         self.sources = self.manual_sources()
         if not self.config.providers and not any(
             k.startswith("github:") for k in self.repos
@@ -257,6 +263,7 @@ class Engine:
                 data["discovery"].update(
                     state="failed",
                     code=str(error),
+                    temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at if client else 0),
                 )
             logging.warning("GitHub discovery skipped: %s", error)
@@ -285,28 +292,66 @@ class Engine:
         self.sources = self.manual_sources() + sources
         return True
 
+    def discovery_state(self, scope: str) -> dict[str, Any]:
+        state: dict[str, Any] = (
+            self.store.data.get("discovery", {})
+            if scope == "github:github.com"
+            else self.store.data.get("provider_discovery", {}).get(scope, {})
+        )
+        return state
+
+    def provider_mirror_conflict(self, source: Source) -> bool:
+        try:
+            name = address(source.url)
+        except HarborError:
+            return False
+        return any(
+            name in meta["repository"].get("aliases", [])
+            and (self.path(key) / "repository.git").exists()
+            for key, meta in self.repos.items()
+            if ":" in key
+        )
+
     def manual_sources(self) -> tuple[Source, ...]:
         """Do not clone a new manual copy over a known provider-owned URL."""
         result = []
         for source in self.config.sources:
-            if not (self.path(source.alias) / "repository.git").exists():
-                try:
-                    name = address(source.url)
-                except HarborError:
-                    name = ""
-                if any(
-                    name in meta["repository"].get("aliases", [])
-                    and (self.path(key) / "repository.git").exists()
-                    for key, meta in self.repos.items()
-                    if ":" in key
-                ):
-                    logging.warning(
-                        "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
-                        source.alias,
-                    )
-                    continue
+            if not (
+                self.path(source.alias) / "repository.git"
+            ).exists() and self.provider_mirror_conflict(source):
+                logging.warning(
+                    "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
+                    source.alias,
+                )
+                continue
             result.append(source)
         return tuple(result)
+
+    def manual_requires_discovery(self, source: Source, failures: set[str]) -> bool:
+        if not failures or ":" in source.alias:
+            return False
+        host = urlsplit(source.url).netloc
+        affected = {scope for scope in failures if scope.partition(":")[2] == host}
+        if not affected:
+            return False
+        meta = self.repos[source.alias]
+        return (
+            meta["selection"]["status"] != "included"
+            or meta["repository"]["clone_url"] != source.url
+            or not (self.path(source.alias) / "repository.git").is_dir()
+            or meta["backup"]["successful_updates"] <= 0
+            or self.provider_mirror_conflict(source)
+            or any(
+                str(self.discovery_state(scope).get("code", "")).endswith(
+                    (
+                        "_IDENTITY_CONFLICT",
+                        "_ALIAS_CONFLICT",
+                        "_INCONSISTENT_ID",
+                    )
+                )
+                for scope in affected
+            )
+        )
 
     def run(self, *, manual: bool = False, repository: str | None = None) -> Result:
         with self.store.transaction() as data:
@@ -356,19 +401,13 @@ class Engine:
             recover(self, during_run=True)
 
         failures = self.discover()
-        failed_hosts = {key.partition(":")[2] for key in failures}
-        # An established manual mirror is authorized by its configured URL and
-        # durable backup history. A first clone on a failed provider instance
-        # must wait until discovery can rule out a duplicate provider mirror.
+        if self.config.auto_retry:
+            self.retries.cancel_excluded()
+        # Keep established manual sources eligible when their authority fails.
         blocked_manual = {
             source.alias
             for source in self.sources
-            if ":" not in source.alias
-            and urlsplit(source.url).netloc in failed_hosts
-            and (
-                not (self.path(source.alias) / "repository.git").is_dir()
-                or self.repos[source.alias]["backup"]["successful_updates"] <= 0
-            )
+            if self.manual_requires_discovery(source, failures)
         }
         self.sources = tuple(s for s in self.sources if s.alias not in blocked_manual)
         if repository is not None:
@@ -405,6 +444,8 @@ class Engine:
         for source in sources:
             if self.git.stop.is_set():
                 return Result.BACKUP_FAILED
+            if self.config.auto_retry and not self.reconcile_operation():
+                return Result.BACKUP_FAILED
             if not self.backup(source):
                 failed = True
         if failed:
@@ -418,6 +459,20 @@ class Engine:
         ):
             return Result.NOT_SELECTED
         return Result.SUCCESS
+
+    def reconcile_operation(self, *, retry: bool = False) -> bool:
+        """Keep the open backup journal until local recovery can account for it."""
+        from repoharbor.recovery import recover
+
+        operation = self.store.data["active_operation"]
+        if operation and operation["state"] in ("running", "interrupted"):
+            if retry and operation["type"] == "repair":
+                return False
+            recover(
+                self, repository=operation["alias"], during_run=True, allow_repair=False
+            )
+        operation = self.store.data["active_operation"]
+        return not operation or operation["state"] not in ("running", "interrupted")
 
     def backup(self, source: Source) -> bool:
         alias = source.alias
@@ -459,6 +514,7 @@ class Engine:
                     backup["status"] = "up_to_date"
                     meta["source"]["status"] = "available"
                     meta["errors"]["consecutive"] = 0
+                    self.retries.success(alias)
                     self.save_meta(alias)
                     return True
                 kind = "mirror_update"
@@ -466,7 +522,10 @@ class Engine:
                 kind = "initial_clone"
                 backup["status"] = "initializing"
                 self.save_meta(alias)
-            operation = self.store.begin(alias, kind)
+            if meta.get("retry", {}).get("status") == "running":
+                operation = self.store.begin(alias, kind, retry=True)
+            else:
+                operation = self.store.begin(alias, kind)
             if kind == "initial_clone":
                 backup["partial_operation"] = operation
                 self.save_meta(alias)
@@ -511,7 +570,10 @@ class Engine:
                 record_error(meta, code)
             if operation and mirror.exists():
                 meta["integrity"]["status"] = "suspect"
+            retry_status = self.retries.failure(alias, error, limited, interrupted)
             self.save_meta(alias)
+            if retry_status == "pending":
+                self.checkpoint("retry_planned")
             if operation:
                 self.store.update_operation(state="interrupted")
             logging.warning("backup failed: %s", alias)
@@ -563,6 +625,7 @@ class Engine:
         meta["source"]["status"] = "available"
         meta["errors"]["consecutive"] = 0
         meta["integrity"]["status"] = "healthy"
+        self.retries.success(alias)
         self.save_meta(alias)
 
     def update_skips(self, skipped: int) -> None:

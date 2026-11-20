@@ -191,7 +191,9 @@ def manual_smoke(mount):
         ]:
             path.chmod(0o755 if path.is_dir() else 0o644)
         config = (
-            "schema_version: 1\nschedule: '0 0 29 2 *'\nfeatures: {manual_run: true}\n"
+            "schema_version: 1\nschedule: '0 0 29 2 *'\n"
+            "features: {manual_run: true, auto_retry: true}\n"
+            "retry: {max_retries: 3, initial_delay_seconds: 3}\n"
             "manual_git_urls:\n  - alias: demo\n"
             "    url: https://127.0.0.1:8443/remote.git\n"
             "storage: {min_free_gib: 0}\n"
@@ -233,9 +235,13 @@ def manual_smoke(mount):
             fixture_code = """
 import http.server, os, ssl
 os.chdir('/fixture')
-server = http.server.ThreadingHTTPServer(
-    ('127.0.0.1', 8443), http.server.SimpleHTTPRequestHandler
-)
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if os.path.exists('outage'):
+            self.send_error(503)
+        else:
+            super().do_GET()
+server = http.server.ThreadingHTTPServer(('127.0.0.1', 8443), Handler)
 tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 tls.load_cert_chain('cert.pem', 'key.pem')
 server.socket = tls.wrap_socket(server.socket, server_side=True)
@@ -282,6 +288,30 @@ server.serve_forever()
             )
             assert after["successful_updates"] == 1
             assert after["last_updated_at"] == before["last_updated_at"]
+            (fixture / "outage").touch()
+            failed = exec_result(container, "backup", "run", "--repository", "demo")
+            assert failed.returncode == 9, failed.stderr
+            (fixture / "outage").unlink()
+            deadline = time.monotonic() + 20
+            while True:
+                after_retry = json.loads(
+                    docker(
+                        "exec",
+                        container,
+                        "repoharbor",
+                        "repositories",
+                        "show",
+                        "demo",
+                        "--json",
+                    )
+                )
+                if after_retry["retry"]["last_result"] == "succeeded":
+                    break
+                assert time.monotonic() < deadline, docker("logs", container)
+                time.sleep(0.15)
+            assert after_retry["successful_updates"] == 1
+            assert after_retry["retry"]["reason"] == "GIT_SERVER_TEMPORARY"
+            assert after_retry["errors"]["total"] == 1
             docker(
                 "exec",
                 container,
@@ -414,7 +444,7 @@ for p in sorted(root.rglob('*')):
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.6.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.7.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
@@ -496,7 +526,7 @@ def smoke():
         manual_smoke(f"type=bind,src={directory},dst=/backups")
     print(
         "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
-        "manual backup, offline restore and periodic integrity"
+        "manual backup, automatic retry, offline restore and periodic integrity"
     )
 
 

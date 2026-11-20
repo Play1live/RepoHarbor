@@ -196,6 +196,18 @@ def test_broken_metadata_preserved(factory, section, value):
         lambda d: d.update(global_storage=[]),
         lambda d: d.update(recovery={}),
         lambda d: d.update(active_run={"state": "unknown"}),
+        lambda d: d.update(
+            discovery={"state": "failed", "started_at": "now", "temporary": 1}
+        ),
+        lambda d: d.update(
+            provider_discovery={
+                "gitlab:gitlab.example.org": {
+                    "state": "completed",
+                    "started_at": "now",
+                    "temporary": True,
+                }
+            }
+        ),
         lambda d: d.update(active_run={"state": "running", "started_at": 4}),
         lambda d: d.update(
             active_operation={"state": "running", "started_at": "now", "alias": 4}

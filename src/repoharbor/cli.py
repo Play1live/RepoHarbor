@@ -76,6 +76,27 @@ def serve(engine: Engine, stop: threading.Event) -> None:
         candidate.start()
         worker = candidate
 
+    def start_retry() -> None:
+        if not engine.config.auto_retry or not scheduler.busy.acquire(blocking=False):
+            return
+        handed_off = False
+        try:
+            alias = engine.retries.due()
+            if alias is None:
+                return
+
+            def execute() -> None:
+                try:
+                    run(lambda: engine.retries.execute(alias))
+                finally:
+                    scheduler.busy.release()
+
+            dispatch(execute)
+            handed_off = True
+        finally:
+            if not handed_off:
+                scheduler.busy.release()
+
     control = Control(engine, scheduler, stop)
     with control.start():
         logging.info("ready; waiting for future schedule (dashboard disabled)")
@@ -87,6 +108,8 @@ def serve(engine: Engine, stop: threading.Event) -> None:
                     checker.tick(
                         now, lambda: run(lambda: integrity.run(engine)), dispatch
                     )
+                if not stop.is_set():
+                    start_retry()
                 stop.wait(0.25)
         except Exception as error:
             record_failure(error)

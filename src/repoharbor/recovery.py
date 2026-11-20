@@ -97,6 +97,7 @@ def recover(
     repository: str | None = None,
     during_run: bool = False,
     periodic: bool = False,
+    allow_repair: bool = True,
 ) -> None:
     store = engine.store
     active = store.data["active_operation"]
@@ -127,6 +128,17 @@ def recover(
             and active["state"] in ("running", "interrupted")
         )
         backup, integrity = meta["backup"], meta["integrity"]
+        local_only = not allow_repair or (
+            not during_run
+            and (
+                meta.get("retry", {}).get("status") in ("pending", "running")
+                or (
+                    interrupted
+                    and active is not None
+                    and active.get("trigger") == "retry"
+                )
+            )
+        )
         finding = integrity.get("periodic", {})
         periodic_damage = finding.get("repair_pending", False)
         eligible = (
@@ -160,9 +172,15 @@ def recover(
         elif pending_quarantine:
             quarantine(engine, alias, active)
         if mirror.exists():
-            healthy = verify(engine, mirror, periodic_damage)
+            if local_only:
+                finding_status, _ = inspect(engine.git, mirror)
+                if engine.git.stop.is_set():
+                    break
+                healthy = {"healthy": True, "corrupt": False}.get(finding_status)
+            else:
+                healthy = verify(engine, mirror, periodic_damage)
             if healthy is None:
-                if interrupted:
+                if interrupted and not local_only:
                     raise HarborError("Cannot verify interrupted mirror operation")
                 continue
             if not partial.exists() and not pending_quarantine:
@@ -173,7 +191,8 @@ def recover(
             if healthy:
                 if periodic_damage:
                     finding["repair_pending"] = False
-                integrity["repair_attempts"] = 0
+                if not local_only:
+                    integrity["repair_attempts"] = 0
                 backup.pop("repair_deferred", None)
                 if interrupted and active is not None:
                     if active["type"] == "repair":
@@ -184,6 +203,8 @@ def recover(
                             engine.finish(alias, active)
                         else:
                             backup["status"] = "interrupted"
+            elif local_only:
+                backup["repair_deferred"] = "RECOVERY_REQUIRED"
             elif not periodic_damage or eligible:
                 repair(engine, alias)
         elif not partial.exists() and not pending_quarantine:
@@ -209,6 +230,8 @@ def recover(
                 store.update_operation(state="reconciled", completed_at=utcnow())
                 if paused_repair:
                     engine.checkpoint("repair_recovery_journal")
+    if not during_run and not engine.git.stop.is_set():
+        engine.retries.reconcile_interrupted()
     with store.transaction() as data:
         if (
             not during_run

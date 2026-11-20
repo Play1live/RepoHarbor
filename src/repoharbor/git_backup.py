@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import re
 import select
 import shutil
 import signal
@@ -15,6 +16,34 @@ from typing import Literal
 
 from repoharbor.credentials import Credentials
 from repoharbor.errors import GitError, HarborError
+
+
+def transient_git_error(diagnostic: bytes) -> str | None:
+    # Only recognize Git/libcurl messages. Server-supplied "remote:" text,
+    # generic transfer errors, and permanent HTTP responses are insufficient.
+    access = re.findall(
+        rb"^fatal: unable to access '[^\r\n]*?': ([^\r\n]*)$", diagnostic, re.M
+    )
+    http = rb"the requested url returned error: ([0-9]{3})$"
+    statuses = re.findall(
+        rb"^error: rpc failed; http ([0-9]{3}) curl 22 ", diagnostic, re.M
+    )
+    statuses += [m[1] for line in access if (m := re.fullmatch(http, line))]
+    if statuses:
+        if all(code in (b"500", b"502", b"503", b"504") for code in statuses):
+            return "GIT_SERVER_TEMPORARY"
+        return None
+    if any(
+        re.match(rb"(?:failed to connect to |recv failure: |send failure: )", line)
+        for line in access
+    ) or re.search(rb"^error: rpc failed; curl (18|52|55|56) ", diagnostic, re.M):
+        return "GIT_NETWORK"
+    if any(
+        re.match(rb"(?:operation timed out|connection timed out)", line)
+        for line in access
+    ) or re.search(rb"^error: rpc failed; curl 28 ", diagnostic, re.M):
+        return "GIT_TIMEOUT"
+    return None
 
 
 class Git:
@@ -34,6 +63,7 @@ class Git:
         self.extra_fds = extra_fds
         self.output_errors = output_errors
         self.scratch = scratch
+        self.classify_transient = False
 
     def run(
         self,
@@ -46,6 +76,23 @@ class Git:
         if self.stop.is_set():
             raise HarborError("INTERRUPTED")
         env = self.credentials.git_env(credential if probe is None else None)
+        command = next(iter(args[2:] if args[:1] == ["-C"] else args), None)
+        remote = args.index("--") + 1 if "--" in args else len(args)
+        classify = (
+            self.classify_transient
+            and probe is None
+            and command in ("clone", "fetch", "ls-remote")
+            and "--refetch" not in args
+            and remote < len(args)
+            and args[remote].startswith("https://")
+        )
+        if classify:
+            # RepoHarbor owns retry scheduling. Git 2.56.1 can enter its 429
+            # loop after a 401 challenge even with maxRetries=0. Reject its
+            # retry delay as well, including a zero or absent Retry-After.
+            env.update(
+                LC_ALL="C", GIT_HTTP_MAX_RETRIES="0", GIT_HTTP_MAX_RETRY_TIME="-1"
+            )
         if probe is not None:
             env.update(
                 LC_ALL="C",
@@ -85,11 +132,11 @@ class Git:
                     return self.probe_output(process, started, probe == "fsck")
                 assert out is not None and err is not None
                 while process.poll() is None:
-                    if (
-                        self.stop.is_set()
-                        or interrupt()
-                        or time.monotonic() - started > self.timeout
-                    ):
+                    if self.stop.is_set() or interrupt():
+                        raise HarborError("INTERRUPTED")
+                    if time.monotonic() - started > self.timeout:
+                        if classify:
+                            raise GitError("GIT_TIMEOUT")
                         raise HarborError("INTERRUPTED")
                     self.stop.wait(0.1)
                 if process.returncode:
@@ -113,7 +160,10 @@ class Git:
                             b"repository not found",
                         )
                     )
-                    raise GitError("GIT_FAILED", "unavailable" if unavailable else None)
+                    code = transient_git_error(diagnostic) if classify else None
+                    raise GitError(
+                        code or "GIT_FAILED", "unavailable" if unavailable else None
+                    )
                 out.seek(0)
                 return out.read().decode("utf-8", errors=self.output_errors)
             finally:
