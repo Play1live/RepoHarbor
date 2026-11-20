@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread
+from unittest.mock import Mock
 
 import pytest
 
@@ -84,9 +85,14 @@ def listening(server):
             thread.join()
 
 
-def exchange(port, method, path, headers=None, value=None, tls=None, raw=None):
+def exchange(
+    port, method, path, headers=None, value=None, tls=None, raw=None, *, peer=None
+):
+    source_address = (peer, 0) if peer is not None else None
     connection = (
-        http.client.HTTPSConnection(HOST, port, timeout=10, context=tls)
+        http.client.HTTPSConnection(
+            HOST, port, timeout=10, context=tls, source_address=source_address
+        )
         if tls
         else http.client.HTTPConnection(HOST, port, timeout=10)
     )
@@ -245,21 +251,146 @@ def test_live_auth_csrf_and_invalid_requests(factory, tls_files):
         assert exchange(port, "GET", "/api/dashboard", auth, tls=client)[0] == 401
 
 
-def test_session_throttle_and_expiry(monkeypatch):
+def test_session_throttle_expiry_and_restart(monkeypatch):
     now = [100.0]
     monkeypatch.setattr("repoharbor.dashboard_http.monotonic", lambda: now[0])
     sessions = Sessions(b"fixture")
     for _ in range(5):
-        assert sessions.login("wrong") == (401, None)
-    assert sessions.login("fixture") == (429, None)
-    now[0] += 61
-    code, session = sessions.login("fixture")
+        assert sessions.login("wrong", HOST) == (401, None)
+    assert sessions.login("fixture", HOST) == (429, None)
+    now[0] += 60
+    code, session = sessions.login("fixture", HOST)
     assert code == 200 and sessions.csrf(session)
+    assert sessions.failures == {}
+    restarted = Sessions(b"fixture")
+    assert len(sessions.salt) == 16 and restarted.salt != sessions.salt
+    assert len(sessions.verifier) == 32 and restarted.verifier != sessions.verifier
+    assert restarted.csrf(session) is None
+    assert restarted.login("fixture", HOST)[0] == 200
     now[0] += 901
     assert sessions.csrf(session) is None
+    monkeypatch.setattr(
+        "repoharbor.dashboard_http.password_verifier",
+        lambda *_: sessions.verifier,
+    )
     for _ in range(18):
-        assert sessions.login("fixture")[0] == 200
+        assert sessions.login("fixture", HOST)[0] == 200
     assert len(sessions.active) == 16
+
+
+def test_concurrent_login_bounds_and_active_sessions(monkeypatch):
+    sessions = Sessions(b"fixture")
+    _, session = sessions.login("fixture", HOST)
+    csrf = sessions.csrf(session)
+    started, release = Event(), Event()
+
+    def slow_verifier(*_):
+        started.set()
+        assert release.wait(3)
+        return b"wrong"
+
+    verifier = Mock(side_effect=slow_verifier)
+    monkeypatch.setattr("repoharbor.dashboard_http.password_verifier", verifier)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        attempt = executor.submit(sessions.login, "wrong", HOST)
+        try:
+            assert started.wait(3)
+            rejected = executor.submit(sessions.login, "fixture", "127.0.0.2")
+            assert rejected.result(1) == (429, None)
+            assert sessions.csrf(session) == csrf
+            verifier.assert_called_once()
+        finally:
+            release.set()
+        assert attempt.result(3) == (401, None)
+    assert list(sessions.failures) == [HOST]
+
+
+def test_failure_table_capacity_and_expiry(monkeypatch):
+    monkeypatch.setattr("repoharbor.dashboard_http.LOGIN_PEER_LIMIT", 2)
+    now = [100.0]
+    monkeypatch.setattr("repoharbor.dashboard_http.monotonic", lambda: now[0])
+    sessions = Sessions(b"fixture")
+    verifier = Mock(return_value=b"wrong")
+    monkeypatch.setattr("repoharbor.dashboard_http.password_verifier", verifier)
+    assert sessions.login("wrong", HOST) == (401, None)
+    assert sessions.login("wrong", "127.0.0.2") == (401, None)
+    assert sessions.login("wrong", "127.0.0.3") == (429, None)
+    assert verifier.call_count == len(sessions.failures) == 2
+    verifier.return_value = sessions.verifier
+    assert sessions.login("fixture", HOST)[0] == 200
+    now[0] += 60
+    assert sessions.login("fixture", "127.0.0.3")[0] == 200
+    assert sessions.failures == {}
+
+
+def test_login_uses_socket_peer_and_hides_credentials(factory, tls_files, caplog):
+    password, client, env = tls_files
+    config = replace(factory.config, web=Web(True, HOST, 0, ORIGIN))
+    with factory(config) as engine:
+        server = open_live(config, engine.events, env)
+        with listening(server) as port:
+
+            def post(value, forwarded, *, peer=HOST):
+                return exchange(
+                    port,
+                    "POST",
+                    "/api/login",
+                    {
+                        "Origin": ORIGIN,
+                        "X-Forwarded-For": forwarded,
+                        "Forwarded": f"for={forwarded}",
+                    },
+                    {"password": value},
+                    client,
+                    peer=peer,
+                )
+
+            for value in ("", "a" * 129, "é", "abc def", False):
+                assert post(value, "127.0.0.2")[0] == 400
+            assert server.sessions.failures == {}
+            responses = [post("wrong", f"127.0.1.{i}") for i in range(1, 6)]
+            assert all(response[0] == 401 for response in responses)
+            blocked = post(password, "127.0.0.2")
+            assert blocked[0] == 429 and blocked[1]["Retry-After"] == "60"
+            success = post(password, HOST, peer="127.0.0.2")
+            assert success[0] == 200 and success[2] == {}
+            cookie = {"Cookie": success[1]["Set-Cookie"].partition(";")[0]}
+            status, headers, data = exchange(
+                port, "GET", "/api/dashboard", cookie, tls=client
+            )
+            assert status == 200
+            visible = (
+                json.dumps([responses, blocked, success, headers, data]) + caplog.text
+            )
+            assert password not in visible
+            assert server.sessions.verifier.hex() not in visible
+            assert server.sessions.salt.hex() not in visible
+            assert password.encode() not in vars(server.sessions).values()
+
+
+def test_unavailable_kdf_fails_closed(factory, tls_files, monkeypatch, caplog):
+    password, client, env = tls_files
+    config = replace(factory.config, web=Web(True, HOST, 0, ORIGIN))
+    with factory(config, events=Events(config)) as engine:
+        server = open_live(config, engine.events, env)
+        monkeypatch.delattr("repoharbor.dashboard_http.hashlib.scrypt")
+        with listening(server) as port:
+            result, headers, body = exchange(
+                port,
+                "POST",
+                "/api/login",
+                {"Origin": ORIGIN},
+                {"password": password},
+                client,
+            )
+            assert (result, body) == (
+                503,
+                {"error": "Sign-in is currently unavailable."},
+            )
+            assert "Set-Cookie" not in headers
+        with dashboard(config, engine.events, env):
+            assert engine.events.recent_events()[-1]["event"] == "web.unavailable"
+        assert password not in caplog.text
 
 
 def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):

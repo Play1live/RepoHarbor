@@ -152,6 +152,9 @@ def test_credential_cannot_cross_services_or_manual_hosts():
         f"gitlab:{HOST}:0",
         f"gitlab:{HOST}:01",
         f"gitlab:{HOST}:../1",
+        f"gitlab:{HOST}:123:8443:17",
+        f"gitlab:{HOST}:8443:" + "1" * 21,
+        f"gitlab:{'a' * 260}.example.org:17",
     ],
 )
 def test_invalid_identity(value):

@@ -30,14 +30,16 @@ def instance_host(value: str) -> str:
 
 
 def repository_key(value: str) -> str:
-    if not isinstance(value, str):
+    if not isinstance(value, str) or len(value) > len("gitlab:") + 259 + 1 + 20:
         raise HarborError("Invalid provider repository identity")
-    if re.fullmatch(r"github:github\.com:[1-9][0-9]{0,19}", value):
+    authority, _, rid = value.rpartition(":")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", rid):
+        raise HarborError("Invalid provider repository identity")
+    if authority == "github:github.com":
         return value
-    match = re.fullmatch(r"gitlab:(.+):([1-9][0-9]{0,19})", value)
-    if not match:
+    if not authority.startswith("gitlab:") or authority == "gitlab:":
         raise HarborError("Invalid provider repository identity")
-    instance_host(match[1])
+    instance_host(authority.removeprefix("gitlab:"))
     return value
 
 

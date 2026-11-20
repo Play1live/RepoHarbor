@@ -37,27 +37,61 @@ STATIC = {
 }
 SESSION = "__Host-repoharbor"
 LIFETIME = 900
+LOGIN_WINDOW = 60
+LOGIN_FAILURE_LIMIT = 5
+LOGIN_PEER_LIMIT = 256
 AUTH_ERROR = "Sign-in required."
 SocketRequest = socket.socket | tuple[bytes, socket.socket]
 
 
+def password_verifier(password: bytes, salt: bytes) -> bytes:
+    try:
+        # OWASP's 32 MiB scrypt profile. maxmem includes OpenSSL's overhead.
+        return hashlib.scrypt(
+            password, salt=salt, n=2**15, r=8, p=3, maxmem=40 * 1024**2, dklen=32
+        )
+    except (AttributeError, MemoryError, OSError, ValueError):
+        raise HarborError("Dashboard password verification unavailable") from None
+
+
 class Sessions:
     def __init__(self, credential: bytes):
-        self.digest = hashlib.sha256(credential).digest()
+        self.salt = secrets.token_bytes(16)
+        self.verifier = password_verifier(credential, self.salt)
         self.lock = Lock()
-        self.failures: list[float] = []
+        self.verification = Lock()
+        self.failures: dict[str, list[float]] = {}
         self.active: dict[str, tuple[float, str]] = {}
 
-    def login(self, credential: str) -> tuple[int, str | None]:
+    def login(self, credential: str, peer: str) -> tuple[int, str | None]:
+        # The same gate bounds scrypt memory and serializes failure accounting.
+        # Back-pressure never queues a KDF or blocks existing authenticated requests.
+        if not self.verification.acquire(blocking=False):
+            return 429, None
+        try:
+            now = monotonic()
+            self.failures = {
+                address: recent
+                for address, stamps in self.failures.items()
+                if (recent := [stamp for stamp in stamps if now - stamp < LOGIN_WINDOW])
+            }
+            failures = self.failures.get(peer)
+            if failures is None and len(self.failures) == LOGIN_PEER_LIMIT:
+                return 429, None
+            if failures is not None and len(failures) >= LOGIN_FAILURE_LIMIT:
+                return 429, None
+            try:
+                candidate = password_verifier(credential.encode("ascii"), self.salt)
+            except HarborError:
+                return 503, None
+            if not hmac.compare_digest(candidate, self.verifier):
+                self.failures.setdefault(peer, []).append(monotonic())
+                return 401, None
+        finally:
+            self.verification.release()
+
         with self.lock:
             now = monotonic()
-            self.failures = [stamp for stamp in self.failures if now - stamp < 60]
-            if len(self.failures) >= 5:
-                return 429, None
-            digest = hashlib.sha256(credential.encode()).digest()
-            if not hmac.compare_digest(digest, self.digest):
-                self.failures.append(now)
-                return 401, None
             self.active = {key: val for key, val in self.active.items() if val[0] > now}
             if len(self.active) >= 16:
                 self.active.pop(next(iter(self.active)))
@@ -185,7 +219,7 @@ class DashboardRequest(BaseHTTPRequestHandler):
         )
         self.send_header("Strict-Transport-Security", "max-age=86400")
         if status == 429:
-            self.send_header("Retry-After", "60")
+            self.send_header("Retry-After", str(LOGIN_WINDOW))
         if cookie is not None:
             self.send_header(
                 "Set-Cookie",
@@ -295,20 +329,20 @@ class DashboardRequest(BaseHTTPRequestHandler):
         if (
             set(body) != {"password"}
             or not isinstance(password, str)
-            or not password.isascii()
+            or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", password)
         ):
             self.reply(400, {"error": "Invalid sign-in request."})
             return
-        status, token = sessions.login(password)
+        # Only the TCP peer is authoritative. A proxy's forwarding headers are ignored.
+        status, token = sessions.login(password, self.client_address[0])
         if token is not None:
             sessions.logout(session)
             self.reply(200, {}, cookie=f"{token}; Max-Age={LIFETIME}")
         else:
-            message = (
-                "Too many sign-in attempts. Try again shortly."
-                if status == 429
-                else "Sign-in failed."
-            )
+            message = {
+                429: "Too many sign-in attempts. Try again shortly.",
+                503: "Sign-in is currently unavailable.",
+            }.get(status, "Sign-in failed.")
             self.reply(status, {"error": message})
 
     def backup(self, body: dict[str, Any]) -> None:
