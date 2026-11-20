@@ -222,3 +222,75 @@ def test_interrupted_retry_fetch_cannot_start_remote_repair_on_restart(
         assert meta["backup"]["successful_updates"] == 1
         assert engine.retries.due() is None
         assert engine.store.data["active_operation"]["state"] == "reconciled"
+
+
+@pytest.mark.parametrize(
+    "phase", ["before_retry_discovery_deferral", "retry_discovery_deferred"]
+)
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_discovery_deferral_survives_signals(github_env, phase, signum):
+    from repoharbor.github import DiscoveryError
+
+    env = github_env
+    config = replace(env.config, auto_retry=True)
+    ctx = multiprocessing.get_context("fork")
+    parent, child = ctx.Pipe()
+
+    def interrupted():
+        with env.create(config, git_instance=env.git()) as engine:
+            signal.signal(signal.SIGTERM, lambda *_: engine.git.stop.set())
+            engine.retries.clock = lambda: 1000
+            original_clone = engine.git.clone
+            engine.git.clone = Mock(side_effect=GitError("GIT_NETWORK"))
+            assert engine.run(repository=env.key) == Result.BACKUP_FAILED
+            engine.git.clone = Mock(wraps=original_clone)
+            env.client.discover.side_effect = DiscoveryError(
+                "GITHUB_HTTP_ERROR", temporary=True
+            )
+
+            def checkpoint(point):
+                if point == phase:
+                    child.send(point)
+                    deadline = time.monotonic() + 10
+                    while not engine.git.stop.is_set():
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+
+            engine.checkpoint = checkpoint
+            engine.retries.clock = lambda: 1300
+            engine.retries.execute(env.key)
+            engine.git.clone.assert_not_called()
+
+    process = ctx.Process(target=interrupted)
+    process.start()
+    try:
+        assert parent.poll(15)
+        assert parent.recv() == phase
+        if signum == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
+        process.join(15)
+        assert process.exitcode == (-signum if signum == signal.SIGKILL else 0)
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join(10)
+        parent.close()
+        child.close()
+
+    with env.create(config, git_instance=env.git()) as engine:
+        recover(engine)
+        meta = engine.repos[env.key]
+        retry = meta["retry"]
+        saved = int(signum == signal.SIGTERM or phase == "retry_discovery_deferred")
+        assert retry.get("discovery_deferrals", 0) == saved
+        assert retry["next_attempt_at"] == (1600 if saved else 1300)
+        assert retry["attempts"] == meta["backup"]["successful_updates"] == 0
+        engine.retries.clock = lambda: 9000
+        assert engine.retries.due() == env.key
+        engine.retries.execute(env.key)
+        assert engine.retries.due() is None
+        recover(engine)
+        assert engine.repos[env.key]["backup"]["successful_updates"] == 1
+        assert engine.repos[env.key]["retry"]["last_result"] == "succeeded"

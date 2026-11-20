@@ -199,6 +199,7 @@ class Engine:
                 data["provider_discovery"][state_key].update(
                     state="failed",
                     code=str(error),
+                    temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at),
                 )
             logging.warning(
@@ -262,6 +263,7 @@ class Engine:
                 data["discovery"].update(
                     state="failed",
                     code=str(error),
+                    temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at if client else 0),
                 )
             logging.warning("GitHub discovery skipped: %s", error)
@@ -290,28 +292,66 @@ class Engine:
         self.sources = self.manual_sources() + sources
         return True
 
+    def discovery_state(self, scope: str) -> dict[str, Any]:
+        state: dict[str, Any] = (
+            self.store.data.get("discovery", {})
+            if scope == "github:github.com"
+            else self.store.data.get("provider_discovery", {}).get(scope, {})
+        )
+        return state
+
+    def provider_mirror_conflict(self, source: Source) -> bool:
+        try:
+            name = address(source.url)
+        except HarborError:
+            return False
+        return any(
+            name in meta["repository"].get("aliases", [])
+            and (self.path(key) / "repository.git").exists()
+            for key, meta in self.repos.items()
+            if ":" in key
+        )
+
     def manual_sources(self) -> tuple[Source, ...]:
         """Do not clone a new manual copy over a known provider-owned URL."""
         result = []
         for source in self.config.sources:
-            if not (self.path(source.alias) / "repository.git").exists():
-                try:
-                    name = address(source.url)
-                except HarborError:
-                    name = ""
-                if any(
-                    name in meta["repository"].get("aliases", [])
-                    and (self.path(key) / "repository.git").exists()
-                    for key, meta in self.repos.items()
-                    if ":" in key
-                ):
-                    logging.warning(
-                        "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
-                        source.alias,
-                    )
-                    continue
+            if not (
+                self.path(source.alias) / "repository.git"
+            ).exists() and self.provider_mirror_conflict(source):
+                logging.warning(
+                    "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
+                    source.alias,
+                )
+                continue
             result.append(source)
         return tuple(result)
+
+    def manual_requires_discovery(self, source: Source, failures: set[str]) -> bool:
+        if not failures or ":" in source.alias:
+            return False
+        host = urlsplit(source.url).netloc
+        affected = {scope for scope in failures if scope.partition(":")[2] == host}
+        if not affected:
+            return False
+        meta = self.repos[source.alias]
+        return (
+            meta["selection"]["status"] != "included"
+            or meta["repository"]["clone_url"] != source.url
+            or not (self.path(source.alias) / "repository.git").is_dir()
+            or meta["backup"]["successful_updates"] <= 0
+            or self.provider_mirror_conflict(source)
+            or any(
+                str(self.discovery_state(scope).get("code", "")).endswith(
+                    (
+                        "_IDENTITY_CONFLICT",
+                        "_ALIAS_CONFLICT",
+                        "_INCONSISTENT_ID",
+                    )
+                )
+                for scope in affected
+            )
+        )
 
     def run(self, *, manual: bool = False, repository: str | None = None) -> Result:
         with self.store.transaction() as data:
@@ -363,19 +403,11 @@ class Engine:
         failures = self.discover()
         if self.config.auto_retry:
             self.retries.cancel_excluded()
-        failed_hosts = {key.partition(":")[2] for key in failures}
-        # An established manual mirror is authorized by its configured URL and
-        # durable backup history. A first clone on a failed provider instance
-        # must wait until discovery can rule out a duplicate provider mirror.
+        # Keep established manual sources eligible when their authority fails.
         blocked_manual = {
             source.alias
             for source in self.sources
-            if ":" not in source.alias
-            and urlsplit(source.url).netloc in failed_hosts
-            and (
-                not (self.path(source.alias) / "repository.git").is_dir()
-                or self.repos[source.alias]["backup"]["successful_updates"] <= 0
-            )
+            if self.manual_requires_discovery(source, failures)
         }
         self.sources = tuple(s for s in self.sources if s.alias not in blocked_manual)
         if repository is not None:

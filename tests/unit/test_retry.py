@@ -287,6 +287,15 @@ def test_retry_preflight_blocks_without_remote_git(
         {"last_result": "failed"},
         {"last_error_code": "GIT_FOUND_SECRET"},
         {"block_reason": []},
+        {"discovery_deferrals": True},
+        {"discovery_deferrals": -1},
+        {"discovery_deferrals": 4},
+        {"block_reason": "DISCOVERY_TEMPORARY"},
+        {
+            "status": "blocked",
+            "next_attempt_at": None,
+            "block_reason": "DISCOVERY_LIMIT_REACHED",
+        },
         {"extra": "value"},
     ],
 )
@@ -323,6 +332,10 @@ def test_pending_retry_status_json_and_text(factory, pending, capsys):
         "last_error_code": None,
         "block_reason": None,
         "limit_reached": False,
+        "discovery_deferred": False,
+        "next_discovery_check_at": None,
+        "discovery_deferrals": 0,
+        "max_discovery_deferrals": 3,
     }
     for enabled in (True, False):
         args.command = "status"

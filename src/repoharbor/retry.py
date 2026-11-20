@@ -13,10 +13,13 @@ from repoharbor.persistence import safe_tree
 if TYPE_CHECKING:
     from repoharbor.engine import Engine
 
+MAX_DISCOVERY_DEFERRALS = 3
+DISCOVERY_BLOCKS = ("DISCOVERY_FAILED", "DISCOVERY_LIMIT_REACHED")
+DISCOVERY_WAITS = ("DISCOVERY_TEMPORARY", "PROVIDER_COOLDOWN")
 BLOCK_REASONS = (
     "BACKUP_FAILED",
-    "DISCOVERY_FAILED",
-    "PROVIDER_COOLDOWN",
+    *DISCOVERY_BLOCKS,
+    *DISCOVERY_WAITS,
     "NOT_SELECTED",
     "RECOVERY_REQUIRED",
     "INTERRUPTED",
@@ -44,13 +47,16 @@ FIELDS = {
 
 
 def validate_retry(value: Any) -> None:
-    if not isinstance(value, dict) or set(value) != FIELDS:
+    if not isinstance(value, dict) or set(value) - {"discovery_deferrals"} != FIELDS:
         raise ValueError
     status, attempts = value["status"], value["attempts"]
+    deferrals = value.get("discovery_deferrals", 0)
     if (
         status not in ("pending", "running", "succeeded", "blocked", "exhausted")
         or type(attempts) is not int
         or not 0 <= attempts <= MAX_RETRIES
+        or type(deferrals) is not int
+        or not 0 <= deferrals <= MAX_DISCOVERY_DEFERRALS
         or value["reason"] not in TRANSIENT_GIT_ERRORS
         or value["last_result"] not in (None, "succeeded", "failed", "interrupted")
         or value["last_error_code"] not in (None, *ATTEMPT_ERRORS)
@@ -72,8 +78,17 @@ def validate_retry(value: Any) -> None:
         or (status == "running" and value["last_result"] is not None)
         or (
             status == "pending"
-            and value["block_reason"] not in (None, "PROVIDER_COOLDOWN")
+            and value["block_reason"] not in (None, *DISCOVERY_WAITS)
         )
+        or (
+            value["block_reason"] == "DISCOVERY_TEMPORARY"
+            and (status != "pending" or deferrals == 0)
+        )
+        or (
+            value["block_reason"] == "DISCOVERY_LIMIT_REACHED"
+            and (status != "blocked" or deferrals != MAX_DISCOVERY_DEFERRALS)
+        )
+        or (status == "succeeded" and deferrals != 0)
         or (status == "blocked" and value["block_reason"] is None)
         or (status not in ("blocked", "pending") and value["block_reason"] is not None)
         or (value["last_result"] is not None and last is None)
@@ -90,12 +105,19 @@ def view(state: dict[str, Any], enabled: bool, maximum: int) -> dict[str, Any]:
     status = state.get("status", "idle")
     attempts = state.get("attempts", 0)
     exhausted = status == "exhausted" or attempts >= maximum
+    pending = enabled and status == "pending" and not exhausted
+    deferred = pending and state.get("block_reason") in DISCOVERY_WAITS
+    due = iso(state.get("next_attempt_at"))
     return {
         "status": status,
-        "pending": enabled and status == "pending" and not exhausted,
+        "pending": pending,
         "attempts": attempts,
         "max_retries": maximum,
-        "next_attempt_at": iso(state.get("next_attempt_at")),
+        "next_attempt_at": due,
+        "discovery_deferred": deferred,
+        "next_discovery_check_at": due if deferred else None,
+        "discovery_deferrals": state.get("discovery_deferrals", 0),
+        "max_discovery_deferrals": MAX_DISCOVERY_DEFERRALS,
         "reason": state.get("reason"),
         "last_attempt_at": iso(state.get("last_attempt_at")),
         "last_result": state.get("last_result"),
@@ -133,6 +155,7 @@ class Retries:
             if state["status"] == "running":
                 state.update(last_result="succeeded", last_error_code=None)
                 logging.info("retry succeeded repository=%s", alias)
+            state.pop("discovery_deferrals", None)
             state.update(
                 status="succeeded", attempts=0, next_attempt_at=None, block_reason=None
             )
@@ -175,9 +198,14 @@ class Retries:
                 "last_error_code": None,
             },
         )
-        if state.get("status") == "exhausted":
+        if (
+            state.get("status") == "exhausted"
+            or state.get("block_reason") in DISCOVERY_BLOCKS
+        ):
             return None
-        state.update(reason=code, block_reason=None)
+        state["reason"] = code
+        if state.get("status") != "pending":
+            state["block_reason"] = None
         if state["attempts"] >= engine.config.retry.max_retries:
             self.exhaust(alias, state)
         else:
@@ -239,32 +267,45 @@ class Retries:
 
     def cooldown(self, host: str) -> float:
         engine = self.engine
-        data = engine.store.data
         return max(
             (
-                (
-                    data.get("discovery", {})
-                    if provider.type == "github"
-                    else data.get("provider_discovery", {}).get(f"gitlab:{host}", {})
-                ).get("retry_at", 0)
+                engine.discovery_state(f"{provider.type}:{host}").get("retry_at", 0)
                 for provider in engine.config.providers
                 if provider.host == host
             ),
             default=0.0,
         )
 
-    def defer_cooldown(self, alias: str, until: float) -> None:
-        state = self.engine.repos[alias]["retry"]
-        # Out-of-range server dates cannot be represented safely in status output.
-        if until > 253402300799:
-            self.block(alias, "PROVIDER_COOLDOWN")
+    def defer_discovery(
+        self, alias: str, *, cooldown: float = 0, checked: bool
+    ) -> None:
+        engine = self.engine
+        state = engine.repos[alias]["retry"]
+        count = state.get("discovery_deferrals", 0)
+        reason = "PROVIDER_COOLDOWN" if cooldown else "DISCOVERY_TEMPORARY"
+        due = max(state["next_attempt_at"], cooldown)
+        if checked:
+            if count >= MAX_DISCOVERY_DEFERRALS:
+                self.block(alias, "DISCOVERY_LIMIT_REACHED")
+                return
+            due = max(due, self.clock() + engine.config.retry.delay(count))
+            count += 1
+        # Out-of-range dates cannot be represented safely in status output.
+        if due > 253402300799:
+            self.block(alias, "PROVIDER_COOLDOWN" if cooldown else "DISCOVERY_FAILED")
             return
         state.update(
-            next_attempt_at=max(state["next_attempt_at"], until),
-            block_reason="PROVIDER_COOLDOWN",
+            next_attempt_at=due, block_reason=reason, discovery_deferrals=count
         )
-        self.engine.save_meta(alias)
-        logging.info("retry deferred repository=%s reason=PROVIDER_COOLDOWN", alias)
+        engine.checkpoint("before_retry_discovery_deferral")
+        engine.save_meta(alias)
+        engine.checkpoint("retry_discovery_deferred")
+        logging.info(
+            "retry deferred repository=%s reason=%s discovery_deferrals=%d",
+            alias,
+            reason,
+            count,
+        )
 
     def execute(self, alias: str) -> None:
         from repoharbor.recovery import recover
@@ -284,39 +325,69 @@ class Retries:
             self.exhaust(alias, state)
             engine.save_meta(alias)
             return
-        if meta["selection"]["status"] == "excluded" and not any(
-            f"{p.type}:{p.host}" == alias.rpartition(":")[0]
-            for p in engine.config.providers
-        ):
+        provider_scope = alias.rpartition(":")[0]
+        if (
+            provider_scope
+            and (
+                not any(
+                    f"{p.type}:{p.host}" == provider_scope
+                    for p in engine.config.providers
+                )
+                or {alias, *meta["repository"]["aliases"]}.intersection(
+                    engine.config.selection.excluded
+                )
+            )
+        ) or (not provider_scope and meta["selection"]["status"] == "excluded"):
             self.block(alias, "NOT_SELECTED")
             return
         safe_tree(engine.config.root)
         host = self.scope(alias)
-        cooldown = self.cooldown(host)
-        if cooldown > self.clock():
-            self.defer_cooldown(alias, cooldown)
-            return
-        folder = engine.path(alias)
-        if "manual_attention_required" in meta[
-            "backup"
-        ] or not engine.reconcile_operation(retry=True):
+        if "manual_attention_required" in meta["backup"]:
             self.block(alias, "RECOVERY_REQUIRED")
             return
+        cooldown = self.cooldown(host)
+        if cooldown > self.clock():
+            self.defer_discovery(alias, cooldown=cooldown, checked=False)
+            return
+        folder = engine.path(alias)
+        reconciled = engine.reconcile_operation(retry=True)
         if state["status"] != "pending" or engine.git.stop.is_set():
+            return
+        if not reconciled:
+            self.block(alias, "RECOVERY_REQUIRED")
             return
         failures = engine.discover(host)
         if engine.git.stop.is_set():
             return
         cooldown = self.cooldown(host)
         if cooldown > self.clock():
-            self.defer_cooldown(alias, cooldown)
-            return
-        if failures:
-            for key in engine.repos:
-                if self.scope(key) == host:
-                    self.block(key, "DISCOVERY_FAILED")
+            self.defer_discovery(alias, cooldown=cooldown, checked=True)
             return
         source = next((s for s in engine.sources if s.alias == alias), None)
+        if provider_scope:
+            failures.intersection_update({provider_scope})
+        elif source is None or (failures and engine.provider_mirror_conflict(source)):
+            self.block(alias, "NOT_SELECTED")
+            return
+        outcomes = [engine.discovery_state(scope) for scope in failures]
+        if any(
+            outcome.get("code") in ("GITHUB_RATE_LIMIT", "GITLAB_RATE_LIMIT")
+            for outcome in outcomes
+        ):
+            # A zero/expired Retry-After still ends work for this check.
+            self.defer_discovery(alias, cooldown=self.clock(), checked=True)
+            return
+        if failures and (
+            source is None or engine.manual_requires_discovery(source, failures)
+        ):
+            if all(
+                outcome.get("state") == "failed" and outcome.get("temporary") is True
+                for outcome in outcomes
+            ):
+                self.defer_discovery(alias, checked=True)
+            else:
+                self.block(alias, "DISCOVERY_FAILED")
+            return
         if source is None:
             self.block(alias, "NOT_SELECTED")
             return
@@ -345,6 +416,15 @@ class Retries:
         ):
             self.block(alias, "RECOVERY_REQUIRED")
             return
+        if failures and not provider_scope:
+            from repoharbor.integrity import inspect
+
+            finding, _ = inspect(engine.git, mirror)
+            if engine.git.stop.is_set():
+                return
+            if finding != "healthy":
+                self.block(alias, "RECOVERY_REQUIRED")
+                return
         status = engine.refresh_storage(alias)
         if status:
             backup["status"] = status

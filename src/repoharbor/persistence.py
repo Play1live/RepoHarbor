@@ -231,6 +231,13 @@ def validate_state(data: dict[str, Any]) -> None:
                 not isinstance(discovery, dict)
                 or discovery.get("state") not in ("running", "failed", "completed")
                 or not isinstance(discovery.get("started_at"), str)
+                or (
+                    "temporary" in discovery
+                    and (
+                        type(discovery["temporary"]) is not bool
+                        or discovery["state"] != "failed"
+                    )
+                )
                 or type(discovery.get("retry_at", 0)) not in (int, float)
                 or not math.isfinite(discovery.get("retry_at", 0))
                 or discovery.get("retry_at", 0) < 0
