@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.9.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, authenticated loopback HTTPS servers, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.9.1` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, authenticated loopback HTTPS servers, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -47,6 +47,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | Periodic integrity configuration and scheduler | Boolean opt-in, independence from manual backups and restore, cron validation, timezone and DST behavior, skipped ticks and no backfill, shared exclusivity with backup runs, and durable overlap counts. |
 | Periodic Git integrity and selection | Full local checks of manual, GitHub and GitLab mirrors, confirmed corrupt objects, refs and packs, orphan pack/index pairs, empty mirrors, dangling objects, excluded and removed sources, and checks without provider access. |
 | Periodic integrity recovery and status | SIGTERM, SIGKILL, timeouts, filesystem errors and restart with partial progress. Offline object restoration followed by a healthy recheck, preservation of repair history and backup metrics, intact independent safeguards, and compatible text and JSON views. |
+| Dashboard manual integrity | Authenticated single and bulk checks with the periodic schedule disabled, local healthy and corrupt mirrors, excluded or removed sources, partial and unsupported mirrors, no remote Git or repair, shared-lock overlaps, outcomes after restart, and rejection of invalid IDs, sessions, CSRF tokens, hosts, and origins. |
 | Extended logging | Strict opt-in configuration, level filtering, text and JSON Lines, UTC timestamps and monotonic durations, run and operation IDs, event coverage, and fictional secret exclusion at `DEBUG`. |
 | Secure log rotation | Bounded and ordered archives, byte limits, append on restart, mount aliases and symlinks, hard links, file ownership and permissions, concurrent emission, and injected short writes, ENOSPC and EIO. File errors preserve successful Git and journal outcomes. |
 | Restore configuration and paths | Boolean flags and their independence, protected backup and secrets paths, symbolic links, traversal, and bind-mount aliases. |

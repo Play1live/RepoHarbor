@@ -1,6 +1,6 @@
-# RepoHarbor 0.9.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.9.1 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.9.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.9.1**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.9.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.9.1`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -305,7 +305,9 @@ The bind address is inside the container. Publishing on host loopback keeps the 
 
 Configure the proxy to preserve the browser's `Host` and `Origin` headers, verify the backend certificate, disable caching for dashboard requests, and limit connection counts and header/body read times. Set a response timeout appropriate for backups or use CLI for lengthy runs. After an interrupted browser request, inspect status before retrying. The service retains ownership of any accepted operation. The [NGINX proxy module reference](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) documents upstream TLS verification and request forwarding.
 
-For direct access on the Docker host without a proxy, set `web.origin` to `https://127.0.0.1:8080`, keep the host loopback mapping, and use a browser-trusted certificate with the loopback IP in its subject alternative names. Open the exact configured origin and enter the administrator password. To enable both browser and CLI backup actions, also set `features.manual_run: true`.
+For direct access on the Docker host without a proxy, set `web.origin` to `https://127.0.0.1:8080`, keep the host loopback mapping, and use a browser-trusted certificate with the loopback IP in its subject alternative names. Open the exact configured origin and enter the administrator password. Set `features.manual_run: true` to enable backups from the browser and CLI, as well as integrity checks from the dashboard.
+
+Select **Check integrity** in a repository's details or **Check all repositories** beside **Backup all repositories**. Confirm the scope and review the progress and result on the Repositories page. Checks are local and read-only, including eligible excluded mirrors. A check can continue after the browser disconnects. If the service is busy, wait for the current operation to finish before submitting another request. A service restart records an unfinished check as interrupted.
 
 In Portainer, create the files on the Docker endpoint host, use the same read-only bind mount and loopback publication or private proxy network, then redeploy the existing stack. For startup diagnostics, check the container log for `web.ready` or `web.unavailable` when extended logging is active. Without extended logging, look for `HTTPS dashboard ready` or `Web dashboard could not open securely`. Confirm the bind/port, exact browser origin, certificate chain, and that UID 10001 can read all three files. Sessions expire after 15 minutes and after a restart.
 
