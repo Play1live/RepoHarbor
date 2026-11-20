@@ -1,4 +1,5 @@
 import errno
+import json
 import os
 import shutil
 from pathlib import Path
@@ -510,3 +511,43 @@ def test_sha256_repository_and_bundle(local_inventory, monkeypatch, tmp_path):
     verifier = tmp_path / "verifier"
     git("init", "--object-format=sha256", verifier)
     assert "complete history" in git("bundle", "verify", bundle, cwd=verifier)
+
+
+def test_bundle_events_and_failed_retry_preserve_offline_state(
+    local_inventory, log_mount, monkeypatch, tmp_path, capsys
+):
+    root, _, _, make = local_inventory
+    make()
+    before = snapshot(root)
+    logfile = log_mount / "restore.log"
+    monkeypatch.setenv(
+        "REPOHARBOR_CONFIG",
+        "schema_version: 1\nfeatures: {restore_helper: true, extended_logging: true}\n"
+        "logging:\n  format: json\n  level: DEBUG\n"
+        f"  file: {{enabled: true, path: {logfile}}}",
+    )
+    output = tmp_path / "example.bundle"
+    assert invoke(monkeypatch, "bundle", output) == Result.SUCCESS
+    assert invoke(monkeypatch, "bundle", output) == Result.DESTINATION_FAILED
+    assert (
+        invoke(monkeypatch, "bundle", output, "fictional-credential-in-user-input")
+        == Result.UNKNOWN_REPOSITORY
+    )
+    assert snapshot(root) == before
+    captured = capsys.readouterr()
+    raw = logfile.read_text()
+    assert raw == captured.err
+    assert "fictional-credential-in-user-input" not in raw + captured.out
+    assert str(output) not in raw
+    events = [json.loads(line) for line in raw.splitlines()]
+    assert [event["event"] for event in events] == [
+        "restore.started",
+        "restore.bundle_created",
+        "restore.bundle_verified",
+        "restore.completed",
+        "restore.started",
+        "restore.failed",
+        "restore.failed",
+    ]
+    assert len({event["run_id"] for event in events[:4]}) == 1
+    assert events[-1]["result"] == "UNKNOWN_REPOSITORY"

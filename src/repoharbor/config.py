@@ -117,6 +117,69 @@ class Retry:
         return min(self.max_delay_seconds, self.initial_delay_seconds * (1 << attempts))
 
 
+MAX_LOG_ARCHIVES = 20
+MAX_LOG_SIZE_MIB = 100
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+DEFAULT_BACKUP_ROOT = Path("/backups")
+DEFAULT_SECRETS_DIR = Path("/run/secrets/repoharbor")
+
+
+@dataclass(frozen=True)
+class LogFile:
+    enabled: bool = False
+    path: Path = Path("/logs/repoharbor.log")
+    max_size_mib: int = 10
+    backup_count: int = 5
+
+
+@dataclass(frozen=True)
+class Logging:
+    level: str = "INFO"
+    format: str = "text"
+    file: LogFile = field(default_factory=LogFile)
+
+
+def logging_settings(raw: Any, root: Path, secrets: Path, enabled: bool) -> Logging:
+    options = keys(raw, {"level", "format", "file"})
+    level, output = (
+        options.get("level", Logging.level),
+        options.get("format", Logging.format),
+    )
+    if level not in LOG_LEVELS or output not in ("text", "json"):
+        raise HarborError("Invalid logging level or format")
+    file = keys(
+        options.get("file", {}), {"enabled", "path", "max_size_mib", "backup_count"}
+    )
+    active = file.get("enabled", LogFile.enabled)
+    size = file.get("max_size_mib", LogFile.max_size_mib)
+    count = file.get("backup_count", LogFile.backup_count)
+    if (
+        type(active) is not bool
+        or type(size) is not int
+        or not 1 <= size <= MAX_LOG_SIZE_MIB
+        or type(count) is not int
+        or not 1 <= count <= MAX_LOG_ARCHIVES
+    ):
+        raise HarborError("Invalid logging file settings")
+    if active and not enabled:
+        raise HarborError("File logging requires features.extended_logging")
+    value = file.get("path", str(LogFile.path))
+    if (
+        not isinstance(value, str)
+        or len(value) > 1024
+        or not re.fullmatch(r"(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}){2,}", value)
+        or not value.endswith(".log")
+    ):
+        raise HarborError("Invalid logging file path")
+    path = Path(value)
+    if (active or "path" in file) and any(
+        path.is_relative_to(base) or base.is_relative_to(path.parent)
+        for base in (root, secrets, DEFAULT_BACKUP_ROOT, DEFAULT_SECRETS_DIR)
+    ):
+        raise HarborError("Logging file path overlaps protected storage")
+    return Logging(level, output, LogFile(active, path, size, count))
+
+
 @dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
@@ -138,6 +201,8 @@ class Config:
     integrity: Integrity = field(default_factory=Integrity)
     auto_retry: bool = False
     retry: Retry = field(default_factory=Retry)
+    extended_logging: bool = False
+    logging: Logging = field(default_factory=Logging)
 
 
 def discovery_settings(
@@ -265,6 +330,7 @@ def load(env: dict[str, str]) -> Config:
             "discovery",
             "integrity",
             "retry",
+            "logging",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -367,11 +433,13 @@ def load(env: dict[str, str]) -> Config:
     restore_helper = features.pop("restore_helper", False)
     integrity_check = features.pop("integrity_check", False)
     auto_retry = features.pop("auto_retry", False)
+    extended_logging = features.pop("extended_logging", False)
     if (
         type(manual_run) is not bool
         or type(restore_helper) is not bool
         or type(integrity_check) is not bool
         or type(auto_retry) is not bool
+        or type(extended_logging) is not bool
         or any(v is not False for v in features.values())
     ):
         raise HarborError("Invalid or unsupported optional feature")
@@ -420,4 +488,6 @@ def load(env: dict[str, str]) -> Config:
         Integrity(integrity_schedule, include_excluded),
         auto_retry,
         Retry(retries, initial_delay, max_delay),
+        extended_logging,
+        logging_settings(d.get("logging", {}), root, secrets, extended_logging),
     )

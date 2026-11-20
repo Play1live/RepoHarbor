@@ -15,7 +15,13 @@ def attention(engine: Engine, alias: str, reason: str) -> None:
     backup = engine.repos[alias]["backup"]
     backup["status"] = "interrupted"
     if backup.get("manual_attention_required") != reason:
-        logging.warning("manual attention required: %s (%s)", alias, reason)
+        engine.events.log(
+            "recovery.manual_attention",
+            logging.WARNING,
+            repository=alias,
+            error_code=reason,
+            legacy=("manual attention required: %s (%s)", alias, reason),
+        )
     backup["manual_attention_required"] = reason
     engine.repos[alias]["integrity"]["status"] = "suspect"
     engine.save_meta(alias)
@@ -60,6 +66,11 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     if not (current and current["alias"] == alias and current["type"] == "quarantine"):
         engine.store.begin(alias, "quarantine")
     engine.store.update_operation(quarantine_pending=True)
+    engine.events.log(
+        "recovery.quarantine_started",
+        repository=alias,
+        operation_id=engine.store.data["active_operation"]["id"],
+    )
     engine.checkpoint("quarantine_journal")
     if partial.exists() and destination.exists():
         attention(engine, alias, "QUARANTINE_CONFLICT")
@@ -80,6 +91,11 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     meta["integrity"]["status"] = "unchecked"
     engine.save_meta(alias)
     engine.checkpoint("quarantine_metadata")
+    engine.events.log(
+        "recovery.quarantine_preserved",
+        repository=alias,
+        operation_id=engine.store.data["active_operation"]["id"],
+    )
 
 
 def verify(engine: Engine, mirror: Path, periodic_damage: bool) -> bool | None:
@@ -156,7 +172,16 @@ def recover(
             or backup.get("repair_deferred")
         ):
             continue
-        if partial.exists():
+        started = engine.events.start()
+        operation_id = active["id"] if interrupted and active is not None else None
+        partial_exists = partial.exists()
+        if interrupted or partial_exists or pending_quarantine:
+            engine.events.log(
+                "recovery.incomplete_operation",
+                repository=alias,
+                operation_id=operation_id,
+            )
+        if partial_exists:
             if (
                 interrupted
                 and active is not None
@@ -180,6 +205,14 @@ def recover(
             else:
                 healthy = verify(engine, mirror, periodic_damage)
             if healthy is None:
+                engine.events.log(
+                    "recovery.deferred",
+                    logging.WARNING,
+                    repository=alias,
+                    error_code="RECOVERY_REQUIRED",
+                    started=started,
+                    operation_id=operation_id,
+                )
                 if interrupted and not local_only:
                     raise HarborError("Cannot verify interrupted mirror operation")
                 continue
@@ -188,6 +221,14 @@ def recover(
             integrity.update(last_checked_at=utcnow(), last_check_kind="recovery")
             if healthy or integrity["status"] != "repair_failed":
                 integrity["status"] = "healthy" if healthy else "corrupt"
+            if healthy is False:
+                engine.events.log(
+                    "recovery.mirror_damaged",
+                    logging.WARNING,
+                    repository=alias,
+                    error_code="INVALID_MIRROR",
+                    operation_id=operation_id,
+                )
             if healthy:
                 if periodic_damage:
                     finding["repair_pending"] = False
@@ -230,6 +271,21 @@ def recover(
                 store.update_operation(state="reconciled", completed_at=utcnow())
                 if paused_repair:
                     engine.checkpoint("repair_recovery_journal")
+        deferred = backup.get("repair_deferred") or backup.get(
+            "manual_attention_required"
+        )
+        if engine.git.stop.is_set():
+            deferred = "INTERRUPTED"
+        elif integrity["status"] in ("corrupt", "repair_failed"):
+            deferred = deferred or "REPAIR_FAILED"
+        engine.events.log(
+            "recovery.deferred" if deferred else "recovery.completed",
+            logging.WARNING if deferred else logging.INFO,
+            repository=alias,
+            operation_id=operation_id,
+            started=started,
+            error_code=deferred,
+        )
     if not during_run and not engine.git.stop.is_set():
         engine.retries.reconcile_interrupted()
     with store.transaction() as data:
@@ -242,7 +298,13 @@ def recover(
         data["recovery"]["last_checked_at"] = utcnow()
 
 
-def repair_result(engine: Engine, alias: str, operation: str, healthy: bool) -> None:
+def repair_result(
+    engine: Engine,
+    alias: str,
+    operation: str,
+    healthy: bool,
+    started: float | None = None,
+) -> None:
     meta = engine.repos[alias]
     integrity, backup = meta["integrity"], meta["backup"]
     if integrity.get("completed_repair_operation") == operation:
@@ -266,6 +328,22 @@ def repair_result(engine: Engine, alias: str, operation: str, healthy: bool) -> 
             integrity["status"] = "corrupt"
             backup["status"] = "repairing"
     engine.save_meta(alias)
+    engine.events.log(
+        "repair.completed" if healthy else "repair.failed",
+        logging.INFO if healthy else logging.WARNING,
+        repository=alias,
+        operation_id=operation,
+        started=started,
+        error_code=None if healthy else "REPAIR_FAILED",
+    )
+    if not healthy and integrity["repair_attempts"] >= engine.config.repair_attempts:
+        engine.events.log(
+            "repair.limit_reached",
+            logging.WARNING,
+            repository=alias,
+            attempts=integrity["repair_attempts"],
+            operation_id=operation,
+        )
 
 
 def repair(engine: Engine, alias: str) -> None:
@@ -303,9 +381,16 @@ def repair(engine: Engine, alias: str) -> None:
     while integrity["repair_attempts"] < engine.config.repair_attempts:
         if engine.git.stop.is_set():
             return
+        started = engine.events.start()
         operation = engine.store.begin(alias, "repair")
         integrity["status"] = backup["status"] = "repairing"
         engine.save_meta(alias)
+        engine.events.log(
+            "repair.started",
+            repository=alias,
+            operation_id=operation,
+            attempts=integrity["repair_attempts"] + 1,
+        )
         try:
             engine.git.fetch(
                 mirror,
@@ -338,9 +423,19 @@ def repair(engine: Engine, alias: str) -> None:
                 engine.save_meta(alias)
                 engine.store.update_operation(state="interrupted")
                 engine.refresh_storage(alias, after=True)
+                engine.events.log(
+                    "repair.deferred",
+                    logging.WARNING,
+                    repository=alias,
+                    operation_id=operation,
+                    started=started,
+                    error_code="INTERRUPTED"
+                    if engine.git.stop.is_set()
+                    else str(error),
+                )
                 return
             healthy = False
-        repair_result(engine, alias, operation, healthy is True)
+        repair_result(engine, alias, operation, healthy is True, started)
         engine.checkpoint("repair_metadata")
         engine.store.complete()
         engine.refresh_storage(alias, after=True)

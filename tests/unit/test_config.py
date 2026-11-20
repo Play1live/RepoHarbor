@@ -198,10 +198,9 @@ def test_restore_feature_requires_boolean(value):
         load(env({"features": {"restore_helper": value}}))
 
 
-@pytest.mark.parametrize("feature", ["web_ui", "extended_logging"])
-def test_restore_cannot_enable_other_features(feature):
+def test_restore_does_not_enable_unsupported_dashboard():
     with pytest.raises(HarborError, match="unsupported optional feature"):
-        load(env({"features": {"restore_helper": True, feature: True}}))
+        load(env({"features": {"restore_helper": True, "web_ui": True}}))
 
 
 @pytest.mark.parametrize(

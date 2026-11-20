@@ -7,8 +7,10 @@ from unittest.mock import Mock
 import pytest
 
 from repoharbor import cli, integrity
+from repoharbor.config import Logging
 from repoharbor.control import request
 from repoharbor.errors import GitError, Result
+from repoharbor.events import Events
 
 
 def eventually(predicate):
@@ -19,16 +21,20 @@ def eventually(predicate):
 
 
 @pytest.mark.parametrize("owner", ["cron", "manual", "integrity"])
-def test_retry_shares_execution_lock(factory, monkeypatch, owner):
+@pytest.mark.parametrize("extended", [False, True])
+def test_retry_shares_execution_lock(factory, monkeypatch, owner, extended):
     config = replace(
         factory.config,
         auto_retry=True,
         manual_run=True,
+        extended_logging=extended,
+        logging=Logging("DEBUG", "json"),
         schedule="2 * * * *" if owner == "cron" else "4 * * * *",
         integrity_check=True,
         integrity=replace(factory.config.integrity, schedule="2 * * * *"),
     )
-    with factory(config) as engine:
+    events = Events(config)
+    with factory(config, events=events) as engine:
         retry_clock = Mock(return_value=1000)
         engine.retries.clock = retry_clock
         clone = engine.git.clone
@@ -105,6 +111,7 @@ def test_retry_shares_execution_lock(factory, monkeypatch, owner):
             if manual.ident is not None:
                 manual.join(10)
         assert not service.is_alive() and not failure
+    events.close()
 
 
 @pytest.mark.parametrize("manual_run", [False, True])

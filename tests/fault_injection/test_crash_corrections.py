@@ -749,7 +749,14 @@ def test_signal_before_recheck_cannot_clear_a_repaired_mirror(factory, signum):
                 def pause(point):
                     if point == "integrity_started":
                         started.set()
-                        assert engine.git.stop.wait(10)
+                        # The signal handler sets stop on this same thread. Avoid
+                        # re-entering the condition lock held by Event.wait().
+                        deadline = time.monotonic() + 10
+                        while (
+                            not engine.git.stop.is_set() and time.monotonic() < deadline
+                        ):
+                            time.sleep(0.01)
+                        assert engine.git.stop.is_set()
 
                 engine.checkpoint = pause
                 integrity.run(engine)

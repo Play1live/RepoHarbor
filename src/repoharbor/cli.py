@@ -17,7 +17,9 @@ from repoharbor.control import Control, request
 from repoharbor.credentials import Credentials
 from repoharbor.engine import Engine
 from repoharbor.errors import HarborError, Result
+from repoharbor.events import Events
 from repoharbor.git_backup import Git
+from repoharbor.log_files import LogSetupError
 from repoharbor.persistence import Store
 from repoharbor.recovery import recover
 from repoharbor.restore import restore
@@ -50,7 +52,9 @@ def serve(engine: Engine, stop: threading.Event) -> None:
             Cron(engine.config.integrity.schedule),
             engine.config.timezone,
             initial,
-            on_skip=lambda skipped: integrity.skip_overlap(engine.store, skipped),
+            on_skip=lambda skipped: integrity.skip_overlap(
+                engine.store, skipped, engine.events
+            ),
             busy=scheduler.busy,
         )
         if engine.config.integrity_check
@@ -99,7 +103,10 @@ def serve(engine: Engine, stop: threading.Event) -> None:
 
     control = Control(engine, scheduler, stop)
     with control.start():
-        logging.info("ready; waiting for future schedule (dashboard disabled)")
+        engine.events.log(
+            "service.ready",
+            legacy=("ready; waiting for future schedule (dashboard disabled)",),
+        )
         try:
             while not stop.is_set():
                 now = datetime.now(UTC)
@@ -117,6 +124,7 @@ def serve(engine: Engine, stop: threading.Event) -> None:
             stop.set()
             if worker is not None:
                 worker.join()
+            engine.events.log("service.stopped")
     if control.failure is not None:
         failures.append(control.failure)
     if failures:
@@ -203,9 +211,14 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def report(result: Result) -> int:
+def report(result: Result, events: Events | None = None) -> int:
     if result != Result.SUCCESS:
-        logging.error("%s", MESSAGES[result])
+        (events if events is not None else Events()).log(
+            "command.failed",
+            logging.ERROR,
+            result=result.name,
+            legacy=("%s", MESSAGES[result]),
+        )
     return result.value
 
 
@@ -218,8 +231,14 @@ def main() -> int:
             repository_id(repository)
     except HarborError:
         return report(Result.INVALID_ARGUMENT)
+    events = Events()
+    stage = "configuration"
+    failure_event = (
+        "service.startup_failed" if args.command is None else "command.failed"
+    )
     try:
         config = load(dict(os.environ))
+        events = Events(config)
         if args.command == "backup":
             command = b"all" if repository is None else f"repo {repository}".encode()
             result = (
@@ -229,38 +248,68 @@ def main() -> int:
             )
             if result == Result.SUCCESS:
                 print("Backup completed successfully")
-            return report(result)
+            return report(result, events)
         if args.command in ("status", "repositories"):
-            return report(print_status(config, args))
+            return report(print_status(config, args), events)
         if args.command == "restore":
+            stage = "backup_mount"
             if config.restore_helper:
                 verify_mount(config.root)
-            return restore(config, args).value
+            return restore(config, args, events).value
 
+        if args.command is None:
+            events.open_file(config)
+            events.log("service.started")
+        stage = "credentials"
         credentials = Credentials.resolve(config, dict(os.environ))
         if args.command == "config":
             if args.action != "validate":
                 raise HarborError("Use config validate")
             print("Configuration valid")
             return 0
+        stage = "backup_mount"
         verify_mount(config.root)
         stop = threading.Event()
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: stop.set())
+        stage = "backup_state"
         with Store(config.root) as store:
-            engine = Engine(config, store, Git(credentials, stop))
+            engine = Engine(config, store, Git(credentials, stop), events=events)
             engine.inventory()
-            recover(engine)
-            integrity.reconcile(store)
+            with events.run():
+                recover(engine)
+                integrity.reconcile(store, events)
+            stage = "serving"
+            failure_event = "service.failed"
             serve(engine, stop)
+    except LogSetupError as error:
+        events.log(
+            failure_event, logging.CRITICAL, error_code=error.code, result="log_setup"
+        )
+        return 1
     except HarborError as error:
-        logging.error("%s", error)
+        events.log(failure_event, logging.ERROR, result=stage, legacy=("%s", error))
         return 1
     except OSError as error:
         # No environment, path or remote-controlled exception string is exposed.
         code = {errno.ENOSPC: "ENOSPC", errno.EIO: "EIO", errno.EACCES: "EACCES"}.get(
             error.errno or 0, "FILESYSTEM_ERROR"
         )
-        logging.error("%s: startup/state operation failed", code)
+        events.log(
+            failure_event,
+            logging.ERROR,
+            result=stage,
+            error_code=code,
+            legacy=("%s: startup/state operation failed", code),
+        )
         return 1
+    except Exception:
+        if events.logger is None:
+            raise
+        events.log(
+            failure_event, logging.ERROR, result=stage, error_code="OPERATION_FAILED"
+        )
+        return 1
+    finally:
+        events.close()
     return 0
