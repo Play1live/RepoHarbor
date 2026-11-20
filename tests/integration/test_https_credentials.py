@@ -2,6 +2,7 @@
 
 import base64
 import os
+import socket
 import ssl
 import subprocess
 import sys
@@ -39,10 +40,16 @@ def test_https_detached_head_only_update(tmp_path, remote, monkeypatch):
         )
         with Store(root) as store:
             engine = Engine(
-                cfg, store, Git(Credentials({"local": secret}), threading.Event())
+                cfg,
+                store,
+                Git(Credentials({"local": secret}), threading.Event(), timeout=20),
             )
             engine.inventory()
-            engine.run()
+            assert urlsplit(url).port is not None
+            # A peer that connects without sending a TLS handshake must not
+            # prevent Git's separate connection from reaching the fixture.
+            with socket.create_connection(("127.0.0.1", urlsplit(url).port), timeout=5):
+                engine.run()
             mirror = engine.path("demo") / "repository.git"
             refs = engine.git.refs(mirror)
             (work / "hello.txt").write_text("HTTPS detached\n")
@@ -93,6 +100,8 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1"):
     state = {"status": 200, "authorized": 0, "challenged": 0}
 
     class Handler(BaseHTTPRequestHandler):
+        timeout = 15
+
         def log_message(self, *args):
             pass  # No request URL, header or secret ever enters test logs.
 
@@ -154,7 +163,9 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1"):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert, key)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    server.socket = context.wrap_socket(
+        server.socket, server_side=True, do_handshake_on_connect=False
+    )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -274,3 +285,59 @@ def test_config_validate_has_no_git_or_runtime_mutations(tmp_path, monkeypatch, 
     assert cli.main() == 0
     assert capsys.readouterr().out == "Configuration valid\n"
     assert not root.exists()
+
+
+@pytest.mark.parametrize("http_status", [401, 403, 404, 429, 503])
+def test_https_automatic_retry_only_for_temporary_status(
+    factory, tmp_path, remote, monkeypatch, caplog, http_status
+):
+    from dataclasses import replace
+
+    from repoharbor.config import Source
+    from repoharbor.errors import Result
+    from repoharbor.recovery import recover
+
+    with https_remote(tmp_path, remote[1]) as (url, cert, secret, server):
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        config = replace(
+            factory.config,
+            auto_retry=True,
+            credentials=("local",),
+            sources=(Source("demo", url, credential="local"),),
+        )
+
+        def new_git():
+            return Git(Credentials({"local": secret}), threading.Event(), timeout=20)
+
+        with factory(config, git_instance=new_git()) as engine:
+            engine.retries.clock = lambda: 1000
+            server["status"] = http_status
+            assert engine.run() == Result.BACKUP_FAILED
+            meta = engine.repos["demo"]
+            if http_status == 503:
+                assert meta["retry"]["reason"] == "GIT_SERVER_TEMPORARY"
+                assert meta["retry"]["next_attempt_at"] == 1300
+            else:
+                assert "retry" not in meta
+                assert meta["errors"]["last"]["code"] == "GIT_FAILED"
+                if http_status == 429:
+                    assert server["authorized"] == 1
+        if http_status == 503:
+            with factory(config, git_instance=new_git()) as engine:
+                server["status"] = 200
+                engine.retries.clock = lambda: 1500
+                recover(engine)
+                assert engine.retries.due() == "demo"
+                engine.retries.execute("demo")
+                assert engine.retries.due() is None
+                meta = engine.repos["demo"]
+                assert meta["retry"]["last_result"] == "succeeded"
+                assert meta["backup"]["successful_updates"] == 1
+                assert meta["errors"]["total"] == 1
+                assert (
+                    engine.store.data["scheduler"].get("last_successful_run_at") is None
+                )
+                assert (
+                    secret not in (engine.path("demo") / "metadaten.json").read_text()
+                )
+        assert secret not in caplog.text

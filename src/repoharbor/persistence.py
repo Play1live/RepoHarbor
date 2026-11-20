@@ -257,6 +257,11 @@ def validate_state(data: dict[str, Any]) -> None:
                     not in {"initial_clone", "mirror_update", "repair", "quarantine"}
                 ):
                     raise ValueError
+                if "trigger" in value and (
+                    value["trigger"] != "retry"
+                    or value["type"] not in ("initial_clone", "mirror_update")
+                ):
+                    raise ValueError
                 if "git_completed_at" in value and (
                     not isinstance(value["git_completed_at"], str)
                     or type(value.get("changed")) is not bool
@@ -345,7 +350,7 @@ class Store:
         with self.transaction() as data:
             data["active_operation"].update(values)
 
-    def begin(self, alias: str, kind: str) -> str:
+    def begin(self, alias: str, kind: str, *, retry: bool = False) -> str:
         operation = {
             "id": utcnow(),
             "alias": alias,
@@ -353,6 +358,8 @@ class Store:
             "state": "running",
             "started_at": utcnow(),
         }
+        if retry:
+            operation["trigger"] = "retry"
         with self.transaction() as data:
             data["active_operation"] = operation
         return str(operation["id"])

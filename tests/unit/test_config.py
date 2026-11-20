@@ -198,7 +198,7 @@ def test_restore_feature_requires_boolean(value):
         load(env({"features": {"restore_helper": value}}))
 
 
-@pytest.mark.parametrize("feature", ["web_ui", "auto_retry", "extended_logging"])
+@pytest.mark.parametrize("feature", ["web_ui", "extended_logging"])
 def test_restore_cannot_enable_other_features(feature):
     with pytest.raises(HarborError, match="unsupported optional feature"):
         load(env({"features": {"restore_helper": True, feature: True}}))
@@ -268,3 +268,41 @@ def test_integrity_custom_schedule_and_exclusions():
     assert config.schedule == "3 * * * *"
     assert config.integrity.schedule == "5 * * * *"
     assert config.integrity.include_excluded is False
+
+
+@pytest.mark.parametrize(
+    "retry",
+    [{"max_retries": value} for value in (False, True, 0, 11, "3", 1.5, None)]
+    + [{"initial_delay_seconds": value} for value in (False, 0, -1, 3601, "300")]
+    + [{"max_delay_seconds": value} for value in (True, 299, 86401, 3600.0)]
+    + [{"unknown": 1}, None],
+)
+def test_invalid_retry_config_rejected_when_disabled(retry):
+    with pytest.raises(HarborError):
+        load(env({"retry": retry}))
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None, []])
+def test_retry_feature_requires_boolean(value):
+    with pytest.raises(HarborError, match="optional feature"):
+        load(env({"features": {"auto_retry": value}}))
+
+
+def test_retry_defaults_and_limits():
+    config = load(env({}))
+    assert not config.auto_retry and config.retry.max_retries == 3
+    assert [config.retry.delay(n) for n in range(3)] == [300, 600, 1200]
+    config = load(
+        env(
+            {
+                "features": {"auto_retry": True},
+                "retry": {
+                    "max_retries": 10,
+                    "initial_delay_seconds": 1,
+                    "max_delay_seconds": 3,
+                },
+            }
+        )
+    )
+    assert config.auto_retry and not config.manual_run
+    assert [config.retry.delay(n) for n in range(4)] == [1, 2, 3, 3]

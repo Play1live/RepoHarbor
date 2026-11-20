@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import subprocess
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from unittest.mock import Mock
@@ -639,7 +640,12 @@ def test_integrity_sigterm_stops_the_active_check_and_preserves_previous_result(
 
             def probing(*_):
                 ready.set()
-                assert engine.git.stop.wait(10)
+                # The signal handler sets this event on the same thread.
+                # Waiting inside Event.wait can interrupt its own lock acquisition.
+                deadline = time.monotonic() + 10
+                while not engine.git.stop.is_set():
+                    assert time.monotonic() < deadline
+                    time.sleep(0.01)
                 return "interrupted", None
 
             integrity.inspect = probing

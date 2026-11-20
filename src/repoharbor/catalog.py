@@ -13,6 +13,7 @@ from repoharbor.persistence import (
     validate_periodic_metadata,
 )
 from repoharbor.registry import stored_repository
+from repoharbor.retry import validate_retry
 from repoharbor.selection import instance_host, repository_key
 
 
@@ -79,6 +80,8 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
             stored_repository(meta, alias)
         elif repo["id"] != alias or repo["provider"] != "manual":
             raise ValueError
+        if "retry" in meta:
+            validate_retry(meta["retry"])
         integrity = meta["integrity"]
         if "periodic" in integrity:
             validate_periodic_metadata(integrity["periodic"])
