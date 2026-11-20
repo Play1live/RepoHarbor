@@ -93,6 +93,7 @@ const reposFilter = {q: "", provider: "", selection: "", backup: "", errors: "",
 const eventsFilter = {type: "", status: "", repository: "", page: 0};
 let refreshId = 0;
 let signature = "";
+let noticeTimer;
 
 function el(tag, attrs = {}, ...children) {
   const element = document.createElement(tag);
@@ -710,9 +711,6 @@ function updateChrome() {
   nav.replaceChildren(...Object.entries(pages).map(([path, [glyph, title]]) =>
     link(path, {id: "nav-" + glyph, "aria-current": current === path ? "page" : null}, icon(glyph), title)));
   document.querySelector(".brand").setAttribute("href", destination("/"));
-  document.querySelector("#sidebar-footer").replaceChildren(el("div", {},
-    badge(serviceKey()),
-    el("p", {}, "RepoHarbor service")));
   const text = {idle: "Service online", busy: "Service busy", unreachable: "Service unavailable", unknown: "Service status unknown"};
   toolbar.replaceChildren(...[
     state.login || state.loading ? null : badge(serviceKey(), text[serviceKey()], "service-indicator"),
@@ -743,7 +741,7 @@ function render() {
     const unreadable = data?.service.repositories.unreadable;
     const problem = state.problem === "status" ? "Current status data is unavailable." : "The dashboard is offline.";
     main.replaceChildren(heading,
-      state.notice ? el("p", {class: "notice", role: "status"}, state.notice) : el("span", {hidden: true}),
+      actionNotice() ?? el("span", {hidden: true}),
       state.loading ? notice("Loading dashboard…") : el("span", {hidden: true}),
       !state.online && !state.loading ? notice(problem + (data ? " Showing the last loaded data."
         : " Refresh to try again."), "error") : el("span", {hidden: true}),
@@ -783,22 +781,37 @@ function routeChanged() {
   }
 }
 
+function actionNotice() {
+  return state.notice ? el("p", {id: "action-notice", class: "notice", role: "status"}, state.notice) : null;
+}
+
+function setNotice(message, temporary = false) {
+  clearTimeout(noticeTimer);
+  state.notice = message;
+  if (temporary) {
+    noticeTimer = setTimeout(() => {
+      state.notice = "";
+      document.getElementById("action-notice")?.remove();
+    }, 5000);
+  }
+}
+
 function login() {
   const input = el("input", {type: "password", autocomplete: "current-password",
     id: "password", required: true, maxlength: 128});
   return el("div", {class: "login"}, panel("Sign in to RepoHarbor", "lock", body(
-    state.notice ? el("p", {class: "notice", role: "status"}, state.notice) : null,
+    actionNotice(),
     el("form", {onsubmit: async event => {
       event.preventDefault();
       const submit = event.currentTarget.querySelector("button");
       submit.disabled = true;
       try {
         await post("/api/login", {password: input.value});
-        state.notice = "";
+        setNotice("");
         await refresh(true);
       } catch (error) {
         input.value = "";
-        state.notice = error.message;
+        setNotice(error.message, true);
         render();
         document.getElementById("password")?.focus();
       } finally { submit.disabled = false; }
@@ -824,8 +837,11 @@ async function logout() {
   try {
     await post("/api/logout", {});
     state.data = null;
-    state.notice = "";
-  } catch (error) { state.notice = error.message; }
+    setNotice("");
+  } catch (error) {
+    setNotice(error.message, true);
+    render();
+  }
   await refresh(true);
 }
 
@@ -845,14 +861,15 @@ function operationButton(id, action, title, glyph, confirmation, waiting) {
   return button(title, glyph, async () => {
     if (!window.confirm(confirmation)) return;
     state.sending = true;
-    state.notice = waiting;
+    setNotice(waiting);
     render();
     try {
       const response = await post("/api/" + action, {repository: id});
-      state.notice = response.message;
-    } catch (error) { state.notice = error.message; }
+      setNotice(response.message, true);
+    } catch (error) { setNotice(error.message, true); }
     finally {
       state.sending = false;
+      render();
       await refresh(true);
     }
   }, {className: action === "backup" ? "button primary" : "button", id: action + (id ? "-repo" : "-all"),
