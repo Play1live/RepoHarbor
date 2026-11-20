@@ -198,8 +198,8 @@ def test_restore_feature_requires_boolean(value):
         load(env({"features": {"restore_helper": value}}))
 
 
-def test_restore_does_not_enable_unsupported_dashboard():
-    with pytest.raises(HarborError, match="unsupported optional feature"):
+def test_restore_does_not_enable_dashboard_without_https_origin():
+    with pytest.raises(HarborError, match="missing HTTPS origin"):
         load(env({"features": {"restore_helper": True, "web_ui": True}}))
 
 

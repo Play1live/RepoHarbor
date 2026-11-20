@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.8.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.9.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -10,11 +10,25 @@ The service refuses symlinks and special files within the backup-root tree. Do n
 
 ## Local control and status
 
-The service listens on a Linux abstract Unix-domain socket addressed by its effective UID and the resolved backup root. The client and server each verify the peer UID with `SO_PEERCRED`. The endpoint is scoped to the Linux network namespace and leaves no socket file on the backup mount. Use `docker exec` under the service's configured user. Operators with access to that UID in the container can request manual backups when the flag is enabled. The service exposes no TCP control port, web dashboard, or Docker healthcheck.
+The service listens on a Linux abstract Unix-domain socket addressed by its effective UID and the resolved backup root. The client and server each verify the peer UID with `SO_PEERCRED`. The endpoint is scoped to the Linux network namespace and leaves no socket file on the backup mount. Use `docker exec` under the service's configured user. Operators with access to that UID in the container can request manual backups when the flag is enabled. The optional HTTPS dashboard provides a separate authenticated entry point. The default deployment has no TCP listener.
 
 Manual backups are opt-in. The running service owns the root lock and executes all Git work. Scheduled and manual requests share one run lock, and overlapping requests are skipped or rejected without queueing. Disconnecting the CLI leaves the service in control of accepted work. The client cannot infer a successful result from that disconnection.
 
 Status and repository inspection read the on-disk state and do not trigger discovery, Git operations, or recovery. A service reachability query uses the same local socket. Restrict access to the backup mount and container because status includes repository identity and operational metadata.
+
+## Web dashboard
+
+The dashboard requires TLS 1.2 or later and a generated administrator password. HTTPS serves the sign-in shell and a fixed set of application assets before authentication. Every operational status response requires an administrator session. Sessions expire after 15 minutes, are cleared on restart, and use a host-only cookie with `Secure`, `HttpOnly`, and `SameSite=Strict`.
+
+At startup RepoHarbor derives a 32-byte verifier with OpenSSL-backed scrypt and a fresh, random 16-byte salt. It keeps the verifier and salt in memory and compares login candidates with `hmac.compare_digest`. The work factors are `N=32768`, `r=8`, and `p=3`, the OWASP 32 MiB scrypt profile. OpenSSL has a 40 MiB limit per derivation, including its workspace overhead. A missing or unavailable KDF fails closed without a weaker substitute. See the [OWASP password storage guidance](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html#scrypt).
+
+The server allows five failures per TCP peer address in a rolling 60-second window and tracks at most 256 peer addresses with failures. It discards expired entries on subsequent sign-in attempts. Only one password derivation can run at once. Concurrent attempts and attempts from untracked peers when the table is full receive HTTP 429 without starting another derivation. Existing sessions use a separate lock. A reverse proxy or shared NAT can make several clients share one limit. The server ignores `Forwarded` and `X-Forwarded-For` when identifying peers. Treat the dashboard as a single-administrator interface on a trusted management network or behind a VPN.
+
+The server checks the exact configured host and checks the browser origin on every POST. Backup and sign-out requests also require a session-bound CSRF token. The backup endpoint rechecks `features.manual_run` and routes accepted operations through the local control socket. Scheduled jobs, retries, integrity checks, and manual requests share the service execution lock and the same capacity, selection, journal, and recovery rules. If the browser disconnects after acceptance, the service still owns the operation and its outcome.
+
+The dashboard has fixed asset routes, allowlisted status and event fields, and no arbitrary file access or export endpoints. Repository identifiers are length-bounded and their provider, authority and numeric ID are validated before use. Repository text is rendered as text and links are validated as credential-free HTTPS URLs. Git credentials, host file paths, raw responses, logs, and exception traces are excluded from web responses. The response policy blocks framing and third-party resources and disables caching of application data.
+
+Keep the TLS key and dashboard password in read-only mounts that the service UID can read. Use a distinct dashboard password, restrict access to the published endpoint, and validate certificates throughout the network path. With a reverse proxy, preserve the browser-facing `Host` and `Origin`, verify backend TLS, and restrict the backend listener to the proxy. See the [deployment guide](../deploy/README.md#enable-the-web-dashboard).
 
 ## Git transport and credentials
 

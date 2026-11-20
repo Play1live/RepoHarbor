@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.8.0-64748B)
+![Version](https://img.shields.io/badge/Version-0.9.0-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -27,7 +27,8 @@ RepoHarbor discovers repositories on GitHub.com, GitLab.com, and compatible Self
 - **Storage controls:** Soft global and per-repository limits, per-repository overrides, and a minimum free-space reserve.
 - **Safe recovery:** Durable operation journals, integrity checks after interruptions, bounded non-destructive repair, and preservation of incomplete clones for inspection.
 - **Credential isolation:** Named credentials from either environment variables or protected files, without embedding tokens in remote URLs.
-- **Headless Docker service:** Non-root execution, no published application port, and no web server or healthcheck in this version.
+- **Optional HTTPS dashboard.** View real backup, repository, activity, storage, discovery, and configuration state. An administrator can also trigger backups when manual execution is enabled.
+- **Headless Docker defaults.** Non-root execution with the dashboard disabled and no published application ports.
 
 ## Getting started
 
@@ -54,6 +55,10 @@ docker compose -f deploy/compose.example.yaml exec -T repoharbor repoharbor repo
 ```
 
 Read-only commands work with the default `features.manual_run: false`. To enable manual backups, set the flag to `true` in `REPOHARBOR_CONFIG` and redeploy. Use `repoharbor backup run --all` or `repoharbor backup run --repository example-demo` inside the running container. The [deployment guide](deploy/README.md#inspect-status-and-run-manual-backups) covers Docker and Portainer commands. The [configuration reference](docs/CONFIGURATION.md#cli-commands-and-exit-codes) lists selectors, status fields, and exit codes.
+
+### Web dashboard
+
+Enable `features.web_ui` to use the browser dashboard. It requires an HTTPS origin, TLS certificate and private key, and a generated administrator password mounted as a private file. Settings are read-only. An administrator can use the existing backup controls when `features.manual_run` is enabled. See the [deployment guide](deploy/README.md#enable-the-web-dashboard) and [security model](docs/SECURITY.md#web-dashboard).
 
 ### Automatic first-time setup
 
@@ -115,7 +120,7 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.8.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

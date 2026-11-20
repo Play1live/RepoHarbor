@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0a111e">
+  <title>RepoHarbor</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/assets/style.css">
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <aside class="sidebar" id="sidebar">
+    <a class="brand" href="/">
+      <picture><source srcset="/assets/brand.svg" type="image/svg+xml"><img src="/assets/brand.png" width="40" height="40" alt=""></picture>
+      <span>Repo<span class="accent">Harbor</span><small>Git repository backup</small></span>
+    </a>
+    <nav id="nav" aria-label="Main navigation"></nav>
+    <div class="sidebar-footer" id="sidebar-footer"></div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar">
+      <button id="menu-toggle" class="icon-button mobile-only" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="Open menu"></button>
+      <span class="breadcrumb" id="breadcrumb"></span>
+      <div class="toolbar" id="toolbar"></div>
+    </header>
+    <main id="main" tabindex="-1">
+      <div class="notice">Loading dashboard…</div>
+      <noscript>The dashboard requires JavaScript.</noscript>
+    </main>
+  </div>
+  <div id="announcement" class="sr-only" role="status"></div>
+</body>
+</html>

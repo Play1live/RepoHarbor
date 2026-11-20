@@ -1,3 +1,6 @@
 # Unix-Zeilenenden für Skripte erzwingen
 *.py text eol=lf
 *.sh text eol=lf
+
+# Preserve the supplied logo bytes in every checkout.
+src/repoharbor/dashboard/brand.svg -text

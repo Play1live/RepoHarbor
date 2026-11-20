@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+from dashboard_smoke import dashboard_smoke
+
 IMAGE = "repoharbor:local-test"
 
 
@@ -599,7 +601,7 @@ def logging_smoke():
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.8.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.9.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
@@ -680,6 +682,7 @@ def smoke():
         assert (Path(directory) / ".repoharbor.lock").exists()
         manual_smoke(f"type=bind,src={directory},dst=/backups")
     logging_smoke()
+    dashboard_smoke(IMAGE)
     print(
         "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
         "manual backup, automatic retry, offline restore, periodic integrity and "

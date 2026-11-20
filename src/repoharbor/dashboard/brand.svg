@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="7.5 5.5 26 27" width="1024" height="1024" fill="none" stroke="#FFFFFF" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Upper mast and rounded deck house -->
+  <path d="M20.5 8.5V11.5" />
+  <path d="M14.4 18.8V14.1C14.4 12.65 15.25 11.8 16.7 11.8H24.3C25.75 11.8 26.6 12.65 26.6 14.1V18.8" />
+  <!-- Raised prow and forward stem -->
+  <path d="M14.35 19.15 20.5 16.45 26.65 19.15" />
+  <path d="M20.5 16.55V21.1" />
+  <!-- Sides of the bow -->
+  <path d="M14.35 19.1 11.6 20.7C10.9 21.1 10.7 21.7 10.95 22.7L12.2 27.2" />
+  <path d="M26.65 19.1 29.4 20.7C30.1 21.1 30.3 21.7 30.05 22.7L28.8 27.2" />
+  <!-- Waterline waves -->
+  <path d="M10.45 28C12.5 28 13.5 26.55 15.25 26.55C17.05 26.55 18.15 28.1 20.5 28.1C22.85 28.1 23.95 26.55 25.75 26.55C27.5 26.55 28.5 28 30.55 28" />
+</svg>

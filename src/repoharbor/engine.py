@@ -773,6 +773,7 @@ class Engine:
         measurement = self.budget.measure(alias, self.path(alias))
         backup = self.repos[alias]["backup"]
         backup["size_bytes"] = measurement.repo_bytes
+        backup["size_measured_at"] = measurement.measured_at
         backup["limit_bytes"] = self.config.storage.overrides.get(
             alias, self.config.storage.repo_bytes
         )
@@ -781,6 +782,7 @@ class Engine:
             data["global_storage"] = {
                 "status": measurement.global_status or "available",
                 "last_measured_bytes": measurement.global_bytes,
+                "free_bytes": measurement.free_bytes,
                 "last_measured_at": measurement.measured_at,
             }
         if after:

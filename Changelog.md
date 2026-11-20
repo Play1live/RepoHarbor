@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0
+
+- Add an opt-in, administrator-authenticated HTTPS dashboard for service status, repositories, recent activity, storage, sources, and read-only configuration.
+- Route optional browser-triggered backups through the existing control socket, execution lock, storage limits, and recovery checks.
+- Record repository measurement timestamps and measured free disk space without changing configuration or persistence schema 1. Existing metadata remains readable.
+- Keep Docker deployments headless by default and document secure Compose, Portainer, and reverse-proxy operation.
+
 ## 0.8.0
 
 - Add opt-in structured text and JSON Lines events for service lifecycle, backups, discovery, retries, integrity, recovery, quarantine, and offline restore.

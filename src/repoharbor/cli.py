@@ -15,6 +15,7 @@ from repoharbor import __version__, integrity
 from repoharbor.config import load
 from repoharbor.control import Control, request
 from repoharbor.credentials import Credentials
+from repoharbor.dashboard_http import dashboard
 from repoharbor.engine import Engine
 from repoharbor.errors import HarborError, Result
 from repoharbor.events import Events
@@ -102,10 +103,10 @@ def serve(engine: Engine, stop: threading.Event) -> None:
                 scheduler.busy.release()
 
     control = Control(engine, scheduler, stop)
-    with control.start():
+    with control.start(), dashboard(engine.config, engine.events, os.environ):
         engine.events.log(
             "service.ready",
-            legacy=("ready; waiting for future schedule (dashboard disabled)",),
+            legacy=("ready; waiting for future schedule",),
         )
         try:
             while not stop.is_set():

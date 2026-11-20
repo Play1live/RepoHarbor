@@ -4,10 +4,12 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from datetime import UTC, datetime
+from threading import Lock
 from typing import TextIO
 from uuid import uuid4
 
@@ -153,6 +155,10 @@ class Events:
     def __init__(self, config: Config | None = None):
         self.logger: logging.Logger | None = None
         self.file: RotatingLog | None = None
+        self.recent: deque[dict[str, Field]] | None = (
+            deque(maxlen=250) if config is not None and config.web.enabled else None
+        )
+        self.recent_lock = Lock()
         if config is not None and config.extended_logging:
             self.logger = logging.Logger("repoharbor.events", config.logging.level)
             self.logger.propagate = False
@@ -198,12 +204,11 @@ class Events:
         started: float | None = None,
         **fields: Field,
     ) -> None:
-        if self.logger is None:
-            if legacy:
-                message, *args = legacy
-                logging.log(level, str(message), *args)
-            return
-        if not self.logger.isEnabledFor(level):
+        if self.logger is None and legacy:
+            message, *args = legacy
+            logging.log(level, str(message), *args)
+        should_log = self.logger is not None and self.logger.isEnabledFor(level)
+        if not should_log and self.recent is None:
             return
         safe: dict[str, Field] = {"event": event}
         for key, value in fields.items():
@@ -223,16 +228,28 @@ class Events:
             safe["run_id"] = run_id
         if started is not None:
             safe["duration_ms"] = max(0, int((time.monotonic() - started) * 1000))
+        if self.recent is not None:
+            with self.recent_lock:
+                self.recent.append({"timestamp": datetime.now(UTC).isoformat(), **safe})
         # Logging must never turn an operation's successful mutation into a failure.
-        with suppress(Exception):
-            self.logger.log(level, event, extra={"fields": safe})
+        if self.logger is not None and should_log:
+            with suppress(Exception):
+                self.logger.log(level, event, extra={"fields": safe})
+
+    def recent_events(self) -> list[dict[str, Field]]:
+        with self.recent_lock:
+            return list(self.recent or ())
 
     def start(self) -> float | None:
-        return time.monotonic() if self.logger is not None else None
+        return (
+            time.monotonic()
+            if self.logger is not None or self.recent is not None
+            else None
+        )
 
     @contextmanager
     def run(self) -> Iterator[float | None]:
-        if self.logger is None:
+        if self.logger is None and self.recent is None:
             yield None
             return
         token = RUN_ID.set(uuid4().hex)

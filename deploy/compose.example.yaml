@@ -38,6 +38,12 @@ services:
         features:
           manual_run: false
           integrity_check: false
+          web_ui: false
+        # To enable HTTPS, also configure web.origin and protected TLS/password
+        # files. See deploy/README.md before changing the bind or publishing a port.
+        web:
+          bind: 127.0.0.1
+          port: 8080
     volumes:
       - type: bind
         source: /srv/repoharbor/backups
