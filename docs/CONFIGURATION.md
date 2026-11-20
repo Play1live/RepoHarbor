@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.9.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise discovery and SSH are outside this version's scope.
+RepoHarbor `0.9.1` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise discovery and SSH are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,7 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | `manual_run: true` enables CLI-triggered and authenticated browser-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. `extended_logging: true` enables structured events. `web_ui: true` enables the authenticated HTTPS dashboard. Each is an independent boolean and defaults to `false`. |
+| `features` | `manual_run: true` enables CLI and dashboard backups and authenticated dashboard integrity checks. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. `extended_logging: true` enables structured events. `web_ui: true` enables the authenticated HTTPS dashboard. Each is an independent boolean and defaults to `false`. |
 | `web.bind` | IPv4 address inside the container. Default `127.0.0.1`. Use a non-loopback address only when the deployment restricts access to this listener. |
 | `web.port` | HTTPS listen port inside the container, an integer from 1024 to 65535. Default `8080`. |
 | `web.origin` | Browser-facing canonical HTTPS origin. Required with `features.web_ui: true`. Use a lowercase host, an explicit port only for non-default browser ports, and no path, trailing slash, or credentials. |
@@ -32,7 +32,7 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `retry.initial_delay_seconds` | Positive integer delay for the first retry. Default `300`. |
 | `retry.max_delay_seconds` | Integer from `1` through `86400`, at least the initial delay. Default `3600`. |
 | `integrity.schedule` | Independent five-field cron expression. Default `0 4 * * 0` (Sunday at 04:00 in `TZ`). |
-| `integrity.include_excluded` | Boolean. Default `true`. Set to `false` to skip excluded mirrors. |
+| `integrity.include_excluded` | Boolean. Default `true`. Set to `false` to skip excluded mirrors in periodic checks. |
 | `logging.level` | Minimum event severity. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. Default `INFO`. |
 | `logging.format` | `text` for readable key/value lines or `json` for JSON Lines. Default `text`. |
 | `logging.file.enabled` | Boolean. Default `false`. Requires `features.extended_logging: true` when enabled. |
@@ -330,7 +330,7 @@ Set `features.web_ui: true` and supply `web.origin` to enable the listener. The 
 
 The service UID needs read access. The password and private key must have no group or other permission bits and must not be symlinks. Mount them read-only and restart to apply changes. Keep the existing password file format. The dashboard requires a Python/OpenSSL build with scrypt support and derives a new in-memory verifier at startup. If the service cannot load the files, initialise scrypt, or bind the HTTPS listener, the dashboard remains unavailable and the backup service continues. The CLI `config validate` checks the YAML and Git credential settings. Listener startup verifies the web files, scrypt support, and bind address.
 
-The optional browser backup controls require the independent `features.manual_run` flag. All settings displayed in the browser remain read-only. See the [deployment guide](../deploy/README.md#enable-the-web-dashboard).
+Browser backup and integrity controls require `features.manual_run: true`. The `features.integrity_check` flag controls the periodic schedule independently. **Check all repositories** includes eligible local mirrors retained after exclusion, upstream failures, or source removal, regardless of `integrity.include_excluded`. The service skips partial clones and pending quarantines and reports mirrors it cannot verify. A busy service rejects new manual requests immediately. All settings displayed in the browser remain read-only. See the [deployment guide](../deploy/README.md#enable-the-web-dashboard).
 
 ## CLI commands and exit codes
 
@@ -407,6 +407,7 @@ Both commands require a new output path with an existing writable parent outside
 
 - `data.json` is the central, durable run/operation journal and scheduler state. Its `discovery` section records GitHub discovery, and `provider_discovery` records GitLab discovery by authority. These records track running, completed, or failed discovery and any cooldown separately from the Git operation journal. The optional `integrity` section records the periodic run state, counters, and overlap history.
 - Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`.
+- Optional `data.json.manual_integrity` and `metadaten.json.integrity.manual` records keep the latest manual run and each mirror's latest completed manual finding separately from periodic checks and repair state. Service restart marks an unfinished run interrupted and preserves completed findings.
 - Each source directory's `repository.git/` contains the valid bare mirror when available. A partial first clone can exist as `repository.git.partial/`; an interrupted partial may be preserved in `quarantine/initial-clone/`.
 
 | State | Meaning |

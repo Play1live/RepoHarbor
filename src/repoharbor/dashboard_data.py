@@ -1,6 +1,9 @@
 """Read-only dashboard projections over schema-1 state and structured events."""
 
+import stat
+from contextlib import suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Lock
 from time import monotonic
 from typing import Any
@@ -11,6 +14,8 @@ from repoharbor.config import Config
 from repoharbor.control import request
 from repoharbor.errors import HarborError, Result
 from repoharbor.events import ERROR_CODES, Events, Field
+from repoharbor.integrity import blocked, has_partial
+from repoharbor.persistence import INTEGRITY_COUNTS
 from repoharbor.retry import MAX_DISCOVERY_DEFERRALS
 from repoharbor.selection import repository_id
 from repoharbor.status import (
@@ -105,6 +110,10 @@ def event_view(event: dict[str, Field]) -> dict[str, Field] | None:
         status = "error"
     elif (
         code
+        or (
+            name.startswith("integrity.")
+            and result in ("skipped", "no_candidates", "interrupted")
+        )
         or action.endswith(("blocked", "skipped", "deferred", "reached"))
         or action
         in (
@@ -129,6 +138,9 @@ def event_view(event: dict[str, Field]) -> dict[str, Field] | None:
         "code": code,
         "correlation": event.get("run_id"),
         "duration_ms": event.get("duration_ms"),
+        "trigger": "manual"
+        if name.startswith("integrity.") and event.get("trigger") == "manual"
+        else None,
     }
 
 
@@ -176,7 +188,12 @@ def settings(config: Config) -> dict[str, Any]:
 
 
 def repository_view(
-    config: Config, alias: str, meta: dict[str, Any], manual_host: str | None
+    config: Config,
+    alias: str,
+    meta: dict[str, Any],
+    manual_host: str | None,
+    folder: Path,
+    active: dict[str, Any] | None,
 ) -> dict[str, Any]:
     repo = repo_view(config, alias, meta, True)
     repo.pop("mirror_path")
@@ -200,10 +217,39 @@ def repository_view(
         repo["retry"][field] = safe_code(repo["retry"][field])
     periodic = repo["periodic_integrity"]
     periodic["error_code"] = safe_code(periodic["error_code"])
+    manual = meta["integrity"].get("manual", {})
+    repo["manual_integrity"] = {
+        "last_started_at": timestamp(manual.get("last_started_at")),
+        "last_completed_at": timestamp(manual.get("last_completed_at")),
+        "last_result": manual.get("last_result"),
+        "error_code": safe_code(manual.get("error_code")),
+    }
+    completed = repo["manual_integrity"]["last_completed_at"]
+    if completed and completed >= max(
+        repo["integrity"]["last_checked_at"] or "", periodic["last_completed_at"] or ""
+    ):
+        result = manual["last_result"]
+        if result != "healthy" or repo["integrity_status"] in ("healthy", "unchecked"):
+            repo["integrity_status"] = result
+        repo["has_error"] |= result == "corrupt"
+    repo["can_check_integrity"] = False
+    if (
+        config.manual_run
+        and not blocked(alias, meta["backup"], active)
+        and not has_partial(folder)
+    ):
+        with suppress(OSError):
+            repo["can_check_integrity"] = stat.S_ISDIR(
+                (folder / "repository.git").lstat().st_mode
+            )
     return repo
 
 
 def snapshot(config: Config, events: Events) -> dict[str, Any]:
+    try:
+        state = read_state(config)
+    except (HarborError, OSError):
+        state = {}
     entries, unreadable = inventory(config)
     repos = []
     hosts = {s.alias: urlsplit(s.url).netloc for s in config.sources}
@@ -211,18 +257,31 @@ def snapshot(config: Config, events: Events) -> dict[str, Any]:
         try:
             repos.append(
                 repository_view(
-                    config, alias, read_metadata(alias, folder), hosts.get(alias)
+                    config,
+                    alias,
+                    read_metadata(alias, folder),
+                    hosts.get(alias),
+                    folder,
+                    state.get("active_operation"),
                 )
             )
         except (HarborError, OSError, OverflowError, TypeError, ValueError):
             assert unreadable is not None
             unreadable += 1
-    try:
-        state = read_state(config)
-    except (HarborError, OSError):
-        state = {}
     live = request(config.root, b"status")
     overall = global_view(config, state, repos, unreadable, live=live)
+    if manual := state.get("manual_integrity"):
+        overall["manual_integrity"] = {
+            "state": "interrupted"
+            if manual["state"] == "running" and live == Result.SERVICE_UNREACHABLE
+            else manual["state"],
+            "target": manual["target"],
+            "repository": manual["current_repository"] if live == Result.BUSY else None,
+            "started_at": timestamp(manual["last_started_at"]),
+            "last_result": manual["last_result"],
+            "last_completed_at": timestamp(manual["last_completed_at"]),
+            **{key: manual[key] for key in INTEGRITY_COUNTS},
+        }
     stored = state.get("global_storage", {})
     overall["storage"]["free_bytes"] = number(stored.get("free_bytes"))
     last_run = (state.get("active_run") or {}).get("state")
@@ -322,3 +381,7 @@ class DashboardData:
                 self.saved = snapshot(self.config, self.events)
                 self.expiry = monotonic() + 5
             return self.saved
+
+    def invalidate(self) -> None:
+        with self.lock:
+            self.expiry = 0.0

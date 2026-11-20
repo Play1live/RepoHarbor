@@ -1,4 +1,4 @@
-"""Read-only periodic verification of the local mirror catalog."""
+"""Read-only Git verification of the local mirror catalog."""
 
 import logging
 import stat
@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from repoharbor.config import Config
 from repoharbor.engine import Engine
-from repoharbor.errors import GitError, HarborError
+from repoharbor.errors import GitError, HarborError, Result
 from repoharbor.events import Events
 from repoharbor.git_backup import Git
 from repoharbor.persistence import (
@@ -110,12 +110,18 @@ def skip_overlap(store: Store, skipped: int, events: Events | None = None) -> No
 
 
 def reconcile(store: Store, events: Events | None = None) -> None:
-    state = store.data.get("integrity")
-    if state and state["state"] == "running":
-        with store.transaction(fatal=True) as data:
-            data["integrity"].update(state="interrupted", current_repository=None)
-        if events is not None:
-            events.log("integrity.incomplete_operation", error_code="INTERRUPTED")
+    for key in ("integrity", "manual_integrity"):
+        state = store.data.get(key)
+        if state and state["state"] == "running":
+            with store.transaction(fatal=True) as data:
+                data[key].update(state="interrupted", current_repository=None)
+            if events is not None:
+                events.log(
+                    "integrity.incomplete_operation",
+                    error_code="INTERRUPTED",
+                    trigger="manual" if key == "manual_integrity" else None,
+                    repository=state.get("target"),
+                )
 
 
 def excluded(config: Config, alias: str, meta: dict[str, Any]) -> bool:
@@ -199,36 +205,83 @@ def clear_resolved_damage(
         errors["consecutive"] = 0
 
 
-def run(engine: Engine) -> None:
+def run(
+    engine: Engine, *, manual: bool = False, repository: str | None = None
+) -> Result:
+    if repository is not None and repository not in engine.repos:
+        return Result.UNKNOWN_REPOSITORY
+    key = "manual_integrity" if manual else "integrity"
+    trigger = "manual" if manual else None
     with engine.events.run() as started:
-        engine.events.log("integrity.started")
+        engine.events.log("integrity.started", trigger=trigger, repository=repository)
         try:
-            check_mirrors(engine)
+            check_mirrors(engine, manual=manual, repository=repository)
         except Exception:
             engine.events.log(
                 "integrity.failed",
                 logging.ERROR,
                 started=started,
                 error_code="FILESYSTEM_ERROR",
+                trigger=trigger,
+                repository=repository,
             )
             raise
-        state = engine.store.data["integrity"]
+        state = engine.store.data[key]
+        outcome = (
+            state["last_result"] if state["state"] == "completed" else "interrupted"
+        )
         engine.events.log(
             "integrity.completed",
             started=started,
-            result=state["last_result"]
-            if state["state"] == "completed"
-            else "interrupted",
+            result=outcome,
             checked=state["checked"],
             damaged=state["corrupt"],
             skipped=state["skipped"],
+            trigger=trigger,
+            repository=repository,
         )
+        return {
+            "healthy": Result.SUCCESS,
+            "issues": Result.INTEGRITY_ISSUES,
+            "no_candidates": Result.INTEGRITY_SKIPPED,
+            "interrupted": Result.INTEGRITY_INTERRUPTED,
+        }[outcome]
 
 
-def check_mirrors(engine: Engine) -> None:
+def blocked(alias: str, backup: dict[str, Any], active: dict[str, Any] | None) -> bool:
+    return bool(
+        backup["created_at"] is None
+        or "partial_operation" in backup
+        or backup.get("quarantine", {}).get("state") == "pending"
+        or (
+            active
+            and active["alias"] == alias
+            and active["type"] in ("initial_clone", "quarantine")
+            and active["state"] in ("running", "interrupted")
+        )
+    )
+
+
+def has_partial(folder: Path) -> bool:
+    try:
+        (folder / "repository.git.partial").lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def check_mirrors(
+    engine: Engine, *, manual: bool = False, repository: str | None = None
+) -> None:
     store = engine.store
+    key = "manual_integrity" if manual else "integrity"
     with store.transaction(fatal=True) as data:
-        state = data.setdefault("integrity", integrity_state())
+        state = data.setdefault(key, integrity_state())
+        if manual:
+            state["target"] = repository
+            state.update(last_completed_at=None, last_result=None)
         state.update(
             state="running",
             last_started_at=utcnow(),
@@ -236,43 +289,42 @@ def check_mirrors(engine: Engine) -> None:
             **dict.fromkeys(INTEGRITY_COUNTS, 0),
         )
     active = store.data["active_operation"]
-    for alias, meta in sorted(engine.repos.items()):
+    aliases = sorted(engine.repos) if repository is None else [repository]
+    for alias in aliases:
         if engine.git.stop.is_set():
             break
+        meta = engine.repos[alias]
         folder = engine.path(alias)
-        backup = meta["backup"]
         if (
             (
-                not engine.config.integrity.include_excluded
+                not manual
+                and not engine.config.integrity.include_excluded
                 and excluded(engine.config, alias, meta)
             )
-            or backup["created_at"] is None
-            or "partial_operation" in backup
-            or backup.get("quarantine", {}).get("state") == "pending"
-            or (
-                active
-                and active["alias"] == alias
-                and active["type"] in ("initial_clone", "quarantine")
-                and active["state"] in ("running", "interrupted")
-            )
+            or blocked(alias, meta["backup"], active)
+            or (manual and has_partial(folder))
         ):
             with store.transaction(fatal=True) as data:
-                data["integrity"]["skipped"] += 1
+                data[key]["skipped"] += 1
+            if manual:
+                engine.events.log(
+                    "integrity.mirror_checked",
+                    repository=alias,
+                    trigger="manual",
+                    result="skipped",
+                )
             continue
         with store.transaction(fatal=True) as data:
-            data["integrity"]["current_repository"] = alias
+            data[key]["current_repository"] = alias
         integrity = meta["integrity"]
-        periodic = integrity.setdefault(
-            "periodic",
-            dict(
-                last_completed_at=None,
-                last_result=None,
-                damaged_at=None,
-                error_code=None,
-                repair_pending=False,
-            ),
+        record = integrity.setdefault(
+            "manual" if manual else "periodic",
+            dict(last_completed_at=None, last_result=None, error_code=None),
         )
-        periodic["last_started_at"] = utcnow()
+        if not manual:
+            record.setdefault("damaged_at", None)
+            record.setdefault("repair_pending", False)
+        record["last_started_at"] = utcnow()
         engine.save_meta(alias, fatal=True)
         engine.checkpoint("integrity_started")
         started = engine.events.start()
@@ -281,14 +333,14 @@ def check_mirrors(engine: Engine) -> None:
             reconcile(store)
             return
         finished = utcnow()
-        periodic.update(last_completed_at=finished, last_result=result, error_code=code)
-        if result in ("healthy", "corrupt"):
+        record.update(last_completed_at=finished, last_result=result, error_code=code)
+        if not manual and result in ("healthy", "corrupt"):
             integrity.update(last_checked_at=finished, last_check_kind="periodic")
             if result == "corrupt":
-                periodic["damaged_at"] = finished
+                record["damaged_at"] = finished
                 if integrity["status"] in ("unchecked", "healthy"):
                     integrity["status"] = "corrupt"
-                    periodic["repair_pending"] = True
+                    record["repair_pending"] = True
             elif (store.data["active_run"] or {}).get("state") != "running":
                 clear_resolved_damage(meta, folder, active)
         engine.save_meta(alias, fatal=True)
@@ -302,9 +354,10 @@ def check_mirrors(engine: Engine) -> None:
             error_code=code,
             result=result,
             started=started,
+            trigger="manual" if manual else None,
         )
         with store.transaction(fatal=True) as data:
-            state = data["integrity"]
+            state = data[key]
             state[result] += 1
             state["checked"] += int(result in ("healthy", "corrupt"))
             state["current_repository"] = None
@@ -312,12 +365,14 @@ def check_mirrors(engine: Engine) -> None:
         reconcile(store)
         return
     with store.transaction(fatal=True) as data:
-        state = data["integrity"]
+        state = data[key]
         state.update(
             state="completed",
             last_completed_at=utcnow(),
             last_result="issues"
-            if state["corrupt"] or state["uncheckable"]
+            if state["corrupt"]
+            or state["uncheckable"]
+            or (manual and state["checked"] and state["skipped"])
             else "healthy"
             if state["checked"]
             else "no_candidates",
