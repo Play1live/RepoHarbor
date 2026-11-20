@@ -2,10 +2,12 @@
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from repoharbor.engine import Engine
 from repoharbor.errors import GitError, HarborError
+from repoharbor.integrity import inspect
 from repoharbor.persistence import record_error, sync_directory, utcnow
 
 
@@ -80,8 +82,21 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     engine.checkpoint("quarantine_metadata")
 
 
+def verify(engine: Engine, mirror: Path, periodic_damage: bool) -> bool | None:
+    if not periodic_damage:
+        return engine.git.healthy(mirror)
+    result, _ = inspect(engine.git, mirror)
+    if result == "interrupted":
+        raise HarborError("INTERRUPTED")
+    return {"healthy": True, "corrupt": False}.get(result)
+
+
 def recover(
-    engine: Engine, *, repository: str | None = None, during_run: bool = False
+    engine: Engine,
+    *,
+    repository: str | None = None,
+    during_run: bool = False,
+    periodic: bool = False,
 ) -> None:
     store = engine.store
     active = store.data["active_operation"]
@@ -97,6 +112,9 @@ def recover(
         (repository,) if repository is not None else engine.repos,
         key=lambda alias: (not (active and active["alias"] == alias), alias),
     )
+    periodic_sources = (
+        {source.alias for source in engine.sources} if periodic else set()
+    )
     for alias in aliases:
         meta = engine.repos[alias]
         if engine.git.stop.is_set():
@@ -109,9 +127,15 @@ def recover(
             and active["state"] in ("running", "interrupted")
         )
         backup, integrity = meta["backup"], meta["integrity"]
+        finding = integrity.get("periodic", {})
+        periodic_damage = finding.get("repair_pending", False)
+        eligible = (
+            alias in periodic_sources and meta["selection"]["status"] == "included"
+        )
         pending_quarantine = backup.get("quarantine", {}).get("state") == "pending"
         if not (
             interrupted
+            or (periodic_damage and eligible and mirror.exists())
             or partial.exists()
             or pending_quarantine
             or integrity["status"] in ("suspect", "repairing")
@@ -135,13 +159,20 @@ def recover(
                 quarantine(engine, alias, active)
         elif pending_quarantine:
             quarantine(engine, alias, active)
-        if not partial.exists() and not pending_quarantine:
-            backup.pop("manual_attention_required", None)
         if mirror.exists():
-            healthy = engine.git.healthy(mirror)
-            integrity["last_checked_at"] = utcnow()
-            integrity["status"] = "healthy" if healthy else "corrupt"
+            healthy = verify(engine, mirror, periodic_damage)
+            if healthy is None:
+                if interrupted:
+                    raise HarborError("Cannot verify interrupted mirror operation")
+                continue
+            if not partial.exists() and not pending_quarantine:
+                backup.pop("manual_attention_required", None)
+            integrity.update(last_checked_at=utcnow(), last_check_kind="recovery")
+            if healthy or integrity["status"] != "repair_failed":
+                integrity["status"] = "healthy" if healthy else "corrupt"
             if healthy:
+                if periodic_damage:
+                    finding["repair_pending"] = False
                 integrity["repair_attempts"] = 0
                 backup.pop("repair_deferred", None)
                 if interrupted and active is not None:
@@ -153,7 +184,7 @@ def recover(
                             engine.finish(alias, active)
                         else:
                             backup["status"] = "interrupted"
-            else:
+            elif not periodic_damage or eligible:
                 repair(engine, alias)
         elif not partial.exists() and not pending_quarantine:
             backup["status"] = "interrupted"
@@ -198,6 +229,8 @@ def repair_result(engine: Engine, alias: str, operation: str, healthy: bool) -> 
     integrity["last_repair_result"] = "healthy" if healthy else "failed"
     if healthy:
         integrity["status"] = "healthy"
+        if "periodic" in integrity:
+            integrity["periodic"]["repair_pending"] = False
         integrity["successful_repairs"] += 1
         integrity["repair_attempts"] = 0
         backup["status"] = "interrupted"
@@ -260,7 +293,13 @@ def repair(engine: Engine, alias: str) -> None:
             )
             meta["source"]["status"] = "available"
             engine.checkpoint("repair_git")
-            healthy = engine.git.healthy(mirror)
+            healthy = verify(
+                engine,
+                mirror,
+                integrity.get("periodic", {}).get("repair_pending", False),
+            )
+            if healthy is not None:
+                integrity.update(last_checked_at=utcnow(), last_check_kind="repair")
         except HarborError as error:
             if isinstance(error, GitError) and error.source_status is not None:
                 meta["source"]["status"] = error.source_status
@@ -278,7 +317,7 @@ def repair(engine: Engine, alias: str) -> None:
                 engine.refresh_storage(alias, after=True)
                 return
             healthy = False
-        repair_result(engine, alias, operation, healthy)
+        repair_result(engine, alias, operation, healthy is True)
         engine.checkpoint("repair_metadata")
         engine.store.complete()
         engine.refresh_storage(alias, after=True)

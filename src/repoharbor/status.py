@@ -13,7 +13,7 @@ from repoharbor.catalog import catalog_entries, directory, read_metadata
 from repoharbor.config import Config, canonical_url
 from repoharbor.control import request
 from repoharbor.errors import HarborError, Result
-from repoharbor.persistence import read_json, validate_state
+from repoharbor.persistence import integrity_state, read_json, validate_state
 from repoharbor.scheduler import Cron
 from repoharbor.selection import repository_id
 
@@ -78,6 +78,14 @@ def repo_view(
         for k in ("repository", "selection", "source", "backup", "errors", "integrity")
     )
     last = error_event(errors["last"])
+    saved_periodic = integrity.get("periodic", {})
+    periodic = {
+        "last_started_at": timestamp(saved_periodic.get("last_started_at")),
+        "last_completed_at": timestamp(saved_periodic.get("last_completed_at")),
+        "last_result": saved_periodic.get("last_result"),
+        "damaged_at": timestamp(saved_periodic.get("damaged_at")),
+        "error_code": saved_periodic.get("error_code"),
+    }
     result = {
         "id": alias,
         "provider": repo["provider"],
@@ -90,6 +98,8 @@ def repo_view(
         "last_updated_at": timestamp(backup["last_updated_at"]),
         "size_bytes": number(backup["size_bytes"]),
         "last_error_code": last["code"] if last else None,
+        "integrity_status": label(integrity["status"]),
+        "periodic_integrity": periodic,
     }
     if details:
         provider_host, _, provider_id = alias.rpartition(":")
@@ -124,6 +134,12 @@ def repo_view(
             integrity={
                 "status": label(integrity["status"]),
                 "last_checked_at": timestamp(integrity["last_checked_at"]),
+                "last_check_kind": (
+                    integrity.get("last_check_kind")
+                    if integrity.get("last_check_kind")
+                    in ("periodic", "recovery", "repair")
+                    else None
+                ),
                 "repair_attempts": number(integrity["repair_attempts"]),
                 "successful_repairs": number(integrity["successful_repairs"]),
                 "last_repair_at": timestamp(integrity.get("last_repair_at")),
@@ -177,9 +193,16 @@ def global_view(
     providers = {f"{p.type}:{p.host}" for p in config.providers}
     saved = dict(state.get("provider_discovery", {}))
     saved["github:github.com"] = state.get("discovery", {})
-    upcoming = Cron(config.schedule).next_after(
-        datetime.now(UTC), ZoneInfo(config.timezone)
+    now, zone = datetime.now(UTC), ZoneInfo(config.timezone)
+    upcoming = Cron(config.schedule).next_after(now, zone)
+    next_integrity = (
+        Cron(config.integrity.schedule).next_after(now, zone)
+        if config.integrity_check
+        else None
     )
+    periodic = dict(state.get("integrity", integrity_state()))
+    if periodic["state"] == "running" and live == Result.SERVICE_UNREACHABLE:
+        periodic.update(state="interrupted", current_repository=None)
     storage = state.get("global_storage", {})
     return {
         "service_status": "running"
@@ -198,6 +221,11 @@ def global_view(
         "last_successful_run_at": timestamp(scheduler.get("last_successful_run_at")),
         "next_scheduled_at": upcoming.isoformat() if upcoming else None,
         "timezone": config.timezone,
+        "periodic_integrity": {
+            "enabled": config.integrity_check,
+            "next_scheduled_at": next_integrity.isoformat() if next_integrity else None,
+            **periodic,
+        },
         "repositories": {
             "known": len(repos) + unreadable if unreadable is not None else None,
             "included": sum(r["selection_status"] == "included" for r in repos)
@@ -313,6 +341,7 @@ def print_status(config: Config, args: Namespace) -> Result:
                 )
                 or meta["integrity"]["status"]
                 in ("corrupt", "suspect", "repair_failed", "repairing")
+                or view["periodic_integrity"]["last_result"] == "uncheckable"
                 or "manual_attention_required" in backup
                 or bool(backup.get("repair_deferred"))
                 or backup.get("quarantine", {}).get("state") == "pending"

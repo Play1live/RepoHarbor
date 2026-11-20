@@ -98,6 +98,12 @@ class Discovery:
 
 
 @dataclass(frozen=True)
+class Integrity:
+    schedule: str = "0 4 * * 0"
+    include_excluded: bool = True
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
     credentials: tuple[str, ...]
@@ -114,6 +120,8 @@ class Config:
     discovery: Discovery = field(default_factory=Discovery)
     manual_run: bool = False
     restore_helper: bool = False
+    integrity_check: bool = False
+    integrity: Integrity = field(default_factory=Integrity)
 
 
 def discovery_settings(
@@ -239,6 +247,7 @@ def load(env: dict[str, str]) -> Config:
             "providers",
             "selection",
             "discovery",
+            "integrity",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -339,12 +348,20 @@ def load(env: dict[str, str]) -> Config:
     )
     manual_run = features.pop("manual_run", False)
     restore_helper = features.pop("restore_helper", False)
+    integrity_check = features.pop("integrity_check", False)
     if (
         type(manual_run) is not bool
         or type(restore_helper) is not bool
+        or type(integrity_check) is not bool
         or any(v is not False for v in features.values())
     ):
         raise HarborError("Invalid or unsupported optional feature")
+    integrity = keys(d.get("integrity", {}), {"schedule", "include_excluded"})
+    integrity_schedule = integrity.get("schedule", Integrity.schedule)
+    Cron(integrity_schedule)
+    include_excluded = integrity.get("include_excluded", True)
+    if type(include_excluded) is not bool:
+        raise HarborError("Invalid integrity include_excluded setting")
     root = Path(env.get("REPOHARBOR_BACKUP_ROOT", "/backups"))
     secrets = Path(env.get("REPOHARBOR_SECRETS_DIR", "/run/secrets/repoharbor"))
     if not root.is_absolute() or not secrets.is_absolute():
@@ -365,4 +382,6 @@ def load(env: dict[str, str]) -> Config:
         Discovery(delay),
         manual_run,
         restore_helper,
+        integrity_check,
+        Integrity(integrity_schedule, include_excluded),
     )

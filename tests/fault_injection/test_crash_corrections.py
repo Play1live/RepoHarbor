@@ -587,3 +587,187 @@ def test_paused_repair_handoff_io_error_keeps_journal(factory, monkeypatch, phas
         assert engine.git.refs(mirror) == refs
         assert engine.repos["demo"]["integrity"]["successful_repairs"] == 1
         assert engine.repos["demo"]["errors"]["total"] == 0
+
+
+@pytest.mark.parametrize("point", ["integrity_started", "integrity_metadata"])
+def test_integrity_sigkill_does_not_complete_global_run(factory, point):
+    from repoharbor import integrity
+
+    with factory() as engine:
+        engine.run()
+        integrity.run(engine)
+        last = engine.store.data["integrity"]["last_completed_at"]
+        last_repo = engine.repos["demo"]["integrity"]["periodic"]["last_completed_at"]
+        journal = engine.store.data["active_operation"].copy()
+    kill_at(factory, integrity.run, point)
+    with factory() as engine:
+        assert engine.store.data["integrity"]["state"] == "running"
+        recover(engine)
+        integrity.reconcile(engine.store)
+        state = engine.store.data["integrity"]
+        assert state["state"] == "interrupted" and state["current_repository"] is None
+        assert state["last_completed_at"] == last
+        assert engine.store.data["active_operation"] == journal
+        info = engine.repos["demo"]["integrity"]
+        repo = info["periodic"]
+        assert repo["last_completed_at"] is not None
+        assert (repo["last_completed_at"] == last_repo) == (
+            point == "integrity_started"
+        )
+        assert info["repair_attempts"] == info["successful_repairs"] == 0
+        assert engine.repos["demo"]["errors"]["total"] == 0
+        assert engine.git.calls == []
+        integrity.run(engine)
+        assert engine.store.data["integrity"]["state"] == "completed"
+
+
+def test_integrity_sigterm_stops_the_active_check_and_preserves_previous_result(
+    factory,
+):
+    from repoharbor import integrity
+
+    with factory() as engine:
+        engine.run()
+        integrity.run(engine)
+        previous = engine.repos["demo"]["integrity"]["periodic"].copy()
+    ctx = multiprocessing.get_context("fork")
+    ready = ctx.Event()
+
+    def child():
+        with factory() as engine:
+            signal.signal(signal.SIGTERM, lambda *_: engine.git.stop.set())
+
+            def probing(*_):
+                ready.set()
+                assert engine.git.stop.wait(10)
+                return "interrupted", None
+
+            integrity.inspect = probing
+            integrity.run(engine)
+            assert engine.store.data["integrity"]["state"] == "interrupted"
+
+    process = ctx.Process(target=child)
+    process.start()
+    try:
+        assert ready.wait(15)
+        os.kill(process.pid, signal.SIGTERM)
+        process.join(15)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.kill()
+            process.join()
+    with factory() as engine:
+        periodic = engine.repos["demo"]["integrity"]["periodic"]
+        assert periodic["last_started_at"] != previous.pop("last_started_at")
+        assert {k: periodic[k] for k in previous} == previous
+        assert engine.store.data["integrity"]["checked"] == 0
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.ENOSPC, errno.EACCES])
+@pytest.mark.parametrize("phase", ["before-metadata", "after-metadata", "final-state"])
+def test_integrity_persistence_faults_stop_writes_and_preserve_journal(
+    factory, monkeypatch, error, phase
+):
+    from repoharbor import integrity, persistence
+
+    with factory() as engine:
+        engine.run()
+        journal = engine.store.data["active_operation"].copy()
+        original = persistence.os.replace
+
+        def replace_state(source, destination):
+            staged = read_json(source)
+            state = staged.get("integrity")
+            if (
+                phase == "before-metadata" and destination.name == "metadaten.json"
+            ) or (
+                isinstance(state, dict)
+                and "current_repository" in state
+                and (
+                    (phase == "after-metadata" and state["checked"] == 1)
+                    or (phase == "final-state" and state["state"] == "completed")
+                )
+            ):
+                raise OSError(error, "test storage fault")
+            original(source, destination)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(persistence.os, "replace", replace_state)
+            with pytest.raises(OSError) as failure:
+                integrity.run(engine)
+            assert failure.value.errno == error
+        with pytest.raises(HarborError, match="restart required"):
+            integrity.skip_overlap(engine.store, 1)
+        with pytest.raises(HarborError, match="restart required"):
+            engine.save_meta("demo")
+    with factory() as engine:
+        integrity.reconcile(engine.store)
+        assert engine.store.data["active_operation"] == journal
+        state = engine.store.data["integrity"]
+        assert state["state"] == "interrupted"
+        assert state["last_result"] is state["last_completed_at"] is None
+        assert state["checked"] == int(phase == "final-state")
+        periodic = engine.repos["demo"]["integrity"].get("periodic")
+        assert (periodic is None) == (phase == "before-metadata")
+        if periodic:
+            assert periodic["last_result"] == "healthy"
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGKILL])
+def test_signal_before_recheck_cannot_clear_a_repaired_mirror(factory, signum):
+    from repoharbor import integrity
+
+    with factory() as engine:
+        engine.run()
+        mirror = engine.path("demo") / "repository.git"
+        oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
+        blob = mirror / "objects" / oid[:2] / oid[2:]
+        contents = blob.read_bytes()
+        blob.unlink()
+        integrity.run(engine)
+        previous = engine.repos["demo"]["integrity"]["periodic"].copy()
+        assert previous["last_result"] == "corrupt"
+    blob.write_bytes(contents)
+
+    if signum == signal.SIGKILL:
+        kill_at(factory, integrity.run, "integrity_started")
+    else:
+        ctx = multiprocessing.get_context("fork")
+        started = ctx.Event()
+
+        def child():
+            with factory() as engine:
+                signal.signal(signal.SIGTERM, lambda *_: engine.git.stop.set())
+
+                def pause(point):
+                    if point == "integrity_started":
+                        started.set()
+                        assert engine.git.stop.wait(10)
+
+                engine.checkpoint = pause
+                integrity.run(engine)
+
+        process = ctx.Process(target=child)
+        process.start()
+        try:
+            assert started.wait(15)
+            os.kill(process.pid, signal.SIGTERM)
+            process.join(15)
+            assert process.exitcode == 0
+        finally:
+            if process.is_alive():
+                process.kill()
+                process.join()
+
+    with factory() as engine:
+        integrity.reconcile(engine.store)
+        state = engine.repos["demo"]["integrity"]
+        periodic = state["periodic"]
+        assert state["status"] == "corrupt"
+        assert periodic["last_started_at"] != previous.pop("last_started_at")
+        assert {k: periodic[k] for k in previous} == previous
+        assert engine.store.data["integrity"]["state"] == "interrupted"
+        integrity.run(engine)
+        assert state["status"] == "healthy"
+        assert not periodic["repair_pending"]

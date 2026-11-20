@@ -60,12 +60,12 @@ class LocalGit(Git):
         self.bare = bare
         self.calls = []
 
-    def run(self, args, credential=None, interrupt=lambda: False):
+    def run(self, args, credential=None, interrupt=lambda: False, **kwargs):
         self.calls.append(args)
         args = [
             str(self.bare) if a == "https://example.org/repo.git" else a for a in args
         ]
-        return super().run(args, credential, interrupt)
+        return super().run(args, credential, interrupt, **kwargs)
 
 
 @pytest.fixture
@@ -127,13 +127,13 @@ def github_env(factory, remote, monkeypatch):
                 first="fictional-first", second="fictional-second"
             )
 
-        def run(self, args, credential=None, interrupt=lambda: False):
+        def run(self, args, credential=None, interrupt=lambda: False, **kwargs):
             self.calls.append(args.copy())
             args = [
                 str(self.bare) if a.startswith("https://github.com/") else a
                 for a in args
             ]
-            return super().run(args, credential, interrupt)
+            return super().run(args, credential, interrupt, **kwargs)
 
     return SimpleNamespace(
         config=cfg,
@@ -262,13 +262,13 @@ def gitlab_env(factory, remote, monkeypatch):
                 first="fictional-first", second="fictional-second"
             )
 
-        def run(self, args, credential=None, interrupt=lambda: False):
+        def run(self, args, credential=None, interrupt=lambda: False, **kwargs):
             self.calls.append(args.copy())
             args = [
                 str(self.bare) if a.startswith("https://gitlab.example.org/") else a
                 for a in args
             ]
-            return super().run(args, credential, interrupt)
+            return super().run(args, credential, interrupt, **kwargs)
 
     return SimpleNamespace(
         config=cfg,

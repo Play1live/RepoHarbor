@@ -1,3 +1,4 @@
+import itertools
 from dataclasses import replace
 
 import pytest
@@ -197,9 +198,73 @@ def test_restore_feature_requires_boolean(value):
         load(env({"features": {"restore_helper": value}}))
 
 
-@pytest.mark.parametrize(
-    "feature", ["web_ui", "integrity_check", "auto_retry", "extended_logging"]
-)
+@pytest.mark.parametrize("feature", ["web_ui", "auto_retry", "extended_logging"])
 def test_restore_cannot_enable_other_features(feature):
     with pytest.raises(HarborError, match="unsupported optional feature"):
         load(env({"features": {"restore_helper": True, feature: True}}))
+
+
+@pytest.mark.parametrize(
+    "enabled,manual,restore", itertools.product([False, True], repeat=3)
+)
+def test_integrity_feature_is_independent(enabled, manual, restore):
+    config = load(
+        env(
+            {
+                "features": {
+                    "integrity_check": enabled,
+                    "manual_run": manual,
+                    "restore_helper": restore,
+                }
+            }
+        )
+    )
+    assert (config.integrity_check, config.manual_run, config.restore_helper) == (
+        enabled,
+        manual,
+        restore,
+    )
+    assert config.integrity.schedule == "0 4 * * 0"
+    assert config.integrity.include_excluded is True
+    assert not load(env()).integrity_check
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        None,
+        [],
+        {"unexpected": True},
+        {"include_excluded": "false"},
+        {"include_excluded": 1},
+        {"schedule": "* * * *"},
+        {"schedule": "60 * * * *"},
+        {"schedule": False},
+    ],
+)
+def test_integrity_block_validated_even_when_disabled(block):
+    with pytest.raises(HarborError):
+        load(env({"integrity": block}))
+
+
+@pytest.mark.parametrize("flag", ["true", "false", 0, 1, None, [], {}])
+def test_integrity_flag_requires_boolean(flag):
+    with pytest.raises(HarborError):
+        load(env({"features": {"integrity_check": flag}}))
+
+
+def test_integrity_custom_schedule_and_exclusions():
+    config = load(
+        env(
+            {
+                "schedule": "3 * * * *",
+                "integrity": {
+                    "schedule": "5 * * * *",
+                    "include_excluded": False,
+                },
+            }
+        )
+    )
+    assert config.schedule == "3 * * * *"
+    assert config.integrity.schedule == "5 * * * *"
+    assert config.integrity.include_excluded is False

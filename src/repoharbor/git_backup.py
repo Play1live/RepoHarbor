@@ -2,6 +2,7 @@
 
 import contextlib
 import os
+import select
 import shutil
 import signal
 import subprocess
@@ -10,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 
 from repoharbor.credentials import Credentials
 from repoharbor.errors import GitError, HarborError
@@ -38,20 +40,38 @@ class Git:
         args: list[str],
         credential: str | None = None,
         interrupt: Callable[[], bool] = lambda: False,
+        *,
+        probe: Literal["config", "structure", "fsck"] | None = None,
     ) -> str:
         if self.stop.is_set():
             raise HarborError("INTERRUPTED")
-        env = self.credentials.git_env(credential)
-        # File output avoids pipe deadlocks and unlimited RAM for Git diagnostics.
-        with (
-            tempfile.TemporaryFile(dir=self.scratch) as out,
-            tempfile.TemporaryFile(dir=self.scratch) as err,
-        ):
+        env = self.credentials.git_env(credential if probe is None else None)
+        if probe is not None:
+            env.update(
+                LC_ALL="C",
+                GIT_ALLOW_PROTOCOL="",
+                GIT_NO_LAZY_FETCH="1",
+                GIT_NO_REPLACE_OBJECTS="1",
+                GIT_OPTIONAL_LOCKS="0",
+                GIT_ASKPASS="/bin/false",
+            )
+        with contextlib.ExitStack() as stack:
+            # Periodic probes drain a bounded pipe without writing temporary output.
+            out = (
+                stack.enter_context(tempfile.TemporaryFile(dir=self.scratch))
+                if probe is None
+                else None
+            )
+            err = (
+                stack.enter_context(tempfile.TemporaryFile(dir=self.scratch))
+                if probe is None
+                else None
+            )
             process = subprocess.Popen(
                 [shutil.which("git") or "/usr/bin/git", *args],
                 env=env,
-                stdout=out,
-                stderr=err,
+                stdout=subprocess.PIPE if probe is not None else out,
+                stderr=subprocess.STDOUT if probe is not None else err,
                 start_new_session=True,
                 # Keep the root locked while Git survives a daemon SIGKILL.
                 pass_fds=self.extra_fds
@@ -59,6 +79,11 @@ class Git:
             )
             started = time.monotonic()
             try:
+                if probe is not None:
+                    assert process.stdout is not None
+                    stack.enter_context(process.stdout)
+                    return self.probe_output(process, started, probe == "fsck")
+                assert out is not None and err is not None
                 while process.poll() is None:
                     if (
                         self.stop.is_set()
@@ -100,6 +125,54 @@ class Git:
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+
+    def probe_output(
+        self, process: subprocess.Popen[bytes], started: float, fsck: bool
+    ) -> str:
+        assert process.stdout is not None
+        fd = process.stdout.fileno()
+        output = bytearray()
+        tail = b""
+        filesystem_failure = False
+        eof = False
+        while not eof or process.poll() is None:
+            if self.stop.is_set():
+                raise GitError("INTERRUPTED")
+            if time.monotonic() - started > self.timeout:
+                raise GitError("GIT_TIMEOUT")
+            if eof:
+                self.stop.wait(0.05)
+                continue
+            readable, _, _ = select.select([fd], [], [], 0.05)
+            if not readable:
+                continue
+            chunk = os.read(fd, 8192)
+            eof = not chunk
+            diagnostic = tail + chunk.lower()
+            filesystem_failure |= any(
+                marker in diagnostic
+                for marker in (
+                    b"permission denied",
+                    b"operation not permitted",
+                    b"input/output error",
+                    b"no space left on device",
+                    b"stale file handle",
+                    b"too many open files",
+                    b"cannot allocate memory",
+                )
+            )
+            tail = diagnostic[-64:]
+            if not fsck:
+                output.extend(chunk)
+                if len(output) > 65536:
+                    raise GitError("GIT_OUTPUT_LIMIT")
+        if filesystem_failure:
+            raise GitError("FILESYSTEM_ERROR")
+        if process.returncode:
+            raise GitError(
+                "GIT_FAILED" if process.returncode > 0 else "GIT_INTERRUPTED"
+            )
+        return output.decode("utf-8", errors="replace")
 
     def refs(self, mirror: Path) -> str:
         return self.run(

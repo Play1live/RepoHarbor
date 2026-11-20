@@ -57,8 +57,9 @@ class Engine:
     def path(self, alias: str) -> Path:
         return directory(self.config.root, alias)
 
-    def save_meta(self, alias: str) -> None:
-        atomic_json(self.path(alias) / "metadaten.json", self.repos[alias])
+    def save_meta(self, alias: str, *, fatal: bool = False) -> None:
+        with self.store.writing(fatal=fatal):
+            atomic_json(self.path(alias) / "metadaten.json", self.repos[alias])
 
     def inventory(self) -> None:
         safe_tree(self.config.root)
@@ -388,11 +389,17 @@ class Engine:
                 # A different repository owns the outstanding journal slot.
                 # A full run or startup recovery can safely reconcile it.
                 return Result.BACKUP_FAILED
-            recover(self, repository=repository, during_run=True)
+            recover(self, repository=repository, during_run=True, periodic=True)
         else:
             sources = self.sources
-            if any(":" in s.alias for s in sources):
-                recover(self, during_run=True)
+            if any(
+                ":" in s.alias
+                or self.repos[s.alias]["integrity"]
+                .get("periodic", {})
+                .get("repair_pending")
+                for s in sources
+            ):
+                recover(self, during_run=True, periodic=True)
 
         failed = False
         for source in sources:
@@ -416,10 +423,11 @@ class Engine:
         alias = source.alias
         meta, folder = self.repos[alias], self.path(alias)
         backup = meta["backup"]
-        if "manual_attention_required" in backup or meta["integrity"]["status"] in (
-            "corrupt",
-            "repair_failed",
-            "suspect",
+        integrity = meta["integrity"]
+        if (
+            "manual_attention_required" in backup
+            or integrity["status"] in ("corrupt", "repair_failed", "suspect")
+            or integrity.get("periodic", {}).get("repair_pending")
         ):
             return False
         status = self.refresh_storage(alias)
@@ -558,6 +566,6 @@ class Engine:
         self.save_meta(alias)
 
     def update_skips(self, skipped: int) -> None:
-        with self.store.transaction() as data:
+        with self.store.transaction(fatal=True) as data:
             data["scheduler"]["skipped_overlaps"] += skipped
             data["scheduler"]["last_overlap_at"] = utcnow()

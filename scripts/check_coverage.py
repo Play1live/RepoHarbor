@@ -13,6 +13,7 @@ CRITICAL = {
     "storage",
     "credentials",
     "git_backup",
+    "integrity",
     "selection",
     "gitlab",
 }
