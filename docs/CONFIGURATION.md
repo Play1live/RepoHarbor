@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.8.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.9.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise discovery and SSH are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,10 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. `extended_logging: true` enables structured events. Each is an independent boolean and defaults to `false`. `web_ui` must be `false` if supplied. |
+| `features` | `manual_run: true` enables CLI-triggered and authenticated browser-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. `extended_logging: true` enables structured events. `web_ui: true` enables the authenticated HTTPS dashboard. Each is an independent boolean and defaults to `false`. |
+| `web.bind` | IPv4 address inside the container. Default `127.0.0.1`. Use a non-loopback address only when the deployment restricts access to this listener. |
+| `web.port` | HTTPS listen port inside the container, an integer from 1024 to 65535. Default `8080`. |
+| `web.origin` | Browser-facing canonical HTTPS origin. Required with `features.web_ui: true`. Use a lowercase host, an explicit port only for non-default browser ports, and no path, trailing slash, or credentials. |
 | `retry.max_retries` | Integer from `1` through `10`. Default `3` additional attempts per failure cycle. |
 | `retry.initial_delay_seconds` | Positive integer delay for the first retry. Default `300`. |
 | `retry.max_delay_seconds` | Integer from `1` through `86400`, at least the initial delay. Default `3600`. |
@@ -312,6 +315,22 @@ Every event carries a UTC ISO 8601 timestamp, a level, and a stable event name. 
 Event namespaces cover `service.*`, `backup.*`, `discovery.*`, `retry.*`, `integrity.*`, `recovery.*`, `repair.*`, and `restore.*`. Some per-mirror details, such as healthy integrity results, use `DEBUG`. Treat timestamps and IDs as operational metadata. Confirm backup and recovery results through the status CLI and schema-1 state files.
 
 File paths use slash-separated components of up to 128 ASCII characters, starting with a letter, digit, underscore, or hyphen. The remaining characters may also include dots. The full path is limited to 1,024 characters. Reserve the selected file and its numbered suffixes for RepoHarbor. The service appends to the existing active file and rotates it before an entry would push it over the size limit. Rotation shifts archives with `.1` as the newest. Reducing the archive count removes surplus managed archives at startup. Previously larger files age out through rotation. Choose a fresh filename when changing formats if a parser needs an entire file to use a single format. [Bind-mount setup and retention](../deploy/README.md#configure-log-retention)
+
+## Web dashboard
+
+The dashboard uses the service's current configuration, persisted backup data, and structured events. It keeps up to 250 recent events in process memory independently of extended file logging. Restarting the service clears that history. The dashboard has no log-file browser, historical storage charts, or offline-restore controls. Storage values and measurement dates can be absent until a measurement is recorded.
+
+Set `features.web_ui: true` and supply `web.origin` to enable the listener. The dashboard reads these absolute container paths at startup.
+
+| Environment variable | Default path | File |
+|---|---|---|
+| `REPOHARBOR_WEB_PASSWORD_FILE` | `/run/secrets/repoharbor-web-password` | A private, regular file with a generated URL-safe administrator password of 43–128 characters. |
+| `REPOHARBOR_WEB_CERT_FILE` | `/run/secrets/repoharbor-web-cert` | TLS certificate chain in PEM format. |
+| `REPOHARBOR_WEB_KEY_FILE` | `/run/secrets/repoharbor-web-key` | A private, regular PEM key without a passphrase. |
+
+The service UID needs read access. The password and private key must have no group or other permission bits and must not be symlinks. Mount them read-only and restart to apply changes. If the service cannot load the files or bind the HTTPS listener, the dashboard remains unavailable and the backup service continues. The CLI `config validate` checks the YAML and Git credential settings. Listener startup verifies the web files and bind address.
+
+The optional browser backup controls require the independent `features.manual_run` flag. All settings displayed in the browser remain read-only. See the [deployment guide](../deploy/README.md#enable-the-web-dashboard).
 
 ## CLI commands and exit codes
 

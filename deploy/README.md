@@ -1,12 +1,12 @@
-# RepoHarbor 0.8.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.9.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.8.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.9.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
 - Linux Docker host, Docker Compose v2, and BuildKit to build the image locally. The Portainer instructions assume a **standalone Docker endpoint**, not Swarm.
 - Python 3.12, Git, and CA certificates are included in the container. A host-side offline restore requires a Git installation on the restore host.
-- The container runs as **UID/GID 10001:10001**, without added Linux capabilities, a TCP listener, or a Docker healthcheck. Automated image checks cover Linux/amd64; verify other architectures separately.
+- The container runs as **UID/GID 10001:10001** without added Linux capabilities. The default deployment has no TCP listener or Docker healthcheck. Automated image checks cover Linux/amd64; verify other architectures separately.
 - A pre-existing, persistent backup bind mount backed by a trusted local filesystem supporting `flock`, atomic rename, and `fsync`. SMB/NFS do not have guaranteed consistency for an active RepoHarbor backup root.
 
 **Verify the intended storage device before creating directories.** The example below assumes that `/srv/repoharbor` itself is a dedicated, mounted filesystem:
@@ -38,13 +38,13 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.8.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.9.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
 ```
 
-Do not disable certificate validation. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. Do **not** add an application port, healthcheck, or `INITIALIZE_*` environment variable. The example omits Docker init for NAS compatibility. RepoHarbor handles signals and Git child processes directly.
+Keep certificate validation enabled. Start with [`compose.example.yaml`](compose.example.yaml) and adapt the host paths, sources, schedule, and budgets. Keep its `restart: unless-stopped`, `stop_grace_period: 5m`, non-root user, and security settings. The example leaves application ports unpublished. The optional dashboard instructions below show how to publish its TLS listener on host loopback. The example omits Docker init for NAS compatibility. RepoHarbor handles signals and Git child processes directly.
 
 ## 3. Configure sources and credentials
 
@@ -256,6 +256,59 @@ The backup command waits for the result. Exit `0` confirms a successful operatio
 
 Exit `8` can mean that discovery failed or is in cooldown even if an unaffected source succeeded in a full run. Discovered repositories on the affected authority require fresh discovery. An established eligible manual mirror can continue, while an unproven or new same-authority mirror waits. For exit `9`, check repository backup, error, and repair states and the storage limits. See the [full exit-code table](../docs/CONFIGURATION.md#cli-commands-and-exit-codes).
 
+### Enable the web dashboard
+
+The same container serves the dashboard when enabled. Plan the browser URL first. The example below uses `https://backup.example.org` through a TLS reverse proxy on the Docker host. Obtain a browser-trusted certificate for that URL and a backend PEM certificate and key trusted by the proxy. The proxy can verify a dedicated backend name that matches the backend certificate.
+
+On the verified host filesystem, create a separate directory for dashboard secrets. The example uses a new, generated hexadecimal password and never places it in the stack YAML.
+
+```sh
+sudo install -d -o 10001 -g 10001 -m 0700 /srv/repoharbor/web-secrets
+sudo -u '#10001' -g '#10001' sh -c \
+  'umask 077; set -C; openssl rand -hex 32 > /srv/repoharbor/web-secrets/password'
+sudo install -o 10001 -g 10001 -m 0400 /path/to/backend-chain.pem \
+  /srv/repoharbor/web-secrets/tls.crt
+sudo install -o 10001 -g 10001 -m 0400 /path/to/backend-key.pem \
+  /srv/repoharbor/web-secrets/tls.key
+```
+
+Merge these options into the existing service. Keep its backup and Git credential mounts. Inside `REPOHARBOR_CONFIG`, edit the existing `features` and `web` mappings and retain the other settings.
+
+```yaml
+services:
+  repoharbor:
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      REPOHARBOR_WEB_PASSWORD_FILE: /run/secrets/dashboard/password
+      REPOHARBOR_WEB_CERT_FILE: /run/secrets/dashboard/tls.crt
+      REPOHARBOR_WEB_KEY_FILE: /run/secrets/dashboard/tls.key
+      REPOHARBOR_CONFIG: |
+        schema_version: 1
+        features:
+          web_ui: true
+          manual_run: false
+        web:
+          bind: 0.0.0.0
+          port: 8080
+          origin: https://backup.example.org
+    volumes:
+      - type: bind
+        source: /srv/repoharbor/web-secrets
+        target: /run/secrets/dashboard
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+The bind address is inside the container. Publishing on host loopback keeps the host proxy's backend port off the LAN. For a containerized proxy, use a dedicated shared Docker network, connect to RepoHarbor on its private container port, and omit the host port publication. Restrict the browser endpoint to a trusted management network or VPN.
+
+Configure the proxy to preserve the browser's `Host` and `Origin` headers, verify the backend certificate, disable caching for dashboard requests, and limit connection counts and header/body read times. Set a response timeout appropriate for backups or use CLI for lengthy runs. After an interrupted browser request, inspect status before retrying. The service retains ownership of any accepted operation. The [NGINX proxy module reference](https://nginx.org/en/docs/http/ngx_http_proxy_module.html) documents upstream TLS verification and request forwarding.
+
+For direct access on the Docker host without a proxy, set `web.origin` to `https://127.0.0.1:8080`, keep the host loopback mapping, and use a browser-trusted certificate with the loopback IP in its subject alternative names. Open the exact configured origin and enter the administrator password. To enable both browser and CLI backup actions, also set `features.manual_run: true`.
+
+In Portainer, create the files on the Docker endpoint host, use the same read-only bind mount and loopback publication or private proxy network, then redeploy the existing stack. For startup diagnostics, check the container log for `web.ready` or `web.unavailable` when extended logging is active. Without extended logging, look for `HTTPS dashboard ready` or `Web dashboard could not open securely`. Confirm the bind/port, exact browser origin, certificate chain, and that UID 10001 can read all three files. Sessions expire after 15 minutes and after a restart.
+
 ### Enable automatic retries
 
 Add the following to your existing `REPOHARBOR_CONFIG` YAML. Merge `auto_retry` into your existing `features` mapping.
@@ -328,7 +381,8 @@ For `manual_attention_required`, **stop the service before touching backup data*
 
 | Symptom | Safe checks |
 |---|---|
-| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, `features.auto_retry`, `features.extended_logging`, and `integrity.include_excluded` must be booleans. Verify the cron expressions and retry and logging bounds. Keep `web_ui: false`. |
+| Invalid configuration | Check YAML indentation, `schema_version: 1`, supported fields, aliases, and credential names. Feature flags and `integrity.include_excluded` must be booleans. Verify cron expressions, retry and logging bounds, and the canonical HTTPS origin if the dashboard is enabled. |
+| Dashboard unavailable or sign-in fails | Check the published port and exact browser origin. Check certificate trust and certificate names, proxy header forwarding, key and password file ownership and permissions, and the dashboard startup event in the container log. For sign-in throttling, wait one minute before trying again. |
 | `LOG_MOUNT_MISSING` / `LOG_MOUNT_UNSAFE` | Check the actual log bind-mount target, the dedicated host directory, UID/GID, and ACLs. |
 | `LOG_FILE_UNSAFE` / `LOG_FILE_UNAVAILABLE` | Check for mode `0600`, matching UID, single-link regular files, sufficient access and space, and a single writer. |
 | `logging.file_failed` | Check the log mount's free space, filesystem health, and permissions. Console logging continues. Restart to resume file logging after correcting the host issue. |

@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.8.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.9.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, authenticated loopback HTTPS servers, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -60,7 +60,8 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | State and security | Corrupt/missing metadata, OS locking, unknown configuration fields, URL validation, secret handling, and error-code redaction. |
 | Status and control | Read-only text/JSON inspection, problem counts, invalid metadata, exit codes, token redaction, Unix peer UID checks, and no queued backup requests. |
 | Manual backups | Full and targeted runs with real Git, discovery failure and conflict handling, overlap with cron, client disconnects, and SIGTERM/SIGKILL during Git operations. |
-| Docker | CLI/version/config validation, required bind mount, non-root execution, no TCP listener or healthcheck, manual backups through `docker exec`, graceful shutdown, recreation with retained data, and offline scheduled integrity checks with retained findings. |
+| HTTPS dashboard | Sign-in, session expiry, host/origin checks, CSRF, protected status, rejection of traversal and development routes, empty or unreadable state, measured zero values, and shared backup locking. |
+| Docker | CLI/version/config validation, required bind mount, non-root execution, headless defaults, opt-in HTTPS startup and shutdown, manual backups through `docker exec`, recreation with retained data, and offline scheduled integrity checks with retained findings. |
 
 Tests use fictional API payloads and credentials, local repositories, and a synthetic loopback TLS service. GitLab tests mock the provider API and exercise local Git mirrors. The suite does not contact a production GitLab instance or establish permissions, API behavior, or connectivity for a deployed instance. An isolated test Git transport may enable local file access. Production backup sources use HTTPS. Offline restore and bundle export use local Git data.
 
@@ -83,6 +84,12 @@ docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:loca
 ```
 
 The trusted CA is made available only during build-time package installation; do not disable TLS verification or add private CA keys to the repository.
+
+The full smoke run also exercises the packaged HTTPS dashboard in a container with a fresh temporary backup filesystem, loopback TLS, and no external network. It confirms the sign-in flow, empty status, absence of the development entry point, asset access, and clean shutdown. To run only this check against an already built image, use:
+
+```sh
+python tests/docker/dashboard_smoke.py repoharbor:local-test
+```
 
 ## GitHub Actions workflow
 
@@ -128,6 +135,8 @@ The GitHub discovery tests use fictional API payloads and real local Git mirrors
 Ruff, format checks, strict mypy, Bandit at the CI medium/high threshold, dependency audit, Gitleaks, Compose validation, local Docker build and smoke tests also passed during the historical GitHub discovery validation. None establishes real NAS/Portainer acceptance or authorizes image publication.
 
 ## Documentation and production acceptance
+
+On the target NAS or Portainer endpoint, validate both the headless default and an isolated dashboard-enabled stack. Use a disposable repository and backup directory. Verify browser and backend certificate validation, loopback or private-network publication, an unauthenticated status denial, successful sign-in, disabled manual actions, and a successful backup after intentionally enabling manual execution. Inspect the six views on desktop and mobile and confirm stored mirrors remain intact after a restart. Keep production backups and credentials out of this acceptance run.
 
 The [root README](../README.md) summarizes the architecture and supported features. The [deployment guide](../deploy/README.md) provides host and Portainer setup plus offline restore, while [SECURITY.md](SECURITY.md) documents the data-preservation rules.
 
