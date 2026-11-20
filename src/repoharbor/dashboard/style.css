@@ -45,6 +45,9 @@
   .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; margin-bottom: 17px; }
   .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: stretch; gap: 16px; }
   .stack { display: grid; gap: 15px; align-content: start; min-width: 0; }
+  .repository-details { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px 28px; }
+  .repository-details > section { min-width: 0; }
+  .repository-actions { display: flex; flex-wrap: wrap; gap: 8px; }
   .split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(295px, 33%); align-items: start; gap: 14px; }
   .source-grid { display: grid; grid-template-columns: minmax(155px, 1fr) repeat(3, minmax(0, 1.15fr)); gap: 16px; }
 }
@@ -181,6 +184,7 @@
     .source-grid section:nth-child(odd) { border-left: 0; padding-left: 0; }
   }
   @media (max-width: 800px) {
+    .repository-details { grid-template-columns: minmax(0, 1fr); }
     .sidebar { visibility: hidden; transform: translateX(-100%); width: min(265px, 84vw); box-shadow: 14px 0 38px #0008; }
     .sidebar.open { visibility: visible; transform: none; }
     .workspace { margin-left: 0; }

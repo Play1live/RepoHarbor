@@ -133,6 +133,7 @@ const repoLabel = repo => repo?.name || repo?.id || unknown;
 const findRepo = id => state.data?.repositories.find(repo => repo.id === id);
 const targetLabel = id => repoLabel(findRepo(id) || {id});
 const repoPath = id => "/repositories/" + encodeURIComponent(id);
+const repoListPath = () => "/repositories" + (reposFilter.errors ? "?errors=" + reposFilter.errors : "");
 
 function eventTitle(operation) {
   const [type, action] = operation.split(".");
@@ -272,10 +273,12 @@ function overview(data) {
   const r = s.repositories;
   const p = s.periodic_integrity;
   const storage = s.storage;
-  const task = s.run_status === "running" && (p.state === "running"
-    ? {started_at: p.started_at, repository: p.repository, trigger: "periodic"} : s.active_run || s.active_retry);
+  const manual = s.manual_integrity;
+  const task = s.run_status === "running" && (manual?.state === "running"
+    ? {...manual, trigger: "manual_integrity"} : p.state === "running"
+      ? {started_at: p.started_at, repository: p.repository, trigger: "periodic"} : s.active_run || s.active_retry);
   const taskTitle = task ? ({scheduled: "Scheduled backup", manual: "Manual backup",
-    periodic: "Integrity check", retry: "Automatic retry"})[task.trigger] || "Operation in progress"
+    periodic: "Integrity check", manual_integrity: "Manual integrity check", retry: "Automatic retry"})[task.trigger] || "Operation in progress"
     : ({busy: "Operation in progress", idle: "No active task"})[serviceKey()] || "Task status unknown";
   const recent = activities.slice(0, 5);
   return [
@@ -365,7 +368,7 @@ function retryBadge(retry) {
     : retry.limit_reached ? badge("exhausted") : retry.status === "idle" ? "—" : badge(retry.status);
 }
 
-function repoRows(data, selected) {
+function repoRows(data) {
   const f = reposFilter;
   const q = f.q.trim().toLocaleLowerCase(locale);
   const repos = data.repositories.filter(repo => (
@@ -388,25 +391,24 @@ function repoRows(data, selected) {
       f.desc = f.sort === key ? !f.desc : key !== "name";
       f.sort = key;
       f.page = 0;
-      swap("repo-list", () => repoRows(data, selected));
+      swap("repo-list", () => repoRows(data));
     }, {className: "sort", id: "sort-" + key}) : title,
     sort: key === f.sort ? (f.desc ? "descending" : "ascending") : null,
   }));
   const size = 12;
   f.page = Math.min(f.page, Math.max(0, Math.ceil(repos.length / size) - 1));
   const rows = repos.slice(f.page * size, (f.page + 1) * size).map(repo => row([
-    el("div", {}, link(repoPath(repo.id), {id: "repo-" + repo.id, class: "table-link",
-      "aria-current": selected === repo.id ? "true" : null}, repoLabel(repo)),
+    el("div", {}, link(repoPath(repo.id), {id: "repo-" + repo.id, class: "table-link"}, repoLabel(repo)),
     repo.owner ? el("div", {class: "muted"}, repo.owner + "/" + repoLabel(repo)) : null),
     el("div", {}, providerName(repo.provider), el("div", {class: "muted"}, repo.host)),
     badge(repo.selection_status), badge(repo.backup_status), time(repo.last_checked_at), time(repo.last_updated_at),
     bytes(repo.size_bytes), badge(repo.integrity_status),
     data.settings.retry.enabled ? retryBadge(repo.retry) : "—",
     repo.last_error_code ? el("code", {}, repo.last_error_code) : "—",
-  ], selected === repo.id));
+  ]));
   return [
     repos.length ? table(columns, rows, "Repository table") : empty("No repositories match your filters."),
-    pagination(repos.length, f.page, size, page => { f.page = page; swap("repo-list", () => repoRows(data, selected)); }),
+    pagination(repos.length, f.page, size, page => { f.page = page; swap("repo-list", () => repoRows(data)); }),
   ];
 }
 
@@ -422,52 +424,61 @@ function externalLink(value) {
 }
 
 function repoDetail(repo, data) {
-  const close = link("/repositories", {class: "icon-button", title: "Close details", "aria-label": "Close details"}, icon("close"));
+  const close = link(repoListPath(), {class: "icon-button", title: "Close details", "aria-label": "Close details"}, icon("close"));
   if (!repo) return panel("Repository unavailable", "repositories", body(
     el("p", {}, "No readable data is available for this repository.")), close, "detail");
   const integrity = repo.integrity;
   const periodic = repo.periodic_integrity;
+  const manual = repo.manual_integrity;
   const retry = repo.retry;
   const errors = repo.errors.recent.filter(Boolean).slice().sort((a, b) => String(b.at).localeCompare(String(a.at)));
   const external = externalLink(repo.web_url);
   const canRun = data.settings.manual_run && data.csrf && repo.selection_status === "included";
+  const canCheck = data.settings.manual_run && data.csrf && repo.can_check_integrity;
+  const section = (title, ...content) => el("section", {}, el("h3", {}, title), content);
   return panel(repoLabel(repo), "repositories", body(
-    fields([["ID", el("code", {}, repo.id)], ["Provider", providerName(repo.provider)], ["Host", repo.host],
+    el("div", {class: "repository-details"},
+    section("Repository information", fields([["ID", el("code", {}, repo.id)], ["Provider", providerName(repo.provider)], ["Host", repo.host],
       ["Selection", badge(repo.selection_status)], ["Selection reason", reasons[repo.selection_reason] || "—"],
       ["Source status", badge(repo.source_status)],
       ["Discovery status", badge(repo.provider === "manual" ? "not_required" : repo.discovery_status)],
       ["Last seen", time(repo.discovery_last_seen_at)],
-      ["Visibility", visibility[repo.visibility] || unknown]]),
-    el("h3", {}, "Backup and storage"),
-    fields([["Status", badge(repo.backup_status)], ["Last check", time(repo.last_checked_at)],
+      ["Visibility", visibility[repo.visibility] || unknown]])),
+    section("Backup and storage", fields([["Status", badge(repo.backup_status)], ["Last check", time(repo.last_checked_at)],
       ["Last attempt", time(repo.last_attempt_at)], ["Last update", time(repo.last_updated_at)],
       ["Measured size", bytes(repo.size_bytes)], ["Limit", limit(repo.limit_bytes)],
-      ["Storage status", badge(repo.storage_status)]]),
-    el("h3", {}, "Integrity and repair"),
-    fields([["Integrity", badge(repo.integrity_status)], ["Last check", time(integrity.last_checked_at)],
+      ["Storage status", badge(repo.storage_status)]])),
+    section("Integrity and repair", fields([["Integrity", badge(repo.integrity_status)], ["Last recorded engine check", time(integrity.last_checked_at)],
       ["Periodic check result", badge(periodic.last_result)], ["Last periodic check", time(periodic.last_completed_at)],
+      ["Last manual check", time(manual.last_completed_at)], ["Manual check result", badge(manual.last_result)],
+      ["Manual check error", manual.error_code || "—"],
       ["Repair attempts", count(integrity.repair_attempts)], ["Successful repairs", count(integrity.successful_repairs)],
       ["Last repair", time(integrity.last_repair_at)], ["Result", badge(integrity.last_repair_result)],
-      ["Action required", integrity.repair_deferred || integrity.manual_attention_required ? "Review needed" : "—"]]),
-    el("h3", {}, "Errors and retries"),
-    fields([["Last error code", repo.last_error_code || "—"], ["Recorded errors", count(repo.errors.total)],
+      ["Action required", integrity.repair_deferred || integrity.manual_attention_required ? "Review needed" : "—"]])),
+    section("Errors and retries", fields([["Last error code", repo.last_error_code || "—"], ["Recorded errors", count(repo.errors.total)],
       ["Retry", data.settings.retry.enabled ? retryBadge(retry) : badge("disabled")],
       ["Automatic attempts", count(retry.attempts) + " / " + count(retry.max_retries)],
       ["Next attempt", retry.pending ? time(retry.next_attempt_at) : "—"],
       ["Discovery deferrals", count(retry.discovery_deferrals) + " / " + count(retry.max_discovery_deferrals)],
       ["Reason for deferral", retry.block_reason || "—"]]),
     errors.length ? fields(errors.map(entry => [date(entry.at), el("code", {}, entry.code || unknown)]))
-      : el("p", {class: "muted"}, "No further error details are available."),
-    canRun || external ? el("div", {class: "detail-actions"}, canRun ? backupButton(repo.id, repoLabel(repo)) : null, external) : null),
+      : el("p", {class: "muted"}, "No further error details are available."))),
+    canRun || canCheck || external ? el("div", {class: "detail-actions"},
+      canRun ? backupButton(repo.id, repoLabel(repo)) : null,
+      canCheck ? checkButton(repo.id, repoLabel(repo)) : null, external) : null),
   close, "detail");
 }
 
 function repositories(data) {
   const f = reposFilter;
-  let selected = null;
+  const check = data.service.manual_integrity;
+  const progress = check && integrityProgress(check);
   if (location.pathname.startsWith("/repositories/")) {
+    let selected;
     try { selected = decodeURIComponent(location.pathname.slice("/repositories/".length)); }
     catch (error) { if (!(error instanceof URIError)) throw error; selected = ""; }
+    return [check && (!check.target || check.target === selected) ? progress : null,
+      repoDetail(findRepo(selected), data)];
   }
   const update = key => value => {
     f[key] = value;
@@ -478,7 +489,7 @@ function repositories(data) {
       else url.searchParams.delete("errors");
       history.replaceState({}, "", url);
     }
-    swap("repo-list", () => repoRows(data, selected));
+    swap("repo-list", () => repoRows(data));
   };
   const list = stack(
     filterBar(searchField("Search repositories", "repo-query", f.q, update("q")),
@@ -493,9 +504,10 @@ function repositories(data) {
         render();
         document.getElementById("repo-query")?.focus();
       }, {only: true})),
-    panel("Repository list", "repositories", el("div", {id: "repo-list"}, repoRows(data, selected))));
+    panel("Repository list", "repositories", el("div", {id: "repo-list"}, repoRows(data))));
   const repos = data.repositories;
   return [
+    progress,
     metrics(
       metric("Known repositories", count(data.service.repositories.known), null, "repositories"),
       metric("Backed up", count(repos.filter(repo => ["updated", "up_to_date"].includes(repo.backup_status)
@@ -503,8 +515,21 @@ function repositories(data) {
       metric("With storage warnings", count(repos.filter(repo => tone(repo.storage_status) === "warning").length),
         null, "warning", "warning", "/storage"),
       metric("With errors", count(data.service.repositories.with_errors), null, "error", "error", "/repositories?errors=yes")),
-    selected !== null ? el("div", {class: "split"}, list, repoDetail(findRepo(selected), data)) : list,
+    list,
   ];
+}
+
+function integrityProgress(check) {
+  const scope = check.target ? targetLabel(check.target) : "All local mirrors";
+  const result = check.state === "completed" ? check.last_result : check.state;
+  const current = check.repository ? " · Checking " + targetLabel(check.repository) : "";
+  return panel("Manual integrity check", "shield", body(
+    el("p", {role: "status"}, scope + current + " ", badge(result)),
+    el("p", {class: "muted"}, [
+      count(check.checked) + " checked", count(check.healthy) + " healthy",
+      count(check.corrupt) + " corrupt", count(check.skipped) + " skipped",
+      count(check.uncheckable) + " unable to check",
+    ].join(" · "))));
 }
 
 function eventId(event) {
@@ -538,6 +563,7 @@ function eventDetail(event) {
     el("h3", {id: "activity-detail", tabindex: "-1"}, eventTitle(event.operation)),
     fields([["Time", time(event.at)], ["Result", badge(event.status)],
       ["Repository", event.repository ? link(repoPath(event.repository), {}, targetLabel(event.repository)) : "—"],
+      ...(event.trigger === "manual" ? [["Trigger", "Manual integrity check"]] : []),
       ["Source", event.host || "—"], ["Duration", duration(event.duration_ms)],
       ["Error code", event.code ? el("code", {}, event.code) : "—"],
       ["Correlation ID", event.correlation ? el("code", {}, event.correlation) : "—"]])),
@@ -709,9 +735,10 @@ function render() {
   if (state.login) {
     main.replaceChildren(login());
   } else {
-    const canRun = data?.settings.manual_run && data.csrf && route() === "/repositories";
+    const canRun = data?.settings.manual_run && data.csrf && location.pathname === "/repositories";
     const heading = el("header", {class: "heading"}, el("div", {},
-      el("h1", {}, page[1]), el("p", {}, page[2])), canRun ? backupButton(null) : null);
+      el("h1", {}, page[1]), el("p", {}, page[2])),
+      canRun ? el("div", {class: "repository-actions"}, backupButton(null), checkButton(null)) : null);
     const content = data ? (builders[route()] || overview)(data) : [];
     const unreadable = data?.service.repositories.unreadable;
     const problem = state.problem === "status" ? "Current status data is unavailable." : "The dashboard is offline.";
@@ -737,15 +764,19 @@ function render() {
 function routeChanged() {
   const params = new URLSearchParams(location.search);
   if (route() === "/repositories" && !location.pathname.startsWith("/repositories/")) {
-    reposFilter.errors = ["yes", "no"].includes(params.get("errors")) ? params.get("errors") : "";
+    const next = ["yes", "no"].includes(params.get("errors")) ? params.get("errors") : "";
+    if (reposFilter.errors !== next) {
+      reposFilter.errors = next;
+      reposFilter.page = 0;
+    }
   }
   setMenu(false);
   render();
   const detail = main.querySelector(".detail .panel-head h2");
   if (detail && location.pathname.startsWith("/repositories/")) {
     detail.tabIndex = -1;
+    window.scrollTo(0, 0);
     detail.focus({preventScroll: true});
-    if (matchMedia("(max-width: 1200px)").matches) detail.scrollIntoView({block: "center"});
   } else {
     window.scrollTo(0, 0);
     main.focus({preventScroll: true});
@@ -799,22 +830,32 @@ async function logout() {
 }
 
 function backupButton(id, name) {
-  return button(id ? "Back up repository" : "Back up all included repositories", "play", async () => {
-    const message = id ? "Start a backup for “" + name + "” now?"
-      : "Start a backup for all included repositories now?";
-    if (!window.confirm(message)) return;
+  return operationButton(id, "backup", id ? "Back up repository" : "Backup all repositories",
+    "play", id ? "Start a backup for “" + name + "” now?" : "Start a backup for all included repositories now?",
+    "Backup requested. Waiting for the result.");
+}
+
+function checkButton(id, name) {
+  return operationButton(id, "integrity", id ? "Check integrity" : "Check all repositories",
+    "shield", id ? "Check the local mirror for “" + name + "”?" : "Check all eligible local mirrors, including excluded repositories?",
+    "Integrity check requested. Waiting for the result.");
+}
+
+function operationButton(id, action, title, glyph, confirmation, waiting) {
+  return button(title, glyph, async () => {
+    if (!window.confirm(confirmation)) return;
     state.sending = true;
-    state.notice = "Backup requested. Waiting for the result.";
+    state.notice = waiting;
     render();
     try {
-      const response = await post("/api/backup", {repository: id});
+      const response = await post("/api/" + action, {repository: id});
       state.notice = response.message;
     } catch (error) { state.notice = error.message; }
     finally {
       state.sending = false;
       await refresh(true);
     }
-  }, {className: "button primary", id: id ? "backup-repo" : "backup-all",
+  }, {className: action === "backup" ? "button primary" : "button", id: action + (id ? "-repo" : "-all"),
     disabled: state.sending || !state.online || serviceKey() === "busy"});
 }
 

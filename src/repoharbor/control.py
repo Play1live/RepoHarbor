@@ -9,6 +9,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
+from repoharbor import integrity
 from repoharbor.engine import Engine
 from repoharbor.errors import HarborError, Result
 from repoharbor.scheduler import Scheduler
@@ -80,14 +81,20 @@ class Control:
         self.worker: threading.Thread | None = None
         self.failure: Exception | None = None
 
-    def run_backup(self, connection: socket.socket, repository: str | None) -> None:
+    def run_operation(
+        self, connection: socket.socket, repository: str | None, check: bool
+    ) -> None:
         with connection:
             try:
-                result = self.engine.run(manual=True, repository=repository)
+                result = (
+                    integrity.run(self.engine, manual=True, repository=repository)
+                    if check
+                    else self.engine.run(manual=True, repository=repository)
+                )
             except Exception as error:
                 self.failure = error
                 self.stop.set()
-                result = Result.BACKUP_FAILED
+                result = Result.INTEGRITY_FAILED if check else Result.BACKUP_FAILED
             finally:
                 self.scheduler.busy.release()
             reply(connection, result)
@@ -107,7 +114,10 @@ class Control:
             )
             return False
         try:
-            repository = parse(command)
+            if len(command) > MAX_REQUEST:
+                raise HarborError("Invalid control request")
+            check = command.startswith(b"check ")
+            repository = parse(command[6:] if check else command)
         except (HarborError, UnicodeError):
             reply(connection, Result.INVALID_ARGUMENT)
             return False
@@ -119,7 +129,7 @@ class Control:
             reply(connection, Result.BUSY)
         else:
             self.worker = threading.Thread(
-                target=self.run_backup, args=(connection, repository)
+                target=self.run_operation, args=(connection, repository, check)
             )
             try:
                 self.worker.start()

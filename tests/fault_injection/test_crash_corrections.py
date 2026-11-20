@@ -591,26 +591,33 @@ def test_paused_repair_handoff_io_error_keeps_journal(factory, monkeypatch, phas
 
 
 @pytest.mark.parametrize("point", ["integrity_started", "integrity_metadata"])
-def test_integrity_sigkill_does_not_complete_global_run(factory, point):
+@pytest.mark.parametrize("manual", [False, True])
+def test_integrity_sigkill_does_not_complete_global_run(factory, point, manual):
     from repoharbor import integrity
+
+    state_key = "manual_integrity" if manual else "integrity"
+    metadata_key = "manual" if manual else "periodic"
+
+    def check(engine):
+        integrity.run(engine, manual=manual)
 
     with factory() as engine:
         engine.run()
-        integrity.run(engine)
-        last = engine.store.data["integrity"]["last_completed_at"]
-        last_repo = engine.repos["demo"]["integrity"]["periodic"]["last_completed_at"]
+        check(engine)
+        last = engine.store.data[state_key]["last_completed_at"]
+        last_repo = engine.repos["demo"]["integrity"][metadata_key]["last_completed_at"]
         journal = engine.store.data["active_operation"].copy()
-    kill_at(factory, integrity.run, point)
+    kill_at(factory, check, point)
     with factory() as engine:
-        assert engine.store.data["integrity"]["state"] == "running"
+        assert engine.store.data[state_key]["state"] == "running"
         recover(engine)
         integrity.reconcile(engine.store)
-        state = engine.store.data["integrity"]
+        state = engine.store.data[state_key]
         assert state["state"] == "interrupted" and state["current_repository"] is None
-        assert state["last_completed_at"] == last
+        assert state["last_completed_at"] == (None if manual else last)
         assert engine.store.data["active_operation"] == journal
         info = engine.repos["demo"]["integrity"]
-        repo = info["periodic"]
+        repo = info[metadata_key]
         assert repo["last_completed_at"] is not None
         assert (repo["last_completed_at"] == last_repo) == (
             point == "integrity_started"
@@ -618,8 +625,8 @@ def test_integrity_sigkill_does_not_complete_global_run(factory, point):
         assert info["repair_attempts"] == info["successful_repairs"] == 0
         assert engine.repos["demo"]["errors"]["total"] == 0
         assert engine.git.calls == []
-        integrity.run(engine)
-        assert engine.store.data["integrity"]["state"] == "completed"
+        check(engine)
+        assert engine.store.data[state_key]["state"] == "completed"
 
 
 def test_integrity_sigterm_stops_the_active_check_and_preserves_previous_result(

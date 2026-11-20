@@ -247,6 +247,12 @@ def test_live_auth_csrf_and_invalid_requests(factory, tls_files):
             port, "POST", "/api/backup", auth, {"repository": None}, client
         )
         assert status == 403 and body == {"error": "Manual backups are disabled."}
+        status, _, body = exchange(
+            port, "POST", "/api/integrity", auth, {"repository": None}, client
+        )
+        assert status == 403 and body == {
+            "error": "Manual integrity checks are disabled."
+        }
         assert exchange(port, "POST", "/api/logout", auth, {}, client)[0] == 200
         assert exchange(port, "GET", "/api/dashboard", auth, tls=client)[0] == 401
 
@@ -427,12 +433,41 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 server = holder["server"]
                 port = server.server_port
                 auth = login(port, client, password)
+                for headers in (
+                    {},
+                    {**auth, "Cookie": "invalid"},
+                    {**auth, "X-CSRF-Token": "invalid"},
+                    {**auth, "Origin": "https://example.org"},
+                    {**auth, "Host": "example.org"},
+                ):
+                    assert (
+                        exchange(
+                            port,
+                            "POST",
+                            "/api/integrity",
+                            headers,
+                            {"repository": None},
+                            client,
+                        )[0]
+                        == 403
+                    )
                 for alias in ("../demo", "/tmp/demo", "https://example.org/"):
                     assert (
                         exchange(
                             port,
                             "POST",
                             "/api/backup",
+                            auth,
+                            {"repository": alias},
+                            client,
+                        )[0]
+                        == 400
+                    )
+                    assert (
+                        exchange(
+                            port,
+                            "POST",
+                            "/api/integrity",
                             auth,
                             {"repository": alias},
                             client,
@@ -450,6 +485,18 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 )
                 assert ready.wait(3)
                 assert request(config.root, b"all") == Result.BUSY
+                assert request(config.root, b"check all") == Result.BUSY
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "demo"},
+                        client,
+                    )[0]
+                    == 409
+                )
                 assert (
                     exchange(
                         port,
@@ -482,6 +529,35 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 assert any(
                     event["operation"] == "backup.completed"
                     for event in data["activities"]
+                )
+                assert data["repositories"][0]["can_check_integrity"]
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "demo"},
+                        client,
+                    )[0]
+                    == 200
+                )
+                checked = exchange(port, "GET", "/api/dashboard", auth, tls=client)[2]
+                assert checked["service"]["manual_integrity"]["healthy"] == 1
+                assert (
+                    checked["repositories"][0]["manual_integrity"]["last_result"]
+                    == "healthy"
+                )
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "unknown"},
+                        client,
+                    )[0]
+                    == 404
                 )
                 assert (
                     exchange(

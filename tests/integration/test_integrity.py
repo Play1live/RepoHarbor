@@ -1,14 +1,17 @@
 import json
 import threading
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock
 
 import pytest
 from conftest import git, raw_project, raw_repo
 
 from repoharbor import integrity, status
+from repoharbor.control import Control, request
 from repoharbor.credentials import Credentials
 from repoharbor.errors import HarborError, Result
 from repoharbor.git_backup import Git
@@ -18,6 +21,7 @@ from repoharbor.persistence import record_error, utcnow
 from repoharbor.providers import Observation
 from repoharbor.recovery import recover
 from repoharbor.registry import plan
+from repoharbor.scheduler import Cron, Scheduler
 
 
 def snapshot(folder):
@@ -29,6 +33,159 @@ def snapshot(folder):
 def blob_path(mirror):
     oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
     return mirror / "objects" / oid[:2] / oid[2:]
+
+
+def test_manual_checks_all_catalog_mirrors_without_remote_or_repair(factory, remote):
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        integrity.run(engine)
+        original = engine.repos["demo"]
+        for alias in ("excluded", "removed", "partial", "uncheckable"):
+            meta = deepcopy(original)
+            meta["repository"].update(id=alias, name=alias, aliases=[alias])
+            meta["selection"]["status"] = "excluded"
+            meta["source"]["status"] = "unavailable"
+            path = engine.path(alias)
+            path.mkdir()
+            engine.repos[alias] = meta
+            git("clone", "--mirror", remote[1], path / "repository.git")
+            engine.save_meta(alias)
+        mirror = engine.path("excluded") / "repository.git"
+        (mirror / "refs/heads/broken").write_text("invalid ref\n")
+        (engine.path("partial") / "repository.git.partial").mkdir()
+        git(
+            "config",
+            "fsck.missingEmail",
+            "ignore",
+            cwd=engine.path("uncheckable") / "repository.git",
+        )
+        previous = deepcopy(engine.store.data)
+        before = {
+            alias: snapshot(engine.path(alias) / "repository.git")
+            for alias in engine.repos
+        }
+        config = replace(engine.config, sources=())
+    with factory(config) as engine:
+        assert not engine.config.integrity_check
+        assert (
+            integrity.run(engine, manual=True, repository="unknown")
+            == Result.UNKNOWN_REPOSITORY
+        )
+        assert (
+            integrity.run(engine, manual=True, repository="partial")
+            == Result.INTEGRITY_SKIPPED
+        )
+        assert (
+            integrity.run(engine, manual=True, repository="excluded")
+            == Result.INTEGRITY_ISSUES
+        )
+        assert (
+            integrity.run(engine, manual=True, repository="excluded")
+            == Result.INTEGRITY_ISSUES
+        )
+        assert (
+            integrity.run(engine, manual=True, repository="removed") == Result.SUCCESS
+        )
+        assert integrity.run(engine, manual=True) == Result.INTEGRITY_ISSUES
+        state = engine.store.data["manual_integrity"]
+        assert state["target"] is None
+        assert [
+            state[key]
+            for key in ("checked", "healthy", "corrupt", "skipped", "uncheckable")
+        ] == [3, 2, 1, 1, 1]
+        assert all(engine.store.data[key] == value for key, value in previous.items())
+        assert all(
+            not {"fetch", "clone", "ls-remote"}.intersection(call)
+            for call in engine.git.calls
+        )
+        assert before == {
+            alias: snapshot(engine.path(alias) / "repository.git")
+            for alias in engine.repos
+        }
+    with factory(config) as engine:
+        assert engine.store.data["manual_integrity"] == state
+        saved = engine.repos["excluded"]["integrity"]
+        assert saved["manual"]["last_result"] == "corrupt"
+        assert saved["manual"]["error_code"] == "GIT_CORRUPTION"
+        assert saved["periodic"] == original["integrity"]["periodic"]
+        assert not saved["periodic"]["repair_pending"]
+
+
+def test_manual_check_stop_and_restart_preserve_previous_completed_finding(factory):
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        assert integrity.run(engine, manual=True) == Result.SUCCESS
+        previous = engine.repos["demo"]["integrity"]["manual"]["last_completed_at"]
+
+        def stop(name):
+            if name == "integrity_started":
+                engine.git.stop.set()
+
+        engine.checkpoint = stop
+        assert (
+            integrity.run(engine, manual=True, repository="demo")
+            == Result.INTEGRITY_INTERRUPTED
+        )
+    with factory() as engine:
+        integrity.reconcile(engine.store)
+        state = engine.store.data["manual_integrity"]
+        assert state["state"] == "interrupted" and state["checked"] == 0
+        result = engine.repos["demo"]["integrity"]["manual"]
+        assert result["last_completed_at"] == previous
+        assert result["last_started_at"] > previous
+        assert result["last_result"] == "healthy"
+
+
+def test_manual_check_empty_catalog(factory):
+    with factory(replace(factory.config, sources=())) as engine:
+        assert integrity.run(engine, manual=True) == Result.INTEGRITY_SKIPPED
+        assert engine.store.data["manual_integrity"]["last_result"] == "no_candidates"
+
+
+def test_manual_integrity_owns_lock_and_skips_overlapping_schedule(
+    factory, monkeypatch
+):
+    initial = datetime(2026, 1, 1, tzinfo=UTC)
+    cron = Cron("* * * * *")
+    backup = Scheduler(cron, "UTC", initial)
+    config = replace(factory.config, manual_run=True)
+    with factory(config) as engine:
+        assert engine.run() == Result.SUCCESS
+        entered, release = threading.Event(), threading.Event()
+        inspect = integrity.inspect
+
+        def pause(git, mirror):
+            entered.set()
+            assert release.wait(5)
+            return inspect(git, mirror)
+
+        monkeypatch.setattr(integrity, "inspect", pause)
+        scheduled = Scheduler(
+            cron,
+            "UTC",
+            initial,
+            lambda count: integrity.skip_overlap(engine.store, count),
+            busy=backup.busy,
+        )
+        control = Control(engine, backup, engine.git.stop)
+        with control.start(), ThreadPoolExecutor() as pool:
+            run = pool.submit(request, config.root, b"check repo demo")
+            try:
+                assert entered.wait(3)
+                state = engine.store.data["manual_integrity"]
+                assert (
+                    state["state"] == "running"
+                    and state["current_repository"] == "demo"
+                )
+                assert request(config.root, b"all") == Result.BUSY
+                assert request(config.root, b"check all") == Result.BUSY
+                periodic = Mock()
+                assert not scheduled.tick(initial + timedelta(minutes=1), periodic)
+                periodic.assert_not_called()
+                assert engine.store.data["integrity"]["skipped_overlaps"] == 1
+            finally:
+                release.set()
+            assert run.result(timeout=5) == Result.SUCCESS
 
 
 @pytest.mark.parametrize(
