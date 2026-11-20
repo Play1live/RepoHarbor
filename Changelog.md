@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.0
+
+- Add opt-in automatic retries for individual GitHub, GitLab, and manual HTTPS backups after classified temporary Git failures. The default backoff allows three additional attempts after successive waits of 5, 10, and 20 minutes.
+- Persist retry plans and outcomes in schema-1 repository metadata and report attempts, deadlines, blocks, and the global pending count in text and JSON status.
+- Share the execution lock with scheduled backups, manual backups, and integrity checks. Reconcile prior mutations before retrying and apply discovery, cooldowns, capacity limits, quarantine, and repair safeguards.
+
 ## 0.6.0
 
 - Add opt-in periodic Git integrity checks with a separate cron schedule for existing mirrors, including excluded repositories by default. Local, read-only checks distinguish corruption from unavailable results and interruptions.

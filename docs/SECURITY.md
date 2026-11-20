@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.6.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.7.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -65,7 +65,7 @@ Discovery records its own state in the existing central `data.json` without repl
 
 A temporary `repository.git.partial/` becomes a valid `repository.git/` **only** when completion is supported by a durable journal marker and a fresh integrity check. Structural health by itself does not establish that the initial network clone completed.
 
-An identified interrupted first clone may be moved through a journaled rename into **one reserved slot** per source: `quarantine/initial-clone/`. Quarantined bytes remain preserved and count toward both repository and global size budgets. Startup reconciliation does **not** start a new clone; a later eligible scheduled or manual run can retry.
+An identified interrupted first clone may be moved through a journaled rename into **one reserved slot** per source: `quarantine/initial-clone/`. Quarantined bytes remain preserved and count toward both repository and global size budgets. Startup reconciliation handles existing local data. A later eligible scheduled, manual, or automatic retry can start a clone.
 
 Unknown or unowned partials, excluded sources, a second partial while quarantine is occupied, missing quarantine content, and conflicting paths set persistent `backup.manual_attention_required` and prevent further automatic downloads. The service does not rotate or delete quarantines automatically. Missing/corrupt journal or metadata files fail closed rather than being silently reset. Only schema version `1` is accepted. GitHub and GitLab metadata and the journal's `discovery` and `provider_discovery` entries are additive extensions. Existing manual state needs no migration.
 
@@ -111,6 +111,14 @@ SIGTERM/SIGINT stop new Git work, terminate the active Git process group, and es
 Periodic runs record their start and progress in `data.json` and store per-mirror findings in `metadaten.json` through atomic file updates. A stop during an unfinished check retains its previous completed finding and timestamp. A completed repository finding can survive a crash before the run counters are written. After a forced stop, startup marks an unfinished periodic run as `interrupted`. The next check starts at a future scheduled tick.
 
 Stored error history preserves total and consecutive counters plus at most the last 20 events, without raw remote stderr or token values. Storage measurements are point-in-time observations, not enforced filesystem quotas. A physical free-space reserve reduces risk but cannot guarantee protection from concurrent writers or sudden disk exhaustion.
+
+## Automatic retry safety
+
+A retry uses the existing backup engine, execution lock, storage measurements, and durable operation journal. The classifier consumes bounded Git diagnostics and emits fixed codes. Raw stderr is kept out of logs and repository metadata. RepoHarbor suppresses Git's internal HTTP 429 retry loop for classified backup commands. Authorization, TLS verification, credential isolation, and provider API pacing continue to apply. HTTP rate limits and incomplete discovery keep remote Git from starting on the affected authority.
+
+An interrupted fetch must pass local recovery before another backup can mutate the mirror. If integrity is uncertain, the journal is preserved and backup mutations wait for reconciliation. Confirmed corruption remains subject to the existing bounded repair policy. Automatic retries do not launch a remote repair or reset repair attempts. An identified partial clone can use the existing journaled quarantine slot. Unowned partials, Git lock files, occupied quarantine slots with a new partial, and manual-attention markers block retry execution.
+
+RepoHarbor writes the retry claim before Git starts. Startup recovery applies proven completions once and preserves incomplete data. An attempt interrupted by SIGTERM or left without proof of completion by SIGKILL consumes its claim and is marked interrupted. A pending retry with a durable temporary failure can still run after startup under the current eligibility rules.
 
 ## Offline restore safety
 

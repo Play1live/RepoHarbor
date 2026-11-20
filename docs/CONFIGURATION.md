@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.6.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.7.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,7 +24,10 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. Each is an independent boolean and defaults to `false`. `web_ui`, `auto_retry`, and `extended_logging` must be `false` if supplied. |
+| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. Each is an independent boolean and defaults to `false`. `web_ui` and `extended_logging` must be `false` if supplied. |
+| `retry.max_retries` | Integer from `1` through `10`. Default `3` additional attempts per failure cycle. |
+| `retry.initial_delay_seconds` | Positive integer delay for the first retry. Default `300`. |
+| `retry.max_delay_seconds` | Integer from `1` through `86400`, at least the initial delay. Default `3600`. |
 | `integrity.schedule` | Independent five-field cron expression. Default `0 4 * * 0` (Sunday at 04:00 in `TZ`). |
 | `integrity.include_excluded` | Boolean. Default `true`. Set to `false` to skip excluded mirrors. |
 
@@ -53,6 +56,11 @@ features:
   manual_run: false
   restore_helper: false
   integrity_check: false
+  auto_retry: false
+retry:
+  max_retries: 3
+  initial_delay_seconds: 300
+  max_delay_seconds: 3600
 ```
 
 `REPOHARBOR_CONFIG` can be provided in a Docker Compose multiline environment entry as in the [example stack](../deploy/compose.example.yaml). Use `repoharbor config validate` to validate the configuration and referenced credentials; this command does **not** download from a remote or create backup state.
@@ -203,7 +211,7 @@ GitHub publishes a selection only after all of its configured tokens complete di
 
 Both clients validate pagination against the expected HTTPS authority, endpoint, and query and construct the next request locally. GitHub accepts continuations that omit the affiliation parameter and still sends the configured affiliations on its next request. A full page without continuation headers triggers a locally constructed next-page request to verify completion. GitLab checks increasing IDs and consistent offset metadata. Both use a 4 MiB response limit, a socket timeout of up to 15 seconds, and a 120-second discovery deadline per client checked between requests and body reads. Exceeding a bound fails discovery.
 
-HTTP 429 and rate-limit responses detected on HTTP 403 trigger a cooldown. A successful HTTP 200 with a zero remaining-quota header also sets one. `Retry-After` accepts seconds or an HTTP date. Reset headers use Unix timestamps, with GitLab also accepting an HTTP date in `RateLimit-ResetTime`. The latest applicable time wins. The fallback is 60 seconds when no usable time is available, and a zero-quota success without a usable reset uses at least that fallback. Server cooldowns have no one-day cap. GitLab persists them before reading an HTTP 200 response body and retains them across restart or temporary provider removal. GitHub saves the cooldown as part of the discovery outcome. The journal records `retry_at` as Unix epoch seconds. Both can resume in a later scheduled or manual run after the stored time, without waiting out the cooldown in the scheduler or automatically retrying in the same run.
+HTTP 429 and rate-limit responses detected on HTTP 403 trigger a cooldown. A successful HTTP 200 with a zero remaining-quota header also sets one. `Retry-After` accepts seconds or an HTTP date. Reset headers use Unix timestamps, with GitLab also accepting an HTTP date in `RateLimit-ResetTime`. The latest applicable time wins. The fallback is 60 seconds when no usable time is available, and a zero-quota success without a usable reset uses at least that fallback. Server cooldowns have no one-day cap. GitLab persists them before reading an HTTP 200 response body and retains them across restart or temporary provider removal. GitHub saves the cooldown as part of the discovery outcome. The journal records `retry_at` as Unix epoch seconds. Discovery can resume after the stored time on a later scheduled or manual run, or when an already pending Git retry is eligible. The scheduler continues to process other eligible work during the cooldown.
 
 ### API observation and Git source status
 
@@ -247,7 +255,23 @@ The check is disabled by default. The two fields under `integrity` are optional 
 
 RepoHarbor checks existing, complete mirrors from its local catalog one at a time, including manual HTTPS, GitHub and GitLab sources. This works for retained mirrors when an upstream repository becomes unavailable or a source is removed from configuration. With `include_excluded: false`, it skips excluded repositories and applies current local selection filters for discovered repositories. Partial first clones and pending quarantines are skipped. The check uses structure and pack checks plus `git fsck --full`. It reads local Git data without discovery, remote requests or changes to objects and refs. A clean result establishes local Git integrity within the scope of the check. Upstream reachability and previously deleted content are outside that scope.
 
-Backup and integrity runs share a lock. Overlapping scheduled runs are skipped and counted for the corresponding schedule. No missed run is queued or retried automatically. A manual backup can return `BUSY` (exit `6`) during a check. See [integrity checks and bounded repair](SECURITY.md#integrity-checks-and-bounded-repair) for how a later eligible backup can handle recorded damage.
+Backups, retries, and integrity runs share a lock. Overlapping scheduled runs are skipped and counted for the corresponding schedule. The scheduler advances to the next cron opportunity. A manual backup can return `BUSY` (exit `6`) during a check or retry. See [integrity checks and bounded repair](SECURITY.md#integrity-checks-and-bounded-repair) for how a later eligible backup can handle recorded damage.
+
+## Automatic backup retries
+
+Automatic retries are disabled by default. Enable them by setting `features.auto_retry: true`. The optional `retry` mapping is validated even while the feature is disabled. Booleans, strings, and fractional numbers are rejected for integer settings.
+
+A scheduled or manual backup failure can schedule one retry for the affected repository. Eligible errors include identified HTTPS connection and transfer failures, HTTP 500, 502, 503 and 504, and classified Git timeouts. Retryability requires this specific evidence. Generic `GIT_FAILED`, `source.status: unavailable`, unknown diagnostics, credentials, permissions, missing repositories, TLS certificate failures, and intentional interruption cannot schedule a retry. The manual CLI returns the original attempt's result. Automatic retries can run with `features.manual_run: false`.
+
+The delay doubles after each failed retry until it reaches `retry.max_delay_seconds`. With defaults, retries are due after 5 minutes, another 10 minutes, and another 20 minutes. Subsequent scheduled or manual failures leave an already pending deadline in place. A success from any trigger, including a successful no-change check, clears the pending deadline and resets the cycle counter while preserving the backup and error history. An exhausted cycle remains exhausted until a successful backup.
+
+Retries run individually when the shared execution lock is free, after backup and integrity cron ticks have been evaluated. An active operation keeps the lock until it completes. A cron tick that arrives during a retry follows the existing overlap rule, and a manual request during a retry returns exit `6`. Retry times are independent of cron and never backfill skipped cron ticks.
+
+Before remote Git starts, RepoHarbor rechecks selection, storage and recovery safeguards. Discovered targets, and manual sources on a configured provider authority, require fresh, complete discovery for that authority. Provider cooldowns can defer an already pending retry beyond the maximum backoff without consuming a Git attempt. A failed or incomplete discovery without a cooldown blocks pending retries on the affected authority. Other authorities keep their own state. Exclusion, storage limits, blocked recovery, and failed permanent Git checks end the current automatic schedule. A subsequent eligible scheduled or manual failure can schedule a retry within the remaining limit.
+
+The optional `retry` object in `metadaten.json` follows schema 1. Older metadata requires no migration. The existing operation journal records `trigger: retry` for retry clones and fetches. After local startup recovery, overdue work is considered one repository at a time. A durably claimed attempt whose outcome cannot be proven after interruption remains counted and blocked. A proven Git completion is applied once. Disabling the feature pauses pending retries. A later successful ordinary backup can still clear a saved retry state.
+
+`status` reports `retry.enabled` and the global `retry.pending` count. The count is unknown when enabled and part of the catalog is unreadable. `repositories list` and `repositories show` report the per-repository retry status, whether it is pending, the current cycle count, configured limit, next time, last attempt time and result, safe reason and error codes, and whether the limit has been reached. Text and JSON expose the same fields. Timestamps in the CLI are UTC.
 
 ## CLI commands and exit codes
 
@@ -266,7 +290,7 @@ repoharbor backup run --repository example-demo
 repoharbor backup run --repository gitlab:gitlab.com:234567
 ```
 
-`show` and `--repository` accept a configured manual alias or a stable provider key from `repositories list`. Addresses and URLs used in selection configuration are invalid CLI selectors. `backup run` requires exactly one of `--all` and `--repository`. It requires `features.manual_run: true` and a reachable service. The flag leaves the cron schedule in place. Scheduled and manual backups share the run lock with periodic integrity checks. When manual backups are enabled, an active backup or integrity check causes a new manual request to return exit `6`.
+`show` and `--repository` accept a configured manual alias or a stable provider key from `repositories list`. Addresses and URLs used in selection configuration are invalid CLI selectors. `backup run` requires exactly one of `--all` and `--repository`. It requires `features.manual_run: true` and a reachable service. The flag leaves the cron schedule in place. Scheduled and manual backups, automatic retries, and periodic integrity checks share the run lock. When manual backups are enabled, a current operation causes a new manual request to return exit `6`.
 
 The inspection commands are read-only and work with manual backups disabled. In text output, missing values are shown as `unknown`; JSON uses `null`. A reachable service only confirms that the control socket answered. The global view includes the most recent started and completed runs, the last successful full run, the next cron time in the configured timezone, provider discovery and cooldowns, and the last recorded storage measurement. A single-repository success updates that repository's metadata without advancing the last successful full-run timestamp.
 
@@ -292,7 +316,7 @@ A repository's last periodic result is `healthy` after a complete clean probe, `
 | `3` | Unknown repository in the catalog. |
 | `4` | The requested optional feature is disabled. |
 | `5` | Service unreachable or connection lost. The client cannot confirm the backup result. |
-| `6` | A backup or integrity check is already in progress, or the backup-root lock is held for another operation. |
+| `6` | A backup, retry, or integrity check is already in progress, or the backup-root lock is held for another operation. |
 | `7` | No eligible backup target or the target is excluded. |
 | `8` | Discovery failed or is in cooldown. A full run may have completed some unaffected backups. |
 | `9` | Backup failed, was interrupted, or could not complete, for example because of a storage or recovery block. |

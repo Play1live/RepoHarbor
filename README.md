@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.6.0-64748B)
+![Version](https://img.shields.io/badge/Version-0.7.0-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -20,6 +20,7 @@ RepoHarbor discovers repositories on GitHub.com, GitLab.com, and compatible Self
 - **Git mirror backups:** Complete bare mirrors with branch and tag synchronization, pruning, and offline restoration using Git.
 - **Offline restore and bundle export:** Opt in to restore a local mirror as a working repository or export a verified Git bundle.
 - **Periodic integrity checks:** Opt in to local, read-only verification of existing mirrors on a separate schedule. Results appear in the status CLI.
+- **Automatic retries.** Opt in to retry individual repositories after identified temporary Git failures, with persistent exponential backoff.
 - **Flexible scheduling:** Five-field cron expressions, IANA timezones, daylight-saving handling, and no missed-run backfill or overlapping runs.
 - **Status CLI and manual backups:** Inspect service and repository state in text or JSON. Opt in to full or single-repository backups through the running service.
 - **Storage controls:** Soft global and per-repository limits, per-repository overrides, and a minimum free-space reserve.
@@ -59,7 +60,7 @@ Read-only commands work with the default `features.manual_run: false`. To enable
 
 - On a new, empty backup root, it automatically creates its state files and repository metadata as needed.
 - On subsequent starts, it loads existing state and performs recovery checks when necessary.
-- It then waits for future backup and enabled integrity schedules. Starting the container does not trigger a scheduled backup or periodic check.
+- It then waits for future backup and enabled integrity schedules. When automatic retries are enabled, it can also resume pending repository retries after startup recovery.
 
 The backup root must already exist as a writable, persistent mount. If the state journal is missing from a non-empty backup root, RepoHarbor stops rather than overwriting data. Docker init is intentionally omitted from the Compose file for NAS compatibility. The application handles signals and Git child processes itself; no RepoHarbor initialization switch is needed.
 
@@ -73,6 +74,10 @@ The backup root must already exist as a writable, persistent mount. If the state
 | Self-Managed GitLab | `/backups/gitlab/<host>/<project-id>/`, with an explicit port encoded as `<host>~<port>` |
 
 Each source stores its bare mirror in `repository.git/` and its metadata in `metadaten.json`. Discovery deduplicates overlapping token results by provider, authority, and numeric ID. Renames and transfers within an authority retain the ID path. The central `/backups/data.json` tracks operations, discovery, and scheduler state, including periodic integrity runs.
+
+### Enable automatic retries
+
+Set `features.auto_retry: true` in `REPOHARBOR_CONFIG`. By default, a temporary Git failure allows up to three additional attempts for the affected repository, after successive waits of 5, 10, and 20 minutes. An earlier successful backup cancels the pending retry. Inspect the global pending count with `repoharbor status` and the repository schedule and outcome with `repoharbor repositories show <repository>`. See the [configuration reference](docs/CONFIGURATION.md#automatic-backup-retries).
 
 ### Schedule periodic integrity checks
 
@@ -105,7 +110,7 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.6.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.7.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

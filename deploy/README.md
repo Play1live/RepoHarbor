@@ -1,6 +1,6 @@
-# RepoHarbor 0.6.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.7.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.6.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.7.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.6.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.7.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -252,9 +252,26 @@ docker exec "$container" repoharbor backup run --all
 docker exec "$container" repoharbor backup run --repository example-demo
 ```
 
-The backup command waits for the result. Exit `0` confirms a successful operation or a successful check with no changes. Exit `4` means the feature is disabled, `5` means the service could not be reached or the connection was lost, and `6` means a backup or integrity check already holds the shared lock. Requests do not queue. A disconnected CLI leaves the outcome unconfirmed for that client. Check status and repository timestamps before retrying.
+The backup command waits for the result. Exit `0` confirms a successful operation or a successful check with no changes. Exit `4` means the feature is disabled, `5` means the service could not be reached or the connection was lost, and `6` means a backup, retry, or integrity check already holds the shared lock. Requests do not queue. A disconnected CLI leaves the outcome unconfirmed for that client. Check status and repository timestamps before retrying.
 
 Exit `8` can mean that discovery failed or is in cooldown even if an unaffected source succeeded in a full run. Discovered repositories on the affected authority require fresh discovery. An established eligible manual mirror can continue, while an unproven or new same-authority mirror waits. For exit `9`, check repository backup, error, and repair states and the storage limits. See the [full exit-code table](../docs/CONFIGURATION.md#cli-commands-and-exit-codes).
+
+### Enable automatic retries
+
+Add the following to your existing `REPOHARBOR_CONFIG` YAML. Merge `auto_retry` into your existing `features` mapping.
+
+```yaml
+features:
+  auto_retry: true
+retry:
+  max_retries: 3
+  initial_delay_seconds: 300
+  max_delay_seconds: 3600
+```
+
+Redeploy against the existing persistent backup mount. The settings allow three additional attempts per repository after eligible temporary Git failures. The manual command returns its original result, and the service handles pending retries independently of `features.manual_run`. Use `repoharbor status --json` for the global pending count and `repoharbor repositories show <repository>` for the next attempt, outcome, or blocking reason. A retry uses the same capacity, selection, and recovery safeguards as backups. A provider cooldown can delay its next attempt. See [automatic backup retries](../docs/CONFIGURATION.md#automatic-backup-retries).
+
+On the target NAS and Portainer endpoint, use a disposable repository to simulate a temporary HTTPS outage. Observe the original failure and pending retry, then recreate the container with the same bind mount. Restore access and confirm that one retry completes with the expected update count. Verify that a storage restriction or excluded source blocks remote Git and that an offline restore succeeds from the resulting mirror.
 
 ## 6. Portainer and controlled updates
 
@@ -277,7 +294,7 @@ docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor
 docker compose -f deploy/compose.example.yaml up -d --no-build --force-recreate
 ```
 
-SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references, even though the schema remains version 1. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
+SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references. Version 0.7.0 records automatic retry state as an additive schema-1 extension. Review pending work and reconcile interrupted operations before changing versions. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
 
 ## 7. Quarantine and troubleshooting
 
@@ -287,7 +304,7 @@ For `manual_attention_required`, **stop the service before touching backup data*
 
 | Symptom | Safe checks |
 |---|---|
-| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, and `integrity.include_excluded` must be booleans. Verify both cron expressions. `web_ui`, `auto_retry`, and `extended_logging` must remain disabled. |
+| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, `features.auto_retry`, and `integrity.include_excluded` must be booleans. Verify both cron expressions and the retry bounds. `web_ui` and `extended_logging` must remain disabled. |
 | Git access denied / token expired | Source permission, credential mode, token rotation; never put credentials into a remote URL or debug output. |
 | TLS error | Server certificate and trusted CA bundle; never disable verification. |
 | Mount / `EACCES` | Actual host filesystem, ACLs, UID/GID 10001, read-only secret bind; do not switch to a privileged container. |
