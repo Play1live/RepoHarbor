@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.7.0-64748B)
+![Version](https://img.shields.io/badge/Version-0.8.0-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -21,6 +21,7 @@ RepoHarbor discovers repositories on GitHub.com, GitLab.com, and compatible Self
 - **Offline restore and bundle export:** Opt in to restore a local mirror as a working repository or export a verified Git bundle.
 - **Periodic integrity checks:** Opt in to local, read-only verification of existing mirrors on a separate schedule. Results appear in the status CLI.
 - **Automatic retries.** Opt in to retry individual repositories after identified temporary Git failures, with persistent exponential backoff.
+- **Extended logging and rotation:** Opt in to structured text or JSON events and optional rotating files on a dedicated log mount. The Compose example limits Docker logs independently.
 - **Flexible scheduling:** Five-field cron expressions, IANA timezones, daylight-saving handling, and no missed-run backfill or overlapping runs.
 - **Status CLI and manual backups:** Inspect service and repository state in text or JSON. Opt in to full or single-repository backups through the running service.
 - **Storage controls:** Soft global and per-repository limits, per-repository overrides, and a minimum free-space reserve.
@@ -83,6 +84,10 @@ Set `features.auto_retry: true` in `REPOHARBOR_CONFIG`. By default, a temporary 
 
 Set `features.integrity_check: true` in `REPOHARBOR_CONFIG`. The default schedule is Sundays at 04:00 in `TZ`. Checks run one mirror at a time, cover excluded mirrors by default, and use local Git data without fetching. They share the execution lock with backups. See the [configuration reference](docs/CONFIGURATION.md#periodic-integrity-checks) for options and the [deployment guide](deploy/README.md#enable-periodic-integrity-checks) for status and recovery procedures.
 
+### Enable extended logging
+
+Set `features.extended_logging: true` for events covering backups, discovery, retries, integrity, recovery, and offline restore. The console defaults to text at `INFO`. Set `logging.format: json` for one event per line. File output is a separate opt-in and uses a dedicated persistent bind mount. Existing v0.7.0 deployments can update in place with their current backup and secret mounts and schema-1 state. [Logging configuration](docs/CONFIGURATION.md#extended-logging) · [Docker and NAS setup](deploy/README.md#configure-log-retention)
+
 ### Restore or export a mirror
 
 Stop the backup service and run the CLI with `features.restore_helper: true`. The assistant reads the local mirror and catalog without network access or provider credentials.
@@ -110,7 +115,7 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.7.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.8.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

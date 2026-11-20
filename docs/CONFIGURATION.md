@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.7.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
+RepoHarbor `0.8.0` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. GitHub Enterprise discovery, SSH, and the web dashboard are outside this version's scope.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -24,12 +24,18 @@ For installation, host mounts, and Portainer instructions, see the [deployment g
 | `storage.min_free_gib` | Minimum physical free-space reserve; default `2`. Cannot be `null`. |
 | `recovery.automatic_repair` | Boolean; default `true`. |
 | `recovery.max_repair_attempts_per_incident` | Integer from `1` through `3`; default `3`. |
-| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. Each is an independent boolean and defaults to `false`. `web_ui` and `extended_logging` must be `false` if supplied. |
+| `features` | `manual_run: true` enables CLI-triggered backups. `restore_helper: true` enables offline restore and bundle export. `integrity_check: true` enables periodic local mirror checks. `auto_retry: true` enables automatic backup retries. `extended_logging: true` enables structured events. Each is an independent boolean and defaults to `false`. `web_ui` must be `false` if supplied. |
 | `retry.max_retries` | Integer from `1` through `10`. Default `3` additional attempts per failure cycle. |
 | `retry.initial_delay_seconds` | Positive integer delay for the first retry. Default `300`. |
 | `retry.max_delay_seconds` | Integer from `1` through `86400`, at least the initial delay. Default `3600`. |
 | `integrity.schedule` | Independent five-field cron expression. Default `0 4 * * 0` (Sunday at 04:00 in `TZ`). |
 | `integrity.include_excluded` | Boolean. Default `true`. Set to `false` to skip excluded mirrors. |
+| `logging.level` | Minimum event severity. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. Default `INFO`. |
+| `logging.format` | `text` for readable key/value lines or `json` for JSON Lines. Default `text`. |
+| `logging.file.enabled` | Boolean. Default `false`. Requires `features.extended_logging: true` when enabled. |
+| `logging.file.path` | Absolute path to a `.log` file immediately inside a dedicated mount. Default `/logs/repoharbor.log`. |
+| `logging.file.max_size_mib` | Integer from 1 through 100. Default 10 MiB. |
+| `logging.file.backup_count` | Integer from 1 through 20. Default 5 archives in addition to the active file. |
 
 An example configuration with invented sources and values:
 
@@ -57,6 +63,7 @@ features:
   restore_helper: false
   integrity_check: false
   auto_retry: false
+  extended_logging: false
 retry:
   max_retries: 3
   initial_delay_seconds: 300
@@ -276,6 +283,35 @@ A repository can accumulate up to three discovery deferrals per Git retry cycle.
 The optional `retry` object in `metadaten.json` follows schema 1. Older metadata requires no migration. The existing operation journal records `trigger: retry` for retry clones and fetches. After local startup recovery, overdue work is considered one repository at a time. A durably claimed attempt whose outcome cannot be proven after interruption remains counted and blocked. A proven Git completion is applied once. Disabling the feature pauses pending retries. A later successful ordinary backup can still clear a saved retry state.
 
 `status` reports `retry.enabled` and the global `retry.pending` count. The count is unknown when enabled and part of the catalog is unreadable. `repositories list` and `repositories show` report the per-repository retry status, whether it is pending, the current cycle count, configured limit, next time, last attempt time and result, safe reason and error codes, and whether the Git limit has been reached. Discovery deferrals also expose `discovery_deferred`, `next_discovery_check_at`, `discovery_deferrals`, and `max_discovery_deferrals`. `block_reason` distinguishes a temporary discovery wait, a provider cooldown, and terminal discovery blocks. Text and JSON expose the same fields. Timestamps in the CLI are UTC.
+
+## Extended logging
+
+Enable structured events independently of the other optional features. Leave file output disabled for console-only operation without a log mount.
+
+```yaml
+features:
+  extended_logging: true
+logging:
+  level: INFO
+  format: text
+  file:
+    enabled: false
+    path: /logs/repoharbor.log
+    max_size_mib: 10
+    backup_count: 5
+```
+
+The service writes events to stderr, where Docker captures them. Application output from commands such as `status --json` remains on stdout. With the feature disabled, the service uses its original console messages. The optional mapping is validated in both modes. Unknown keys, incorrect types, booleans for integer settings, and file output without extended logging are configuration errors. `config validate` checks settings and credentials. The service checks the actual log mount and file permissions at startup, and offline restore checks them after taking its normal backup lock.
+
+Every event carries a UTC ISO 8601 timestamp, a level, and a stable event name. Where available, it also carries a repository alias or stable ID, a run ID, a journal operation ID, and a monotonic duration in milliseconds. For example, with JSON output a single line can read
+
+```json
+{"timestamp":"2026-01-01T12:00:00.000Z","level":"INFO","event":"backup.completed","repository":"example-demo","run_id":"0e511d66e2be4bea98b9b6af39a5512a","duration_ms":1250,"result":"success"}
+```
+
+Event namespaces cover `service.*`, `backup.*`, `discovery.*`, `retry.*`, `integrity.*`, `recovery.*`, `repair.*`, and `restore.*`. Some per-mirror details, such as healthy integrity results, use `DEBUG`. Treat timestamps and IDs as operational metadata. Confirm backup and recovery results through the status CLI and schema-1 state files.
+
+File paths use slash-separated components of up to 128 ASCII characters, starting with a letter, digit, underscore, or hyphen. The remaining characters may also include dots. The full path is limited to 1,024 characters. Reserve the selected file and its numbered suffixes for RepoHarbor. The service appends to the existing active file and rotates it before an entry would push it over the size limit. Rotation shifts archives with `.1` as the newest. Reducing the archive count removes surplus managed archives at startup. Previously larger files age out through rotation. Choose a fresh filename when changing formats if a parser needs an entire file to use a single format. [Bind-mount setup and retention](../deploy/README.md#configure-log-retention)
 
 ## CLI commands and exit codes
 

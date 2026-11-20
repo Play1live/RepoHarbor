@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.7.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.8.0`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -131,6 +131,14 @@ Use trusted backup and output filesystems. The assistant checks the target's par
 SIGTERM and SIGINT stop Git work and allow staging cleanup. A forced SIGKILL can leave a private staging directory. A surviving Git process retains the root lock until it exits. Treat the staging directory as incomplete and wait for all related processes to exit before removing it. You can retry with a new output path. ENOSPC and other write failures are reported as errors. For a late failure after the atomic rename, such as a directory synchronization error, a complete result may already be present. Check the final path and verify the result before retrying.
 
 Use the [manual Git procedure](../deploy/README.md#recover-directly-with-git) if the RepoHarbor state cannot be validated but you have an independently verified, intact mirror. The operator must keep writers stopped and choose a safe separate destination for that procedure.
+
+## Extended logging and log storage
+
+Event fields contain approved identifiers, counts, outcomes, and internal error codes. This also applies at `DEBUG`. Provider diagnostics, Git output, exception text, credential names and values, secret-file contents, and repository contents stay out of extended events. Repository IDs, aliases, provider authorities, and operational timing may still be confidential. Limit Docker-log access and persistent-log access to authorized operators.
+
+File logging requires a dedicated writable Linux mount disjoint from the backup root and secret directory. RepoHarbor rejects paths through symlinks and mount aliases of protected storage. It checks that active and archived logs are private, service-owned regular files with mode `0600`, and rejects hard links and independently mounted log files. Use a log directory owned by the service UID with mode `0700`. Keep the host mount source and its parents under trusted administrative control. The directory lock allows one log writer at a time. Only the active file and its configured numbered archive namespace are managed.
+
+Invalid file setup causes a safe startup diagnosis. If the file sink fails during operation, RepoHarbor emits one `logging.file_failed` event on stderr and continues with console output until restart. State remains in `data.json`, `metadaten.json`, and the operations journal. Logs provide diagnostic context and carry no durability guarantee. Use the journal and validated mirrors to establish the outcome of interrupted Git work. [Deployment and troubleshooting](../deploy/README.md#configure-log-retention)
 
 ## Scope and operational acceptance
 

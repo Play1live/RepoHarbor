@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.7.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.8.0` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, an authenticated loopback HTTPS server, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -28,7 +28,7 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 |---|---:|
 | Total line coverage | **90%** |
 | Total branch coverage | **85%** |
-| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `git_backup`, `gitlab`, `integrity`, `persistence`, `recovery`, `restore`, `selection`, `storage`) | **95%** |
+| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `events`, `git_backup`, `gitlab`, `integrity`, `log_files`, `mounts`, `persistence`, `recovery`, `restore`, `selection`, `storage`) | **95%** |
 
 `scripts/check_coverage.py` enforces these independently using `coverage.json`, including a check that branch-coverage data is present. A green pytest result alone does not replace the separate coverage gate.
 
@@ -47,6 +47,8 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 | Periodic integrity configuration and scheduler | Boolean opt-in, independence from manual backups and restore, cron validation, timezone and DST behavior, skipped ticks and no backfill, shared exclusivity with backup runs, and durable overlap counts. |
 | Periodic Git integrity and selection | Full local checks of manual, GitHub and GitLab mirrors, confirmed corrupt objects, refs and packs, orphan pack/index pairs, empty mirrors, dangling objects, excluded and removed sources, and checks without provider access. |
 | Periodic integrity recovery and status | SIGTERM, SIGKILL, timeouts, filesystem errors and restart with partial progress. Offline object restoration followed by a healthy recheck, preservation of repair history and backup metrics, intact independent safeguards, and compatible text and JSON views. |
+| Extended logging | Strict opt-in configuration, level filtering, text and JSON Lines, UTC timestamps and monotonic durations, run and operation IDs, event coverage, and fictional secret exclusion at `DEBUG`. |
+| Secure log rotation | Bounded and ordered archives, byte limits, append on restart, mount aliases and symlinks, hard links, file ownership and permissions, concurrent emission, and injected short writes, ENOSPC and EIO. File errors preserve successful Git and journal outcomes. |
 | Restore configuration and paths | Boolean flags and their independence, protected backup and secrets paths, symbolic links, traversal, and bind-mount aliases. |
 | Offline restore and bundle integration | Real Git mirrors for manual, GitHub, GitLab.com, and Self-Managed GitLab IDs. Tests cover excluded and unavailable sources, alternate branch selection, missing default branches, empty mirrors, corrupt objects, and reference preservation. They verify standalone bundles through offline clone and reject truncated or incomplete exports. |
 | Restore locking and fault injection | Active backup lock, competing restore, SIGTERM and SIGKILL during staged Git operations, inherited locks, ENOSPC/EIO, and destination races. Tests check safe retry, preservation of the original backup, and the absence of prematurely published output. |
@@ -72,7 +74,7 @@ docker build -t repoharbor:local-test .
 python3 tests/docker/smoke.py
 ```
 
-The Docker smoke test verifies the version and config CLI, the bind mount, the unprivileged user, and the absence of TCP listeners before starting the test Git fixture. It inspects status with `docker exec`, checks that a disabled manual request returns exit `4`, and exercises full and targeted runs against a local HTTPS Git fixture with manual execution enabled. It also verifies the root lock, graceful SIGTERM with and without Docker init, and state retention on container recreation. The restore smoke tests use separate `--network none` containers with a read-only root filesystem, a read-only backup bind mount, and a writable export bind mount. They verify that the running service blocks a restore, then check a restored working tree and a bundle imported in another container with only the export mount. The automatic retry smoke test returns HTTP 503 from the fixture, verifies the original CLI failure, and waits for a successful no-change retry with its existing update count. The periodic integrity smoke test also verifies that a disabled schedule stays idle, an enabled schedule distinguishes intact and damaged mirrors with networking disabled, and a restart retains the findings. It checks that the scan leaves Git mirror contents and backup success metrics intact. Production NAS filesystems, live provider APIs and Portainer need separate acceptance tests.
+The Docker smoke test verifies the version and config CLI, the bind mount, the unprivileged user, and the absence of TCP listeners before starting the test Git fixture. It inspects status with `docker exec`, checks that a disabled manual request returns exit `4`, and exercises full and targeted runs against a local HTTPS Git fixture with manual execution enabled. It also verifies the root lock, graceful SIGTERM with and without Docker init, and state retention on container recreation. The restore smoke tests use separate `--network none` containers with a read-only root filesystem, a read-only backup bind mount, and a writable export bind mount. They verify that the running service blocks a restore, then check a restored working tree and a bundle imported in another container with only the export mount. The automatic retry smoke test returns HTTP 503 from the fixture, verifies the original CLI failure, and waits for a successful no-change retry with its existing update count. The periodic integrity smoke test also verifies that a disabled schedule stays idle, an enabled schedule distinguishes intact and damaged mirrors with networking disabled, and a restart retains the findings. It checks that the scan leaves Git mirror contents and backup success metrics intact. The logging smoke test checks the required separate mount, Docker log-driver settings, file rotation, and retention across SIGTERM and SIGKILL. Production NAS filesystems, live provider APIs and Portainer need separate acceptance tests.
 
 For an authorized TLS-intercepting build proxy, the Dockerfile supports an optional BuildKit CA secret:
 
@@ -130,3 +132,5 @@ Ruff, format checks, strict mypy, Bandit at the CI medium/high threshold, depend
 The [root README](../README.md) summarizes the architecture and supported features. The [deployment guide](../deploy/README.md) provides host and Portainer setup plus offline restore, while [SECURITY.md](SECURITY.md) documents the data-preservation rules.
 
 Before production use, an operator must separately verify the actual host NAS mount, filesystem locking and durability, UID/GID and ACL permissions, selected credential mode, a real scheduled backup, recorded timestamps, controlled container restart, and a complete offline restore. Automated validation or an apparently healthy Docker container is **not** evidence of a successful backup.
+
+For deployments that enable file output, verify the dedicated log bind mount, effective UID/GID, ACLs, private files, and directory locking on the real filesystem. Run a disposable backup, confirm the expected console and file events, and test both size-based retention limits. Recreate the container with the same mounts and verify that the active application log is appended. Stop the service and verify the original mirror can still be restored offline.

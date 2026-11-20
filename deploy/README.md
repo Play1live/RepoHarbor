@@ -1,6 +1,6 @@
-# RepoHarbor 0.7.0 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.8.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.7.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.8.0**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.7.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.8.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -273,6 +273,30 @@ Redeploy against the existing persistent backup mount. The settings allow three 
 
 On the target NAS and Portainer endpoint, use a disposable repository to simulate a temporary HTTPS outage. Observe the original failure and pending retry, then recreate the container with the same bind mount. Restore access and confirm that one retry completes with the expected update count. Verify that a storage restriction or excluded source blocks remote Git and that an offline restore succeeds from the resulting mirror.
 
+### Configure log retention
+
+The Compose example uses Docker's `json-file` driver with `max-size: "10m"` (10 MiB per file) and `max-file: "5"` (five files total, including the active one). This is about 50 MiB of Docker-log storage per container, plus record and filesystem overhead. Both basic and extended console output remain available through `docker compose logs` and Portainer. Docker applies these settings when it creates the container.
+
+For structured console events, add `extended_logging: true` under the existing `features` mapping in `REPOHARBOR_CONFIG`. For persistent application logs, also set `logging.file.enabled: true` and mount the directory that directly contains `logging.file.path`. The default path is `/logs/repoharbor.log`.
+
+On the Docker host, provision a **separate** directory owned by the container UID/GID. With the default identity, a host administrator can use
+
+```sh
+install -d -m 0700 -o 10001 -g 10001 /srv/repoharbor/logs
+```
+
+Add the bind mount to the service's existing `volumes` list in Compose or Portainer. Keep the existing backup and secret mounts.
+
+```yaml
+- type: bind
+  source: /srv/repoharbor/logs
+  target: /logs
+  bind:
+    create_host_path: false
+```
+
+The application defaults allow one active file and five archives at 10 MiB each (about 60 MiB), separate from the Docker log budget. If logs and backups share a physical device, provision space for both and the backup free-space reserve. On a NAS, verify that effective permissions and locking allow the UID to create, append, and rename logs, and that only authorized operators can read the files. If offline restore uses the same logging settings, pass the same log mount to the restore container after stopping the service. Use the console-only configuration for a restore without that mount. [Formats, levels, and limits](../docs/CONFIGURATION.md#extended-logging)
+
 ## 6. Portainer and controlled updates
 
 The image must exist on the **same Docker endpoint managed by Portainer**. Do not assume the web-based stack editor builds the image. Build it on the endpoint first, then paste or import the Compose definition in Portainer and **remove the `build:` block**, leaving `image: repoharbor:local-test`. Bind paths refer to the Docker host, not the browser computer. No registry publication or automatic image availability is assumed.
@@ -294,7 +318,7 @@ docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor
 docker compose -f deploy/compose.example.yaml up -d --no-build --force-recreate
 ```
 
-SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references. Version 0.7.0 records automatic retry state as an additive schema-1 extension. Review pending work and reconcile interrupted operations before changing versions. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
+SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references. An upgrade from 0.7.0 keeps schema 1 for configuration, state, metadata, and the journal. Existing retry state carries forward. Extended logging is opt-in and the example's Docker retention settings take effect after recreation. Review pending work and reconcile interrupted operations before changing versions. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
 
 ## 7. Quarantine and troubleshooting
 
@@ -304,7 +328,10 @@ For `manual_attention_required`, **stop the service before touching backup data*
 
 | Symptom | Safe checks |
 |---|---|
-| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, `features.auto_retry`, and `integrity.include_excluded` must be booleans. Verify both cron expressions and the retry bounds. `web_ui` and `extended_logging` must remain disabled. |
+| Invalid configuration | YAML indentation, `schema_version: 1`, supported fields, alias and credential names. `features.manual_run`, `features.restore_helper`, `features.integrity_check`, `features.auto_retry`, `features.extended_logging`, and `integrity.include_excluded` must be booleans. Verify the cron expressions and retry and logging bounds. Keep `web_ui: false`. |
+| `LOG_MOUNT_MISSING` / `LOG_MOUNT_UNSAFE` | Check the actual log bind-mount target, the dedicated host directory, UID/GID, and ACLs. |
+| `LOG_FILE_UNSAFE` / `LOG_FILE_UNAVAILABLE` | Check for mode `0600`, matching UID, single-link regular files, sufficient access and space, and a single writer. |
+| `logging.file_failed` | Check the log mount's free space, filesystem health, and permissions. Console logging continues. Restart to resume file logging after correcting the host issue. |
 | Git access denied / token expired | Source permission, credential mode, token rotation; never put credentials into a remote URL or debug output. |
 | TLS error | Server certificate and trusted CA bundle; never disable verification. |
 | Mount / `EACCES` | Actual host filesystem, ACLs, UID/GID 10001, read-only secret bind; do not switch to a privileged container. |

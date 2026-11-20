@@ -5,6 +5,11 @@ services:
     image: repoharbor:local-test
     user: "10001:10001"
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     stop_grace_period: 5m
     security_opt:
       - no-new-privileges:true
@@ -45,3 +50,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
+      # With extended_logging and logging.file.enabled set to true, add:
+      # - type: bind
+      #   source: /srv/repoharbor/logs
+      #   target: /logs
+      #   bind:
+      #     create_host_path: false
