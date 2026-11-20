@@ -1,19 +1,23 @@
 import io
 import json
+import os
 import subprocess
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from repoharbor import log_files
 from repoharbor.config import Config, Provider, Source, Storage
 from repoharbor.credentials import Credentials
 from repoharbor.engine import Engine
 from repoharbor.git_backup import Git
 from repoharbor.github import parse_repository
+from repoharbor.mounts import Mount
 from repoharbor.persistence import Store
 from repoharbor.providers import Observation
 from repoharbor.selection import Selection
@@ -81,10 +85,12 @@ def factory(tmp_path, remote):
     )
 
     @contextmanager
-    def create(config=None, checkpoint=None, git_instance=None):
+    def create(config=None, checkpoint=None, git_instance=None, *, events=None):
         config = config or cfg
         with Store(root) as store:
-            engine = Engine(config, store, git_instance or LocalGit(remote[1]))
+            engine = Engine(
+                config, store, git_instance or LocalGit(remote[1]), events=events
+            )
             if checkpoint is not None:
                 engine.checkpoint = checkpoint
             engine.inventory()
@@ -93,6 +99,27 @@ def factory(tmp_path, remote):
     create.config = cfg
     create.root = root
     return create
+
+
+@pytest.fixture
+def log_mount(tmp_path, monkeypatch):
+    logs = tmp_path / "logs"
+    logs.mkdir(mode=0o700)
+    fd = os.open(logs, log_files.DIRECTORY_FLAGS)
+    try:
+        mount = log_files.mount_id(fd)
+    finally:
+        os.close(fd)
+    # Synthetic mount table. Descriptor traversal, permissions and I/O are real.
+    monkeypatch.setattr(
+        log_files,
+        "read_mounts",
+        lambda _: {
+            Path("/"): Mount(b"1:1", Path("/"), mount, b"ext4"),
+            logs: Mount(b"1:1", logs, mount, b"ext4"),
+        },
+    )
+    return logs
 
 
 @pytest.fixture

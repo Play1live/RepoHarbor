@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.0
+
+- Add opt-in structured text and JSON Lines events for service lifecycle, backups, discovery, retries, integrity, recovery, quarantine, and offline restore.
+- Add optional private log files with size-based rotation, bounded archives, and a console diagnosis if the file sink fails. The log directory uses a dedicated persistent mount.
+- Limit Docker container logs independently in the Compose example. Configuration and persistence remain at schema 1, with existing v0.7.0 state retained.
+
 ## 0.7.0
 
 - Add opt-in automatic retries for individual GitHub, GitLab, and manual HTTPS backups after classified temporary Git failures. The default backoff allows three additional attempts after successive waits of 5, 10, and 20 minutes.

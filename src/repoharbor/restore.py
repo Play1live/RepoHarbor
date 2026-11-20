@@ -5,7 +5,6 @@ import errno
 import fcntl
 import logging
 import os
-import re
 import shutil
 import signal
 import stat
@@ -20,7 +19,10 @@ from repoharbor.catalog import directory, read_metadata
 from repoharbor.config import Config
 from repoharbor.credentials import Credentials
 from repoharbor.errors import GitError, HarborError, Result
+from repoharbor.events import Events
 from repoharbor.git_backup import Git
+from repoharbor.log_files import LogSetupError
+from repoharbor.mounts import aliases_protected_mount as aliases_protected_mount
 from repoharbor.persistence import read_json, safe_tree, validate_state
 
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -115,36 +117,6 @@ def mirror_path(root: Path, repository: str) -> Path:
             "Mirror is incomplete, externally linked or has Git lock files"
         )
     return mirror
-
-
-def aliases_protected_mount(
-    parent: Path, protected: tuple[Path, ...], mountinfo: Path
-) -> bool:
-    """Compare filesystem-relative paths to detect bind aliases of protected data."""
-
-    def decode(value: bytes) -> Path:
-        raw = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), value)
-        return Path(os.fsdecode(raw))
-
-    mounts = {}
-    for line in mountinfo.read_bytes().splitlines():
-        _, _, device, root, point, *_ = line.split()
-        mounts[decode(point)] = (device, decode(root))
-
-    def location(path: Path) -> tuple[bytes, Path]:
-        for mount in (path, *path.parents):
-            if mount in mounts:
-                device, root = mounts[mount]
-                return device, root / path.relative_to(mount)
-        raise HarborError("Restore destination mount could not be verified")
-
-    device, relative = location(parent)
-    candidates = set(protected)
-    candidates.update(p for p in mounts if any(p.is_relative_to(q) for q in protected))
-    return any(
-        device == other_device and relative.is_relative_to(other_path)
-        for other_device, other_path in map(location, candidates)
-    )
 
 
 @contextmanager
@@ -322,6 +294,7 @@ def transfer(
     bundle: Path,
     refs: dict[str, tuple[str, str]],
     head: str,
+    events: Events | None = None,
 ) -> None:
     expected = {name: oid for name, (oid, _) in refs.items()}
     head_oid = expected.get(head) if head.startswith("refs/") else head
@@ -332,6 +305,8 @@ def transfer(
             Result.RESTORE_FAILED, "Empty mirror cannot be exported as a Git bundle"
         )
     git_at(git, view, "bundle", "create", str(bundle), "--all")
+    if events is not None:
+        events.log("restore.bundle_created")
     # Verify prerequisites before importing anything into a completely empty repo.
     git_at(git, repo, "bundle", "verify", str(bundle))
     listed = [
@@ -343,6 +318,8 @@ def transfer(
         raise RestoreError(
             Result.RESTORE_FAILED, "Git bundle reference verification failed"
         )
+    if events is not None:
+        events.log("restore.bundle_verified")
     refspecs = ["+refs/*:refs/*"] if refs else []
     if head_oid:
         refspecs.append("HEAD")
@@ -402,18 +379,35 @@ def checkout(
         git_at(git, repo, "symbolic-ref", "HEAD", head)
 
 
-def restore(config: Config, args: Namespace) -> Result:
-    if not config.restore_helper:
-        logging.error("Restore commands are disabled (features.restore_helper)")
-        return Result.FEATURE_DISABLED
+def restore(config: Config, args: Namespace, events: Events | None = None) -> Result:
+    event_log = events if events is not None else Events()
+    with event_log.run() as started:
+        if not config.restore_helper:
+            event_log.log(
+                "restore.failed",
+                logging.ERROR,
+                result=Result.FEATURE_DISABLED.name,
+                legacy=("Restore commands are disabled (features.restore_helper)",),
+            )
+            return Result.FEATURE_DISABLED
+        return restore_local(config, args, event_log, started)
+
+
+def restore_local(
+    config: Config, args: Namespace, events: Events, started: float | None
+) -> Result:
     stop = threading.Event()
+    repository = None
     try:
         with ExitStack() as stack:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 previous = signal.signal(sig, lambda *_: stop.set())
                 stack.callback(signal.signal, sig, previous)
             fd = stack.enter_context(locked_root(config.root))
+            events.open_file(config)
             mirror = mirror_path(config.root, args.repository)
+            repository = args.repository
+            events.log("restore.started", repository=repository, kind=args.action)
             cloning = args.action == "clone"
             value = args.destination if cloning else args.output
             parent_fd, target = stack.enter_context(destination(config, value))
@@ -458,7 +452,7 @@ def restore(config: Config, args: Namespace) -> Result:
             bundle = stage / "export.bundle"
             init_repo(git, repo, object_format, bare=not cloning)
             if not cloning or refs or not head.startswith("refs/"):
-                transfer(git, view, repo, bundle, refs, head)
+                transfer(git, view, repo, bundle, refs, head, events)
             if cloning:
                 checkout(git, repo, refs, head, branch)
                 artifact = repo
@@ -477,21 +471,58 @@ def restore(config: Config, args: Namespace) -> Result:
                 )
             publish(artifact, parent_fd, target.name)
             os.fsync(parent_fd)
+    except LogSetupError:
+        raise
     except RestoreError as error:
-        logging.error("%s", error)
+        events.log(
+            "restore.failed",
+            logging.ERROR,
+            started=started,
+            repository=repository,
+            result=error.result.name,
+            kind=args.action,
+            legacy=("%s", error),
+        )
         return error.result
     except OSError as error:
         code = errno.errorcode.get(error.errno or 0, "FILESYSTEM_ERROR")
-        logging.error("Restore filesystem operation failed (%s)", code)
+        events.log(
+            "restore.failed",
+            logging.ERROR,
+            started=started,
+            repository=repository,
+            result=Result.DESTINATION_FAILED.name,
+            error_code=code,
+            kind=args.action,
+            legacy=("Restore filesystem operation failed (%s)", code),
+        )
         return Result.DESTINATION_FAILED
     except (HarborError, ValueError, RuntimeError) as error:
-        if stop.is_set():
-            logging.error("Restore interrupted")
-        elif isinstance(error, HarborError):
-            logging.error("%s", error)
-        else:
-            logging.error("Invalid restore state or path")
+        legacy = (
+            ("Restore interrupted",)
+            if stop.is_set()
+            else ("%s", error)
+            if isinstance(error, HarborError)
+            else ("Invalid restore state or path",)
+        )
+        events.log(
+            "restore.failed",
+            logging.ERROR,
+            started=started,
+            repository=repository,
+            result=Result.RESTORE_FAILED.name,
+            kind=args.action,
+            legacy=legacy,
+            error_code="INTERRUPTED" if stop.is_set() else None,
+        )
         return Result.RESTORE_FAILED
+    events.log(
+        "restore.completed",
+        started=started,
+        repository=repository,
+        kind=args.action,
+        result="success",
+    )
     print(
         "Repository restored successfully"
         if cloning

@@ -6,6 +6,9 @@ from pathlib import Path
 
 CRITICAL = {
     "catalog",
+    "events",
+    "log_files",
+    "mounts",
     "control",
     "persistence",
     "recovery",

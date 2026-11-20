@@ -443,8 +443,163 @@ for p in sorted(root.rglob('*')):
             docker("rm", "-f", container)
 
 
+def logging_smoke():
+    yaml = (
+        "schema_version: 1\nfeatures: {extended_logging: true}\n"
+        "logging: {format: json, file: {enabled: true, "
+        "max_size_mib: 1, backup_count: 2}}"
+    )
+    env = ["-e", "REPOHARBOR_TOKEN_SOURCE=env", "-e", f"REPOHARBOR_CONFIG={yaml}"]
+    missing = subprocess.run(
+        ["docker", "run", "--rm", *env, IMAGE],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert missing.returncode == 1
+    assert json.loads(missing.stderr)["error_code"] == "LOG_MOUNT_MISSING"
+
+    with tempfile.TemporaryDirectory() as directory:
+        backups = Path(directory) / "backup"
+        backups.mkdir()
+        backups.chmod(0o777)
+        logs = Path(directory) / "logs"
+        logs.mkdir()
+        log_mount = f"type=bind,src={logs},dst=/logs"
+        backup_mount = f"type=bind,src={backups},dst=/backups"
+
+        def as_owner(code):
+            return docker(
+                "run",
+                "--rm",
+                "--mount",
+                log_mount,
+                "--entrypoint",
+                "python",
+                IMAGE,
+                "-c",
+                code,
+            )
+
+        def fixture_setup(code):
+            # Set up and remove the host-side fixture. The service uses its image UID.
+            return docker(
+                "run",
+                "--rm",
+                "--user",
+                "0",
+                "--mount",
+                log_mount,
+                "--entrypoint",
+                "python",
+                IMAGE,
+                "-c",
+                code,
+            )
+
+        fixture_setup(
+            "import os; os.chown('/logs', 10001, 10001); os.chmod('/logs', 0o700)"
+        )
+        try:
+            as_owner(
+                "import os; from pathlib import Path; "
+                "p = Path('/logs/repoharbor.log'); "
+                "p.touch(mode=0o600); p.write_bytes(b'{}\\n'); "
+                "os.truncate(p, 1024**2)"
+            )
+            container = docker(
+                "run",
+                "-d",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--log-driver",
+                "json-file",
+                "--log-opt",
+                "max-size=10m",
+                "--log-opt",
+                "max-file=5",
+                *env,
+                "--mount",
+                log_mount,
+                "--mount",
+                backup_mount,
+                IMAGE,
+            )
+            try:
+
+                def wait_ready_count(expected):
+                    deadline = time.monotonic() + 30
+                    while docker("logs", container).count('"service.ready"') < expected:
+                        assert time.monotonic() < deadline, docker("logs", container)
+                        threading.Event().wait(0.1)
+
+                wait_ready_count(1)
+                info = json.loads(docker("inspect", container))[0]
+                log_config = info["HostConfig"]["LogConfig"]
+                assert log_config == {
+                    "Type": "json-file",
+                    "Config": {
+                        "max-file": "5",
+                        "max-size": "10m",
+                    },
+                }
+                active = "/logs/repoharbor.log"
+                read_log = (
+                    "from pathlib import Path; "
+                    f"print(Path({active!r}).read_text(), end='')"
+                )
+                records = [
+                    json.loads(line)
+                    for line in docker(
+                        "exec", container, "python", "-c", read_log
+                    ).splitlines()
+                ]
+                assert [item["event"] for item in records] == [
+                    "service.started",
+                    "service.ready",
+                ]
+                assert as_owner(
+                    "from pathlib import Path; "
+                    "print(Path('/logs/repoharbor.log.1').stat().st_size)"
+                ) == str(1024**2)
+                inode_code = (
+                    f"from pathlib import Path; print(Path({active!r}).stat().st_ino)"
+                )
+                inode = as_owner(inode_code)
+                docker("stop", "-t", "15", container)
+                assert '"service.stopped"' in docker("logs", container)
+                docker("start", container)
+                wait_ready_count(2)
+                assert as_owner(inode_code) == inode
+                docker("kill", "--signal", "KILL", container)
+                docker("start", container)
+                wait_ready_count(3)
+                assert as_owner(inode_code) == inode
+                assert [
+                    item["event"]
+                    for item in map(json.loads, as_owner(read_log).splitlines())
+                ].count("service.ready") == 3
+                assert (
+                    json.loads(docker("exec", container, "cat", "/backups/data.json"))[
+                        "active_operation"
+                    ]
+                    is None
+                )
+            finally:
+                docker("rm", "-f", container)
+        finally:
+            fixture_setup(
+                "from pathlib import Path; "
+                "[p.unlink() for p in Path('/logs').iterdir()]; "
+                "Path('/logs').chmod(0o755)"
+            )
+
+
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.7.0"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.8.0"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
@@ -524,9 +679,11 @@ def smoke():
                 docker("rm", "-f", container)
         assert (Path(directory) / ".repoharbor.lock").exists()
         manual_smoke(f"type=bind,src={directory},dst=/backups")
+    logging_smoke()
     print(
         "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
-        "manual backup, automatic retry, offline restore and periodic integrity"
+        "manual backup, automatic retry, offline restore, periodic integrity and "
+        "log rotation"
     )
 
 

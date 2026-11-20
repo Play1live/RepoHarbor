@@ -154,7 +154,12 @@ class Retries:
         if state:
             if state["status"] == "running":
                 state.update(last_result="succeeded", last_error_code=None)
-                logging.info("retry succeeded repository=%s", alias)
+                self.engine.events.log(
+                    "retry.succeeded",
+                    repository=alias,
+                    attempts=state["attempts"],
+                    legacy=("retry succeeded repository=%s", alias),
+                )
             state.pop("discovery_deferrals", None)
             state.update(
                 status="succeeded", attempts=0, next_attempt_at=None, block_reason=None
@@ -215,12 +220,19 @@ class Retries:
                 + engine.config.retry.delay(state["attempts"])
             )
             state.update(status="pending", next_attempt_at=due)
-            logging.info(
-                "retry scheduled repository=%s reason=%s attempts=%d due=%s",
-                alias,
-                code,
-                state["attempts"],
-                due,
+            engine.events.log(
+                "retry.scheduled",
+                repository=alias,
+                error_code=code,
+                attempts=state["attempts"],
+                due_at=due,
+                legacy=(
+                    "retry scheduled repository=%s reason=%s attempts=%d due=%s",
+                    alias,
+                    code,
+                    state["attempts"],
+                    due,
+                ),
             )
         return str(state["status"])
 
@@ -229,7 +241,14 @@ class Retries:
             last_result="interrupted" if code == "INTERRUPTED" else "failed",
             last_error_code=code,
         )
-        logging.warning("retry failed repository=%s reason=%s", alias, code)
+        self.engine.events.log(
+            "retry.failed",
+            logging.WARNING,
+            repository=alias,
+            error_code=code,
+            attempts=state["attempts"],
+            legacy=("retry failed repository=%s reason=%s", alias, code),
+        )
         if code == "INTERRUPTED":
             self.block(alias, code, save=False)
 
@@ -240,12 +259,26 @@ class Retries:
             state.update(status="blocked", next_attempt_at=None, block_reason=reason)
             if save:
                 engine.save_meta(alias)
-            logging.warning("retry blocked repository=%s reason=%s", alias, reason)
+            engine.events.log(
+                "retry.blocked",
+                logging.WARNING,
+                repository=alias,
+                error_code=reason,
+                legacy=("retry blocked repository=%s reason=%s", alias, reason),
+            )
 
     def exhaust(self, alias: str, state: dict[str, Any]) -> None:
         state.update(status="exhausted", next_attempt_at=None, block_reason=None)
-        logging.warning(
-            "retry limit reached repository=%s attempts=%d", alias, state["attempts"]
+        self.engine.events.log(
+            "retry.limit_reached",
+            logging.WARNING,
+            repository=alias,
+            attempts=state["attempts"],
+            legacy=(
+                "retry limit reached repository=%s attempts=%d",
+                alias,
+                state["attempts"],
+            ),
         )
 
     def cancel_excluded(self) -> None:
@@ -300,14 +333,25 @@ class Retries:
         engine.checkpoint("before_retry_discovery_deferral")
         engine.save_meta(alias)
         engine.checkpoint("retry_discovery_deferred")
-        logging.info(
-            "retry deferred repository=%s reason=%s discovery_deferrals=%d",
-            alias,
-            reason,
-            count,
+        engine.events.log(
+            "retry.cooldown_deferred" if cooldown else "retry.discovery_deferred",
+            repository=alias,
+            error_code=reason,
+            deferrals=count,
+            due_at=due,
+            legacy=(
+                "retry deferred repository=%s reason=%s discovery_deferrals=%d",
+                alias,
+                reason,
+                count,
+            ),
         )
 
     def execute(self, alias: str) -> None:
+        with self.engine.events.run():
+            self.execute_due(alias)
+
+    def execute_due(self, alias: str) -> None:
         from repoharbor.recovery import recover
 
         engine = self.engine
@@ -443,7 +487,12 @@ class Retries:
         )
         engine.save_meta(alias)
         engine.checkpoint("retry_claimed")
-        logging.info("retry started repository=%s attempt=%d", alias, state["attempts"])
+        engine.events.log(
+            "retry.started",
+            repository=alias,
+            attempts=state["attempts"],
+            legacy=("retry started repository=%s attempt=%d", alias, state["attempts"]),
+        )
         if not engine.backup(source) and state["status"] == "running":
             # A safety preflight can still change after the durable claim.
             code = "INTERRUPTED" if engine.git.stop.is_set() else "RECOVERY_REQUIRED"

@@ -9,6 +9,7 @@ from typing import Any, Literal
 from repoharbor.config import Config
 from repoharbor.engine import Engine
 from repoharbor.errors import GitError, HarborError
+from repoharbor.events import Events
 from repoharbor.git_backup import Git
 from repoharbor.persistence import (
     INTEGRITY_COUNTS,
@@ -96,19 +97,25 @@ def inspect(git: Git, mirror: Path) -> tuple[Finding, str | None]:
     return "healthy", None
 
 
-def skip_overlap(store: Store, skipped: int) -> None:
+def skip_overlap(store: Store, skipped: int, events: Events | None = None) -> None:
     with store.transaction(fatal=True) as data:
         state = data.setdefault("integrity", integrity_state())
         state["skipped_overlaps"] += skipped
         state["last_overlap_at"] = utcnow()
-    logging.info("scheduled integrity check skipped: another operation is active")
+    (events if events is not None else Events()).log(
+        "integrity.schedule_skipped",
+        skipped=skipped,
+        legacy=("scheduled integrity check skipped: another operation is active",),
+    )
 
 
-def reconcile(store: Store) -> None:
+def reconcile(store: Store, events: Events | None = None) -> None:
     state = store.data.get("integrity")
     if state and state["state"] == "running":
         with store.transaction(fatal=True) as data:
             data["integrity"].update(state="interrupted", current_repository=None)
+        if events is not None:
+            events.log("integrity.incomplete_operation", error_code="INTERRUPTED")
 
 
 def excluded(config: Config, alias: str, meta: dict[str, Any]) -> bool:
@@ -193,6 +200,32 @@ def clear_resolved_damage(
 
 
 def run(engine: Engine) -> None:
+    with engine.events.run() as started:
+        engine.events.log("integrity.started")
+        try:
+            check_mirrors(engine)
+        except Exception:
+            engine.events.log(
+                "integrity.failed",
+                logging.ERROR,
+                started=started,
+                error_code="FILESYSTEM_ERROR",
+            )
+            raise
+        state = engine.store.data["integrity"]
+        engine.events.log(
+            "integrity.completed",
+            started=started,
+            result=state["last_result"]
+            if state["state"] == "completed"
+            else "interrupted",
+            checked=state["checked"],
+            damaged=state["corrupt"],
+            skipped=state["skipped"],
+        )
+
+
+def check_mirrors(engine: Engine) -> None:
     store = engine.store
     with store.transaction(fatal=True) as data:
         state = data.setdefault("integrity", integrity_state())
@@ -242,6 +275,7 @@ def run(engine: Engine) -> None:
         periodic["last_started_at"] = utcnow()
         engine.save_meta(alias, fatal=True)
         engine.checkpoint("integrity_started")
+        started = engine.events.start()
         result, code = inspect(engine.git, folder / "repository.git")
         if result == "interrupted" or engine.git.stop.is_set():
             reconcile(store)
@@ -259,6 +293,16 @@ def run(engine: Engine) -> None:
                 clear_resolved_damage(meta, folder, active)
         engine.save_meta(alias, fatal=True)
         engine.checkpoint("integrity_metadata")
+        engine.events.log(
+            "integrity.mirror_damaged"
+            if result == "corrupt"
+            else "integrity.mirror_checked",
+            logging.DEBUG if result == "healthy" else logging.WARNING,
+            repository=alias,
+            error_code=code,
+            result=result,
+            started=started,
+        )
         with store.transaction(fatal=True) as data:
             state = data["integrity"]
             state[result] += 1

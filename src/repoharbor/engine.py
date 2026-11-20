@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 from repoharbor.catalog import catalog_entries, directory, read_metadata
 from repoharbor.config import Config, Source
 from repoharbor.errors import GitError, HarborError, Result
+from repoharbor.events import Events
 from repoharbor.git_backup import Git
 from repoharbor.github import DiscoveryError, GitHub
 from repoharbor.gitlab import GitLab
@@ -24,6 +25,7 @@ from repoharbor.persistence import (
     sync_directory,
     utcnow,
 )
+from repoharbor.providers import Observation
 from repoharbor.registry import (
     gitlab_manual_identities,
     manual_addresses,
@@ -50,8 +52,10 @@ class Engine:
         checkpoint: Checkpoint = no_checkpoint,
         *,
         retry_clock: Callable[[], float] = time.time,
+        events: Events | None = None,
     ):
         self.config, self.store, self.git = config, store, git
+        self.events = events if events is not None else Events()
         self.git.backup_lock_fd = store.fd
         self.git.classify_transient = config.auto_retry
         self.retries = Retries(self, retry_clock)
@@ -117,6 +121,8 @@ class Engine:
             self.save_meta(source.alias)
 
     def discover(self, host_scope: str | None = None) -> set[str]:
+        started = self.events.start()
+        self.events.log("discovery.started", authority=host_scope)
         failures = set()
         github_config = replace(
             self.config,
@@ -149,13 +155,23 @@ class Engine:
             else:
                 sources += discovered
         self.sources = sources
+        self.events.log(
+            "discovery.completed",
+            started=started,
+            authority=host_scope,
+            result="partial_failure" if failures else "success",
+            considered=len(sources),
+        )
         return failures
 
     def discover_gitlab(self, config: Config, host: str) -> tuple[Source, ...] | None:
         state_key = "gitlab:" + host
         previous = self.store.data.get("provider_discovery", {}).get(state_key, {})
         if config.providers and previous.get("retry_at", 0) > time.time():
+            self.events.log("discovery.cooldown", provider="gitlab", authority=host)
             return None
+        started = self.events.start()
+        self.events.log("discovery.provider_started", provider="gitlab", authority=host)
         with self.store.transaction() as data:
             data.setdefault("provider_discovery", {})[state_key] = {
                 "state": "running",
@@ -173,6 +189,7 @@ class Engine:
         def persist_cooldown(until: float) -> None:
             with self.store.transaction() as data:
                 data["provider_discovery"][state_key]["retry_at"] = until
+            self.events.log("discovery.cooldown_set", provider="gitlab", authority=host)
 
         client.on_cooldown = persist_cooldown
         try:
@@ -202,8 +219,14 @@ class Engine:
                     temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at),
                 )
-            logging.warning(
-                "GitLab discovery skipped: %s", str(error).replace("GITHUB_", "GITLAB_")
+            code = str(error).replace("GITHUB_", "GITLAB_")
+            self.discovery_failed(
+                "gitlab",
+                host,
+                code,
+                error.temporary,
+                started,
+                ("GitLab discovery skipped: %s", code),
             )
             return None
         with self.store.transaction() as data:
@@ -225,6 +248,9 @@ class Engine:
                 completed_at=utcnow(),
                 retry_at=client.retry_at,
             )
+        self.discovery_completed(
+            "gitlab", host, observations, proposed, sources, started
+        )
         return sources
 
     def discover_github(self) -> bool:
@@ -235,7 +261,14 @@ class Engine:
             return True
         previous = self.store.data.get("discovery", {})
         if self.config.providers and previous.get("retry_at", 0) > time.time():
+            self.events.log(
+                "discovery.cooldown", provider="github", authority="github.com"
+            )
             return False
+        started = self.events.start()
+        self.events.log(
+            "discovery.provider_started", provider="github", authority="github.com"
+        )
         with self.store.transaction() as data:
             data["discovery"] = {"state": "running", "started_at": utcnow()}
         client: GitHub | None = None
@@ -266,12 +299,22 @@ class Engine:
                     temporary=error.temporary,
                     retry_at=max(error.retry_at, client.retry_at if client else 0),
                 )
-            logging.warning("GitHub discovery skipped: %s", error)
+            self.discovery_failed(
+                "github",
+                "github.com",
+                str(error),
+                error.temporary,
+                started,
+                ("GitHub discovery skipped: %s", error),
+            )
             return False
         if client.retry_at:
             # Keep a known server cooldown even if metadata publication crashes.
             with self.store.transaction() as data:
                 data["discovery"]["retry_at"] = client.retry_at
+            self.events.log(
+                "discovery.cooldown_set", provider="github", authority="github.com"
+            )
         # Publish no runnable sources until every metadata write is durable. On a
         # crash, startup performs local recovery only; next discovery recomputes all.
         for alias, meta in proposed.items():
@@ -290,7 +333,63 @@ class Engine:
                 state="completed", completed_at=utcnow(), retry_at=client.retry_at
             )
         self.sources = self.manual_sources() + sources
+        self.discovery_completed(
+            "github",
+            "github.com",
+            observations,
+            proposed,
+            sources,
+            started,
+        )
         return True
+
+    def discovery_failed(
+        self,
+        provider: str,
+        host: str,
+        code: str,
+        temporary: bool,
+        started: float | None,
+        legacy: tuple[object, ...],
+    ) -> None:
+        event = (
+            "discovery.rate_limited"
+            if code in ("GITHUB_RATE_LIMIT", "GITLAB_RATE_LIMIT")
+            else "discovery.failed"
+        )
+        self.events.log(
+            event,
+            logging.WARNING,
+            legacy=legacy,
+            started=started,
+            provider=provider,
+            authority=host,
+            error_code=code,
+            temporary=temporary or event == "discovery.rate_limited",
+        )
+
+    def discovery_completed(
+        self,
+        provider: str,
+        host: str,
+        observations: list[Observation],
+        proposed: dict[str, dict[str, Any]],
+        sources: tuple[Source, ...],
+        started: float | None,
+    ) -> None:
+        if self.events.logger is not None:
+            excluded = sum(
+                meta["selection"]["status"] == "excluded" for meta in proposed.values()
+            )
+            self.events.log(
+                "discovery.provider_completed",
+                started=started,
+                provider=provider,
+                authority=host,
+                detected=len({item.repository.key for item in observations}),
+                considered=len(sources),
+                excluded=excluded,
+            )
 
     def discovery_state(self, scope: str) -> dict[str, Any]:
         state: dict[str, Any] = (
@@ -319,9 +418,15 @@ class Engine:
             if not (
                 self.path(source.alias) / "repository.git"
             ).exists() and self.provider_mirror_conflict(source):
-                logging.warning(
-                    "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
-                    source.alias,
+                self.events.log(
+                    "discovery.source_skipped",
+                    logging.WARNING,
+                    repository=source.alias,
+                    error_code="PROVIDER_IDENTITY_CONFLICT",
+                    legacy=(
+                        "manual source skipped: %s (PROVIDER_IDENTITY_CONFLICT)",
+                        source.alias,
+                    ),
                 )
                 continue
             result.append(source)
@@ -354,6 +459,32 @@ class Engine:
         )
 
     def run(self, *, manual: bool = False, repository: str | None = None) -> Result:
+        trigger = "manual" if manual else "scheduled"
+        target = repository if repository in self.repos else None
+        with self.events.run() as clock:
+            self.events.log("backup.run_started", trigger=trigger, repository=target)
+            try:
+                result = self.run_recorded(manual, repository)
+            except Exception:
+                self.events.log(
+                    "backup.run_failed",
+                    logging.ERROR,
+                    started=clock,
+                    trigger=trigger,
+                    repository=target,
+                    error_code="BACKUP_FAILED",
+                )
+                raise
+            self.events.log(
+                "backup.run_completed",
+                started=clock,
+                trigger=trigger,
+                repository=target,
+                result=result.name,
+            )
+            return result
+
+    def run_recorded(self, manual: bool, repository: str | None) -> Result:
         with self.store.transaction() as data:
             started = utcnow()
             data["active_run"] = {
@@ -409,6 +540,12 @@ class Engine:
             for source in self.sources
             if self.manual_requires_discovery(source, failures)
         }
+        for alias in sorted(blocked_manual):
+            self.events.log(
+                "discovery.source_skipped",
+                repository=alias,
+                error_code="DISCOVERY_FAILED",
+            )
         self.sources = tuple(s for s in self.sources if s.alias not in blocked_manual)
         if repository is not None:
             provider = repository.rpartition(":")[0]
@@ -476,6 +613,8 @@ class Engine:
 
     def backup(self, source: Source) -> bool:
         alias = source.alias
+        clock = self.events.start()
+        self.events.log("backup.check_started", repository=alias)
         meta, folder = self.repos[alias], self.path(alias)
         backup = meta["backup"]
         integrity = meta["integrity"]
@@ -484,17 +623,38 @@ class Engine:
             or integrity["status"] in ("corrupt", "repair_failed", "suspect")
             or integrity.get("periodic", {}).get("repair_pending")
         ):
+            self.events.log(
+                "backup.blocked",
+                logging.WARNING,
+                repository=alias,
+                error_code="RECOVERY_REQUIRED",
+                started=clock,
+            )
             return False
         status = self.refresh_storage(alias)
         if status:
             backup["status"] = status
             self.save_meta(alias)
+            self.events.log(
+                "backup.storage_blocked",
+                logging.WARNING,
+                repository=alias,
+                error_code=status,
+                started=clock,
+            )
             return False
         mirror, partial = folder / "repository.git", folder / "repository.git.partial"
         # Unknown partials must be assessed by recovery, never overwritten by clone.
         if partial.exists():
             backup["status"] = "interrupted"
             self.save_meta(alias)
+            self.events.log(
+                "backup.blocked",
+                logging.WARNING,
+                repository=alias,
+                error_code="RECOVERY_REQUIRED",
+                started=clock,
+            )
             return False
         backup["last_attempt_at"] = utcnow()
         self.save_meta(alias)
@@ -516,6 +676,12 @@ class Engine:
                     meta["errors"]["consecutive"] = 0
                     self.retries.success(alias)
                     self.save_meta(alias)
+                    self.events.log(
+                        "backup.up_to_date",
+                        repository=alias,
+                        started=clock,
+                        result="unchanged",
+                    )
                     return True
                 kind = "mirror_update"
             else:
@@ -529,6 +695,13 @@ class Engine:
             if kind == "initial_clone":
                 backup["partial_operation"] = operation
                 self.save_meta(alias)
+            self.events.log(
+                "backup.clone_started"
+                if kind == "initial_clone"
+                else "backup.update_started",
+                repository=alias,
+                operation_id=operation,
+            )
             self.checkpoint("journal")
 
             interrupt = self.budget.monitor(alias, folder)
@@ -550,7 +723,14 @@ class Engine:
             self.finish(alias, self.store.data["active_operation"])
             self.checkpoint("metadata")
             self.store.complete()
-            logging.info("backup completed: %s", alias)
+            self.events.log(
+                "backup.completed",
+                legacy=("backup completed: %s", alias),
+                repository=alias,
+                operation_id=operation,
+                started=clock,
+                result="success",
+            )
             return True
         except HarborError as error:
             code = str(error)
@@ -576,7 +756,15 @@ class Engine:
                 self.checkpoint("retry_planned")
             if operation:
                 self.store.update_operation(state="interrupted")
-            logging.warning("backup failed: %s", alias)
+            self.events.log(
+                "backup.storage_blocked" if limited else "backup.failed",
+                logging.WARNING,
+                legacy=("backup failed: %s", alias),
+                repository=alias,
+                operation_id=operation,
+                error_code="INTERRUPTED" if interrupted else code,
+                started=clock,
+            )
             return False
         finally:
             self.refresh_storage(alias, after=True)
@@ -632,3 +820,4 @@ class Engine:
         with self.store.transaction(fatal=True) as data:
             data["scheduler"]["skipped_overlaps"] += skipped
             data["scheduler"]["last_overlap_at"] = utcnow()
+        self.events.log("backup.schedule_skipped", skipped=skipped)
