@@ -6,6 +6,7 @@ import shutil
 import textwrap
 from argparse import Namespace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -185,8 +186,11 @@ def global_view(
     state: dict[str, Any],
     repos: list[dict[str, Any]],
     unreadable: int | None,
+    *,
+    live: Result | None = None,
 ) -> dict[str, Any]:
-    live = request(config.root, b"status")
+    if live is None:
+        live = request(config.root, b"status")
     scheduler = state.get("scheduler", {})
     active = state.get("active_run") or {}
     target = active.get("repository")
@@ -302,15 +306,18 @@ def output(data: Any, as_json: bool) -> None:
         fields(data)
 
 
-def print_status(config: Config, args: Namespace) -> Result:
+def inventory(config: Config) -> tuple[list[tuple[str, Path]], int | None]:
     root = config.root
     try:
         entries = catalog_entries(root)
         unreadable: int | None = 0 if root.is_dir() else None
     except (HarborError, OSError):
-        entries = []
-        unreadable = None
+        return [], None
+    return entries, unreadable
 
+
+def print_status(config: Config, args: Namespace) -> Result:
+    entries, unreadable = inventory(config)
     if args.command == "repositories" and args.action == "show":
         folder = dict(entries).get(args.repository)
         if folder is None:
@@ -338,24 +345,7 @@ def print_status(config: Config, args: Namespace) -> Result:
             continue
         view = repo_view(config, alias, meta, False)
         if args.command == "status":
-            backup = meta["backup"]
-            view["has_error"] = (
-                meta["errors"]["consecutive"] > 0
-                or backup["status"]
-                in (
-                    "error",
-                    "interrupted",
-                    "repair_failed",
-                    "repair_paused",
-                    "repairing",
-                )
-                or meta["integrity"]["status"]
-                in ("corrupt", "suspect", "repair_failed", "repairing")
-                or view["periodic_integrity"]["last_result"] == "uncheckable"
-                or "manual_attention_required" in backup
-                or bool(backup.get("repair_deferred"))
-                or backup.get("quarantine", {}).get("state") == "pending"
-            )
+            view["has_error"] = has_error(meta, view)
         views.append(view)
 
     result = Result.SUCCESS if unreadable == 0 else Result.STATE_UNAVAILABLE
@@ -364,12 +354,32 @@ def print_status(config: Config, args: Namespace) -> Result:
         return result
     state: dict[str, Any] = {}
     try:
-        if any(p.is_symlink() for p in (root, *root.parents)):
-            raise HarborError("Unsafe backup root")
-        saved = read_json(root / "data.json")
-        validate_state(saved)
-        state = saved
+        state = read_state(config)
     except HarborError:
         result = Result.STATE_UNAVAILABLE
     output(global_view(config, state, views, unreadable), args.json)
     return result
+
+
+def read_state(config: Config) -> dict[str, Any]:
+    root = config.root
+    if any(p.is_symlink() for p in (root, *root.parents)):
+        raise HarborError("Unsafe backup root")
+    state = read_json(root / "data.json")
+    validate_state(state)
+    return state
+
+
+def has_error(meta: dict[str, Any], view: dict[str, Any]) -> bool:
+    backup = meta["backup"]
+    return bool(
+        meta["errors"]["consecutive"] > 0
+        or backup["status"]
+        in ("error", "interrupted", "repair_failed", "repair_paused", "repairing")
+        or meta["integrity"]["status"]
+        in ("corrupt", "suspect", "repair_failed", "repairing")
+        or view["periodic_integrity"]["last_result"] == "uncheckable"
+        or "manual_attention_required" in backup
+        or bool(backup.get("repair_deferred"))
+        or backup.get("quarantine", {}).get("state") == "pending"
+    )

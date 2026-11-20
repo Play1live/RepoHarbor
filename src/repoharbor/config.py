@@ -4,6 +4,7 @@ import math
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
+from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -181,6 +182,39 @@ def logging_settings(raw: Any, root: Path, secrets: Path, enabled: bool) -> Logg
 
 
 @dataclass(frozen=True)
+class Web:
+    enabled: bool = False
+    bind: str = "127.0.0.1"
+    port: int = 8080
+    origin: str | None = None
+
+
+def web_settings(raw: Any, enabled: bool) -> Web:
+    options = keys(raw, {"bind", "port", "origin"})
+    bind = options.get("bind", Web.bind)
+    port = options.get("port", Web.port)
+    origin = options.get("origin")
+    if (
+        not isinstance(bind, str)
+        or type(port) is not int
+        or not 1024 <= port <= 65535
+        or (enabled and origin is None)
+    ):
+        raise HarborError("Invalid web configuration or missing HTTPS origin")
+    try:
+        IPv4Address(bind)
+        if origin is not None and (
+            canonical_url(origin) != origin or urlsplit(origin).path
+        ):
+            raise ValueError
+    except (ValueError, HarborError):
+        raise HarborError(
+            "Web requires an IPv4 bind and canonical HTTPS origin"
+        ) from None
+    return Web(enabled, bind, port, origin)
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[Source, ...]
     credentials: tuple[str, ...]
@@ -203,6 +237,7 @@ class Config:
     retry: Retry = field(default_factory=Retry)
     extended_logging: bool = False
     logging: Logging = field(default_factory=Logging)
+    web: Web = field(default_factory=Web)
 
 
 def discovery_settings(
@@ -331,6 +366,7 @@ def load(env: dict[str, str]) -> Config:
             "integrity",
             "retry",
             "logging",
+            "web",
         },
     )
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
@@ -434,13 +470,14 @@ def load(env: dict[str, str]) -> Config:
     integrity_check = features.pop("integrity_check", False)
     auto_retry = features.pop("auto_retry", False)
     extended_logging = features.pop("extended_logging", False)
+    web_ui = features.pop("web_ui", False)
     if (
         type(manual_run) is not bool
         or type(restore_helper) is not bool
         or type(integrity_check) is not bool
         or type(auto_retry) is not bool
         or type(extended_logging) is not bool
-        or any(v is not False for v in features.values())
+        or type(web_ui) is not bool
     ):
         raise HarborError("Invalid or unsupported optional feature")
     integrity = keys(d.get("integrity", {}), {"schedule", "include_excluded"})
@@ -490,4 +527,5 @@ def load(env: dict[str, str]) -> Config:
         Retry(retries, initial_delay, max_delay),
         extended_logging,
         logging_settings(d.get("logging", {}), root, secrets, extended_logging),
+        web_settings(d.get("web", {}), web_ui),
     )

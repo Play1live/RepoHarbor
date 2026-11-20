@@ -13,6 +13,10 @@ repoharbor = "repoharbor.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
+
+[tool.setuptools.package-data]
+repoharbor = ["dashboard/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -8,6 +8,8 @@ import threading
 import time
 from pathlib import Path
 
+from dashboard_smoke import dashboard_smoke
+
 IMAGE = "repoharbor:local-test"
 
 
@@ -680,6 +682,7 @@ def smoke():
         assert (Path(directory) / ".repoharbor.lock").exists()
         manual_smoke(f"type=bind,src={directory},dst=/backups")
     logging_smoke()
+    dashboard_smoke(IMAGE)
     print(
         "Docker smoke passed: CLI, non-root, headless, SIGTERM, "
         "manual backup, automatic retry, offline restore, periodic integrity and "

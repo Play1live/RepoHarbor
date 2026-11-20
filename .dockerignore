@@ -3,3 +3,5 @@
 !src/
 !src/repoharbor/
 !src/repoharbor/*.py
+!src/repoharbor/dashboard/
+!src/repoharbor/dashboard/*
