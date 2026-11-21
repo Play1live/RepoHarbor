@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.9.0`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.9.1`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -24,7 +24,9 @@ At startup RepoHarbor derives a 32-byte verifier with OpenSSL-backed scrypt and 
 
 The server allows five failures per TCP peer address in a rolling 60-second window and tracks at most 256 peer addresses with failures. It discards expired entries on subsequent sign-in attempts. Only one password derivation can run at once. Concurrent attempts and attempts from untracked peers when the table is full receive HTTP 429 without starting another derivation. Existing sessions use a separate lock. A reverse proxy or shared NAT can make several clients share one limit. The server ignores `Forwarded` and `X-Forwarded-For` when identifying peers. Treat the dashboard as a single-administrator interface on a trusted management network or behind a VPN.
 
-The server checks the exact configured host and checks the browser origin on every POST. Backup and sign-out requests also require a session-bound CSRF token. The backup endpoint rechecks `features.manual_run` and routes accepted operations through the local control socket. Scheduled jobs, retries, integrity checks, and manual requests share the service execution lock and the same capacity, selection, journal, and recovery rules. If the browser disconnects after acceptance, the service still owns the operation and its outcome.
+The server checks the exact configured host and checks the browser origin on every POST. Backup, manual integrity, and sign-out requests also require a session-bound CSRF token. The backup and integrity endpoints recheck `features.manual_run` and route accepted operations through the existing UID-checked control socket. Scheduled jobs, retries, and manual requests share the service execution lock. If the browser disconnects after acceptance, the service still owns the operation and its outcome.
+
+Manual integrity checks resolve validated repository IDs against the local catalog. They use the same structure, pack/index, and full Git checks as scheduled verification. Git probes disallow transport and lazy fetching. Manual findings update metadata outside the mirror and leave object contents, references, and automated repair decisions intact.
 
 The dashboard has fixed asset routes, allowlisted status and event fields, and no arbitrary file access or export endpoints. Repository identifiers are length-bounded and their provider, authority and numeric ID are validated before use. Repository text is rendered as text and links are validated as credential-free HTTPS URLs. Git credentials, host file paths, raw responses, logs, and exception traces are excluded from web responses. The response policy blocks framing and third-party resources and disables caching of application data.
 

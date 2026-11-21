@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.9.0-64748B)
+![Version](https://img.shields.io/badge/Version-0.9.1-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -58,7 +58,7 @@ Read-only commands work with the default `features.manual_run: false`. To enable
 
 ### Web dashboard
 
-Enable `features.web_ui` to use the browser dashboard. It requires an HTTPS origin, TLS certificate and private key, and a generated administrator password mounted as a private file. Settings are read-only. An administrator can use the existing backup controls when `features.manual_run` is enabled. See the [deployment guide](deploy/README.md#enable-the-web-dashboard) and [security model](docs/SECURITY.md#web-dashboard).
+Enable `features.web_ui` to use the browser dashboard. It requires an HTTPS origin, TLS certificate and private key, and a generated administrator password mounted as a private file. Settings are read-only. With `features.manual_run` enabled, administrators can start backups, select **Check integrity** on a repository's detail page, or select **Check all repositories** on the list. Manual checks inspect local mirrors and are available even when periodic checks are disabled. See the [deployment guide](deploy/README.md#enable-the-web-dashboard) and [security model](docs/SECURITY.md#web-dashboard).
 
 ### Automatic first-time setup
 
@@ -120,7 +120,7 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.0` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.1` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

@@ -10,6 +10,7 @@ from repoharbor.persistence import (
     metadata,
     read_json,
     validate_integrity_times,
+    validate_manual_integrity_metadata,
     validate_periodic_metadata,
 )
 from repoharbor.registry import stored_repository
@@ -85,6 +86,8 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
         integrity = meta["integrity"]
         if "periodic" in integrity:
             validate_periodic_metadata(integrity["periodic"])
+        if "manual" in integrity:
+            validate_manual_integrity_metadata(integrity["manual"])
         if (
             backup["format"] != "mirror"
             or backup["relative_path"] != "repository.git"

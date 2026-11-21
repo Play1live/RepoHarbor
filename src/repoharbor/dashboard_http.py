@@ -294,6 +294,7 @@ class DashboardRequest(BaseHTTPRequestHandler):
             "/api/login",
             "/api/logout",
             "/api/backup",
+            "/api/integrity",
         }:
             self.reply(404, {"error": "Action unavailable."})
             return
@@ -319,8 +320,8 @@ class DashboardRequest(BaseHTTPRequestHandler):
         elif self.path == "/api/logout" and not body:
             sessions.logout(session)
             self.reply(200, {}, cookie="; Max-Age=0")
-        elif self.path == "/api/backup":
-            self.backup(body)
+        elif self.path in {"/api/backup", "/api/integrity"}:
+            self.run_manual(body, check=self.path == "/api/integrity")
         else:
             self.reply(400, {"error": "Invalid request."})
 
@@ -345,10 +346,11 @@ class DashboardRequest(BaseHTTPRequestHandler):
             }.get(status, "Sign-in failed.")
             self.reply(status, {"error": message})
 
-    def backup(self, body: dict[str, Any]) -> None:
+    def run_manual(self, body: dict[str, Any], *, check: bool) -> None:
         config = self.server.config
+        results = INTEGRITY_RESULTS if check else BACKUP_RESULTS
         if not config.manual_run:
-            self.reply(403, {"error": "Manual backups are disabled."})
+            self.reply(403, {"error": results[Result.FEATURE_DISABLED][1]})
             return
         alias = body.get("repository")
         try:
@@ -361,6 +363,8 @@ class DashboardRequest(BaseHTTPRequestHandler):
                 if alias is None
                 else f"repo {repository_id(alias)}".encode("ascii")
             )
+            if check:
+                command = b"check " + command
         except (HarborError, ValueError):
             self.reply(400, {"error": "Invalid repository."})
             return
@@ -372,7 +376,10 @@ class DashboardRequest(BaseHTTPRequestHandler):
                 result = request(config.root, command)
             finally:
                 self.server.manual.release()
-        status, message = BACKUP_RESULTS.get(result, (500, "Backup failed."))
+            self.server.data.invalidate()
+        status, message = results.get(
+            result, (500, "Integrity check failed." if check else "Backup failed.")
+        )
         self.reply(status, {"message" if status == 200 else "error": message})
 
 
@@ -384,6 +391,18 @@ BACKUP_RESULTS = {
     Result.FEATURE_DISABLED: (403, "Manual backups are disabled."),
     Result.SERVICE_UNREACHABLE: (503, "The backup service is unavailable."),
     Result.DISCOVERY_FAILED: (409, "Discovery failed or is in cooldown."),
+}
+
+INTEGRITY_RESULTS = {
+    Result.SUCCESS: (200, "Integrity check completed successfully."),
+    Result.BUSY: BACKUP_RESULTS[Result.BUSY],
+    Result.UNKNOWN_REPOSITORY: BACKUP_RESULTS[Result.UNKNOWN_REPOSITORY],
+    Result.SERVICE_UNREACHABLE: BACKUP_RESULTS[Result.SERVICE_UNREACHABLE],
+    Result.FEATURE_DISABLED: (403, "Manual integrity checks are disabled."),
+    Result.INTEGRITY_ISSUES: (409, "Integrity check completed with issues."),
+    Result.INTEGRITY_SKIPPED: (409, "No local mirror was eligible for inspection."),
+    Result.INTEGRITY_INTERRUPTED: (503, "Integrity check was interrupted."),
+    Result.INTEGRITY_FAILED: (500, "Integrity check failed."),
 }
 
 

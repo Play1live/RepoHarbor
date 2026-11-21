@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.1
+
+- Open repository details across the dashboard content area and preserve list filters, sorting, and pagination when navigating back.
+- Allow administrators to verify one local mirror or all eligible local mirrors from the dashboard. The read-only checks share the backup execution lock and report progress and outcomes separately from scheduled checks.
+
 ## 0.9.0
 
 - Add an opt-in, administrator-authenticated HTTPS dashboard for service status, repositories, recent activity, storage, sources, and read-only configuration.

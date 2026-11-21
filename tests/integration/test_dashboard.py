@@ -247,6 +247,12 @@ def test_live_auth_csrf_and_invalid_requests(factory, tls_files):
             port, "POST", "/api/backup", auth, {"repository": None}, client
         )
         assert status == 403 and body == {"error": "Manual backups are disabled."}
+        status, _, body = exchange(
+            port, "POST", "/api/integrity", auth, {"repository": None}, client
+        )
+        assert status == 403 and body == {
+            "error": "Manual integrity checks are disabled."
+        }
         assert exchange(port, "POST", "/api/logout", auth, {}, client)[0] == 200
         assert exchange(port, "GET", "/api/dashboard", auth, tls=client)[0] == 401
 
@@ -427,12 +433,41 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 server = holder["server"]
                 port = server.server_port
                 auth = login(port, client, password)
+                for headers in (
+                    {},
+                    {**auth, "Cookie": "invalid"},
+                    {**auth, "X-CSRF-Token": "invalid"},
+                    {**auth, "Origin": "https://example.org"},
+                    {**auth, "Host": "example.org"},
+                ):
+                    assert (
+                        exchange(
+                            port,
+                            "POST",
+                            "/api/integrity",
+                            headers,
+                            {"repository": None},
+                            client,
+                        )[0]
+                        == 403
+                    )
                 for alias in ("../demo", "/tmp/demo", "https://example.org/"):
                     assert (
                         exchange(
                             port,
                             "POST",
                             "/api/backup",
+                            auth,
+                            {"repository": alias},
+                            client,
+                        )[0]
+                        == 400
+                    )
+                    assert (
+                        exchange(
+                            port,
+                            "POST",
+                            "/api/integrity",
                             auth,
                             {"repository": alias},
                             client,
@@ -450,6 +485,18 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 )
                 assert ready.wait(3)
                 assert request(config.root, b"all") == Result.BUSY
+                assert request(config.root, b"check all") == Result.BUSY
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "demo"},
+                        client,
+                    )[0]
+                    == 409
+                )
                 assert (
                     exchange(
                         port,
@@ -482,6 +529,35 @@ def test_real_control_and_busy_responses(factory, tls_files, monkeypatch):
                 assert any(
                     event["operation"] == "backup.completed"
                     for event in data["activities"]
+                )
+                assert data["repositories"][0]["can_check_integrity"]
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "demo"},
+                        client,
+                    )[0]
+                    == 200
+                )
+                checked = exchange(port, "GET", "/api/dashboard", auth, tls=client)[2]
+                assert checked["service"]["manual_integrity"]["healthy"] == 1
+                assert (
+                    checked["repositories"][0]["manual_integrity"]["last_result"]
+                    == "healthy"
+                )
+                assert (
+                    exchange(
+                        port,
+                        "POST",
+                        "/api/integrity",
+                        auth,
+                        {"repository": "unknown"},
+                        client,
+                    )[0]
+                    == 404
                 )
                 assert (
                     exchange(
@@ -532,6 +608,96 @@ def test_projection_with_exclusion_dirty_metadata_and_service_absent(factory):
         journal.write_text("broken")
         assert not snapshot(config, engine.events)["state_available"]
         assert journal.read_text() == "broken"
+
+
+@pytest.mark.parametrize(
+    (
+        "manual",
+        "periodic",
+        "manual_is_latest",
+        "excluded",
+        "backup_error",
+        "expected_status",
+        "expected_error",
+    ),
+    [
+        ("uncheckable", "healthy", True, False, False, "uncheckable", True),
+        ("uncheckable", "healthy", True, True, False, "uncheckable", True),
+        ("corrupt", "healthy", True, False, False, "corrupt", True),
+        ("healthy", "healthy", True, False, False, "healthy", False),
+        ("uncheckable", "healthy", False, False, False, "healthy", False),
+        ("corrupt", "healthy", False, False, False, "healthy", False),
+        ("healthy", "uncheckable", True, False, False, "healthy", True),
+        ("healthy", "healthy", True, False, True, "healthy", True),
+    ],
+    ids=[
+        "current-uncheckable",
+        "excluded-current-uncheckable",
+        "current-corrupt",
+        "current-healthy",
+        "stale-uncheckable",
+        "stale-corrupt",
+        "existing-periodic-error",
+        "existing-backup-error",
+    ],
+)
+def test_manual_integrity_error_projection(
+    factory,
+    tls_files,
+    manual,
+    periodic,
+    manual_is_latest,
+    excluded,
+    backup_error,
+    expected_status,
+    expected_error,
+):
+    password, client, env = tls_files
+    config = replace(factory.config, web=Web(True, HOST, 0, ORIGIN))
+    earlier = "2026-01-09T03:01:00+00:00"
+    later = "2026-01-09T03:02:00+00:00"
+    manual_at, periodic_at = (later, earlier) if manual_is_latest else (earlier, later)
+
+    with factory(config) as engine:
+        meta = engine.repos["demo"]
+        meta["selection"]["status"] = "excluded" if excluded else "included"
+        if backup_error:
+            meta["backup"]["status"] = "error"
+        meta["integrity"].update(
+            status="healthy",
+            last_checked_at=periodic_at if periodic == "healthy" else None,
+            manual={
+                "last_started_at": manual_at,
+                "last_completed_at": manual_at,
+                "last_result": manual,
+                "error_code": {
+                    "corrupt": "GIT_CORRUPTION",
+                    "uncheckable": "GIT_TIMEOUT",
+                }.get(manual),
+            },
+            periodic={
+                "last_started_at": periodic_at,
+                "last_completed_at": periodic_at,
+                "last_result": periodic,
+                "error_code": "MIRROR_UNSUPPORTED"
+                if periodic == "uncheckable"
+                else None,
+                "damaged_at": None,
+                "repair_pending": False,
+            },
+        )
+        engine.save_meta("demo")
+        with listening(open_live(config, engine.events, env)) as port:
+            auth = login(port, client, password)
+            code, _, data = exchange(port, "GET", "/api/dashboard", auth, tls=client)
+
+    assert code == 200
+    (repo,) = data["repositories"]
+    assert repo["selection_status"] == ("excluded" if excluded else "included")
+    assert repo["manual_integrity"]["last_result"] == manual
+    assert repo["integrity_status"] == expected_status
+    assert repo["has_error"] is expected_error
+    assert data["service"]["repositories"]["with_errors"] == int(expected_error)
 
 
 def test_symlink_state_is_ignored(factory, tmp_path):

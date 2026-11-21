@@ -114,6 +114,39 @@ def integrity_state() -> dict[str, Any]:
     }
 
 
+def validate_manual_integrity_state(value: Any) -> None:
+    if not isinstance(value, dict) or "target" not in value:
+        raise ValueError
+    try:
+        if value["target"] is not None:
+            if not isinstance(value["target"], str):
+                raise ValueError
+            repository_id(value["target"])
+    except HarborError:
+        raise ValueError from None
+    validate_integrity_state(
+        {key: item for key, item in value.items() if key != "target"}
+    )
+
+
+def validate_manual_integrity_metadata(value: Any) -> None:
+    if not isinstance(value, dict) or value.keys() != {
+        "last_started_at",
+        "last_completed_at",
+        "last_result",
+        "error_code",
+    }:
+        raise ValueError
+    result = value["last_result"]
+    validate_periodic_metadata(
+        dict(
+            value,
+            damaged_at=value["last_completed_at"] if result == "corrupt" else None,
+            repair_pending=False,
+        )
+    )
+
+
 def validate_integrity_times(value: dict[str, Any], *names: str) -> None:
     for name in names:
         at = value[name]
@@ -201,6 +234,8 @@ def validate_state(data: dict[str, Any]) -> None:
             raise ValueError
         if "integrity" in data:
             validate_integrity_state(data["integrity"])
+        if "manual_integrity" in data:
+            validate_manual_integrity_state(data["manual_integrity"])
         scheduler = data["scheduler"]
         if (
             not isinstance(scheduler, dict)
