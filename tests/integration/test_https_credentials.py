@@ -71,7 +71,9 @@ def test_https_detached_head_only_update(tmp_path, remote, monkeypatch):
 
 
 @contextmanager
-def https_remote(tmp_path, bare, hostname="127.0.0.1", secret="test-password"):
+def https_remote(
+    tmp_path, bare, hostname="127.0.0.1", secret="test-password", redirect_to=None
+):
     cert, key = tmp_path / "server.crt", tmp_path / "server.key"
     if not cert.exists():
         subprocess.run(
@@ -99,11 +101,10 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1", secret="test-password"):
         )
     expected = "Basic " + base64.b64encode(f"oauth2:{secret}".encode()).decode()
     state = {
-        "status": 200,
+        "status": 302 if redirect_to else 200,
         "authorized": 0,
         "challenged": 0,
         "headers": [],
-        "location": None,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -136,8 +137,8 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1", secret="test-password"):
             state["authorized"] += 1
             if state["status"] != 200:
                 self.send_response(state["status"])
-                if state["location"] is not None:
-                    self.send_header("Location", state["location"])
+                if state["status"] == 302 and redirect_to is not None:
+                    self.send_header("Location", redirect_to)
                 self.send_header("Content-Length", str(len(secret.encode())))
                 self.end_headers()
                 self.wfile.write(
@@ -353,28 +354,32 @@ def test_https_rejects_redirects_and_separates_authority_credentials(
 ):
     # Both endpoints must be trusted so a connection to the redirect target
     # would reach its HTTP handler if Git followed the redirect.
-    with (
-        https_remote(tmp_path, remote[1], secret="fixture-first") as a,
-        https_remote(tmp_path, remote[1], secret="fixture-second") as b,
-    ):
-        url_a, ca_a, token_a, state_a = a
-        url_b, ca_b, token_b, state_b = b
-        transport = Git(
-            Credentials({"first": token_a, "second": token_b}),
-            threading.Event(),
-            timeout=15,
-        )
-        monkeypatch.setenv("SSL_CERT_FILE", str(ca_a))
-        state_a.update(status=302, location=url_b)
-        with pytest.raises(GitError, match="GIT_FAILED"):
-            transport.remote_refs(url_a, "first")
-        assert state_a["authorized"] and not state_b["headers"]
-        state_a["location"] = url_a.replace("https:", "http:", 1)
-        with pytest.raises(GitError, match="GIT_FAILED"):
-            transport.remote_refs(url_a, "first")
-        assert state_a["authorized"] == 2
-        state_a["status"] = 200
-        assert "refs/heads/main" in transport.remote_refs(url_a, "first")
+    with https_remote(tmp_path, remote[1], secret="fixture-second") as second:
+        url_b, ca_b, token_b, state_b = second
+        with https_remote(
+            tmp_path, remote[1], secret="fixture-first", redirect_to=url_b
+        ) as first:
+            url_a, ca_a, token_a, state_a = first
+            transport = Git(
+                Credentials({"first": token_a, "second": token_b}),
+                threading.Event(),
+                timeout=15,
+            )
+            monkeypatch.setenv("SSL_CERT_FILE", str(ca_a))
+            with pytest.raises(GitError, match="GIT_FAILED"):
+                transport.remote_refs(url_a, "first")
+            assert state_a["authorized"] == 1 and not state_b["headers"]
+            state_a["status"] = 200
+            assert "refs/heads/main" in transport.remote_refs(url_a, "first")
+        with https_remote(
+            tmp_path,
+            remote[1],
+            secret=token_a,
+            redirect_to=url_b.replace("https:", "http:", 1),
+        ) as downgrade:
+            with pytest.raises(GitError, match="GIT_FAILED"):
+                transport.remote_refs(downgrade[0], "first")
+            assert downgrade[3]["authorized"] == 1
         monkeypatch.setenv("SSL_CERT_FILE", str(ca_b))
         assert "refs/heads/main" in transport.remote_refs(url_b, "second")
         assert state_b["challenged"] and state_b["authorized"]
