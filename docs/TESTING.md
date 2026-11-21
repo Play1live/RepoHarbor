@@ -157,7 +157,7 @@ The test uses a temporary mirror, locally issued certificate, and fixture creden
 CI publishes the image ID, CycloneDX SBOM, and Debian and Python advisory report.
 The gate fails on known high or critical findings with vendor fixes. Review the
 full report for findings without vendor fixes and for lower-severity issues.
-CodeQL analyzes Python and JavaScript in its own workflow. Python development and
+CodeQL analyzes Python and JavaScript in its own workflow and uploads its SARIF as an Actions artifact. GitHub's repository-level CodeQL default setup manages code-scanning alerts independently. Python development and
 build artifacts are pinned by hash. The base-image digest is fixed and Debian
 packages follow signed Bookworm updates, so different build dates can yield
 different package revisions. Review lock and digest updates explicitly.
