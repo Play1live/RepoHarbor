@@ -226,7 +226,9 @@ def test_https_authentication_and_offline_restore(
             ),
         }
         if mode == "file":
-            (secrets / "local").write_text(secret + "\n")
+            token_file = secrets / "local"
+            token_file.touch(mode=0o600, exist_ok=False)
+            token_file.write_text(secret + "\n")
         else:
             env["REPOHARBOR_TOKEN_LOCAL"] = secret
         cfg = load(env)
