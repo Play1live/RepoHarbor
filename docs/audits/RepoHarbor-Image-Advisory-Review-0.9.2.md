@@ -257,7 +257,7 @@ Applying crafted SQLite session changesets can overflow an allocation. The basel
 
 ### CVE-2026-12064
 
-**NOT_AFFECTED** · Trivy HIGH (fix_deferred) · Vendor assessment No base score verified in the cited vendor record · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
+**NOT_AFFECTED** · Trivy HIGH (fix_deferred) · Vendor assessment Low · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
 
 The curl advisory requires the standalone curl tool's handling of a schemeless default SFTP/SCP URL and SSH host verification options. The image installs libcurl for Git but has no curl executable. RepoHarbor accepts only explicit HTTPS URLs for remote Git and prevents redirects. Evidence: curl CNA, executable inventory, URL and transport checks. [Debian Tracker](https://security-tracker.debian.org/tracker/CVE-2026-12064) · [Vendor advisory or fix](https://curl.se/docs/CVE-2026-12064.html) · [curl CVE record](https://www.cve.org/CVERecord?id=CVE-2026-12064) · [Exact Debian packaging source](https://deb.debian.org/debian/pool/main/c/curl/curl_7.88.1-10+deb12u15.debian.tar.xz)
 
@@ -317,7 +317,7 @@ Restricted bind mounts can resolve a changed source and apply ownership or mode 
 
 ### CVE-2026-8286
 
-**MITIGATED** · Trivy HIGH (fix_deferred) · Vendor assessment No base score verified in the cited vendor record · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
+**MITIGATED** · Trivy HIGH (fix_deferred) · Vendor assessment Low · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
 
 libcurl can reuse a connection with different TLS parameters during STARTTLS. Git uses direct HTTPS with certificate validation and a fixed CA configuration per command. It never requests an upgrade through a STARTTLS protocol. Treat the library as affected outside this usage. Evidence: curl CNA, Git transport config and custom-CA HTTPS smoke. [Debian Tracker](https://security-tracker.debian.org/tracker/CVE-2026-8286) · [Vendor advisory or fix](https://curl.se/docs/CVE-2026-8286.html) · [curl CVE record](https://www.cve.org/CVERecord?id=CVE-2026-8286) · [Exact Debian packaging source](https://deb.debian.org/debian/pool/main/c/curl/curl_7.88.1-10+deb12u15.debian.tar.xz)
 
@@ -335,7 +335,7 @@ The zlib defect occurs in the gz-file write API after an earlier write failure. 
 
 ### CVE-2026-8927
 
-**MITIGATED** · Trivy HIGH (fix_deferred) · Vendor assessment No base score verified in the cited vendor record · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
+**MITIGATED** · Trivy HIGH (fix_deferred) · Vendor assessment Medium · Debian Bookworm `curl` `7.88.1-10+deb12u15`.
 
 The bug needs sequential requests on one easy handle, different proxies selected from the environment and Digest authentication to the first proxy. The Git subprocess drops proxy variables, isolates config, rejects proxy overrides and operates without redirects. Python provider HTTPS uses urllib rather than this libcurl handle. Evidence: curl CNA, Git environment and provider/HTTPS tests. [Debian Tracker](https://security-tracker.debian.org/tracker/CVE-2026-8927) · [Vendor advisory or fix](https://curl.se/docs/CVE-2026-8927.html) · [curl CVE record](https://www.cve.org/CVERecord?id=CVE-2026-8927) · [Exact Debian packaging source](https://deb.debian.org/debian/pool/main/c/curl/curl_7.88.1-10+deb12u15.debian.tar.xz)
 
@@ -352,6 +352,8 @@ Perl Archive::Tar before 3.10 can exhaust memory reading an untrusted tar header
 - Added a Docker smoke assertion for both the shared library and the Python extension. Image CI publishes an exact package inventory, Trivy version, this assessment, the image ID, CycloneDX SBOM, and raw scan. Each High/Critical package entry appears in the job summary. The gate still fails on any High/Critical result with a scanner-listed fixed version. A green gate alone does not assess entries without a listed fix. This review provides the applicability assessment for the recorded scan.
 - Local Python 3.12 passed 1,323 tests including Chromium, with 97.04% line coverage and 93.94% branch coverage. Python 3.13 passed 1,322 tests, with the browser case handled separately, 97.00% line coverage and 93.94% branch coverage. Coverage gates passed on both versions. The packaged Docker smoke passed, including real HTTPS Git with the fixture CA, manual backups and retry, periodic integrity, offline clone and bundle restore, dashboard, headless startup, stop and restart. The unit, integration and fault-injection cases exercise provider discovery, credential isolation, scheduling, normal clone/fetch, recovery, repair, quarantine and limits. Ruff, Mypy, Bandit at the CI threshold, pip-audit and Compose validation were run without changing thresholds or enabling a scanner ignore list.
 
+A read-only GitHub HTTPS check from the rebuilt image succeeded with the cloud CA bundle explicitly supplied, with certificate verification enabled. The cloud route did not validate with the standalone runtime trust bundle. The bundled smoke independently verifies Git HTTPS against its dedicated fixture CA. Validate public trust and any private CA on the deployed NAS.
+
 ## E. Residual risk
 
 1. Keep the documented Compose controls enabled, including no-new-privileges and no capabilities. Local mount, ACL and PAM code remains installed. A privileged or multi-user adaptation of this image changes the applicability of those findings. The Bookworm PAM build in particular needs a verified vendor fix before enabling an affected PAM namespace service.
@@ -360,7 +362,7 @@ Perl Archive::Tar before 3.10 can exhaust memory reading an untrusted tar header
 
 ## F. Before/after scan comparison
 
-The original CI artifact contains 118 High and 2 Critical package/advisory pairs. The rebuilt image has 113 High and 1 Critical. The six removed rows are CVE-2025-7458, CVE-2026-11822, CVE-2026-11824, CVE-2026-119373, CVE-2026-119374 and CVE-2026-119379. Every retained High/Critical pair keeps its original version, rating and scanner fix field. The second scan introduced no additional High/Critical pairs. The remaining Critical scanner entry is CVE-2023-45853, for MiniZip code absent from the runtime. The full raw report and all ratings remain visible in CI. [Baseline artifact](https://github.com/Play1live/RepoHarbor/actions/runs/44937961536/artifacts/14720980680)
+The original CI artifact contains 118 High and 2 Critical package/advisory pairs. The rebuilt image has 113 High and 1 Critical. The six removed rows are CVE-2025-7458, CVE-2026-11822, CVE-2026-11824, CVE-2026-119373, CVE-2026-119374 and CVE-2026-119379. Every retained High/Critical pair keeps its original version, rating and scanner fix field. The second scan introduced no additional High/Critical pairs. The CI rebuild confirmed the same 114 pairs. It recorded image config ID `sha256:47c3f98b52f49437be702288f8869caee95a5dc95aac6562b1e58358075c97e7` at 2026-11-21 20:16 UTC. The remaining Critical scanner entry is CVE-2023-45853, for MiniZip code absent from the runtime. The full raw report and all ratings remain visible in CI. [Baseline artifact](https://github.com/Play1live/RepoHarbor/actions/runs/44937961536/artifacts/14720980680) · [Runtime-equivalent rebuilt CI artifact](https://github.com/Play1live/RepoHarbor/actions/runs/44945330919/artifacts/14723745559)
 
 ## G. Release assessment
 
