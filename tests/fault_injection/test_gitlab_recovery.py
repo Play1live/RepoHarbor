@@ -68,7 +68,11 @@ def test_gitlab_partial_selection_crash_preserves_mirror(gitlab_env):
     kill_at(create, lambda e: e.run(), "discovery_metadata")
     with create() as engine:
         recover(engine)
-        assert not engine.git.calls
+        # Interrupted runs can trigger a local recheck of the last completed mirror.
+        assert all(
+            not {"clone", "fetch", "ls-remote"}.intersection(call)
+            for call in engine.git.calls
+        )
         engine.run()
         assert not engine.sources
         assert engine.repos[env.key]["backup"] == before

@@ -427,3 +427,121 @@ def test_manual_identity_claim_survives_rename_and_removal(github_env):
         )
         assert len(engine.sources) == 1
         env.client.request.assert_not_called()
+
+
+def test_finish_soft_limit_blocks_future_transfers_until_bytes_are_released(
+    factory, remote, monkeypatch
+):
+    cfg = replace(
+        factory.config, storage=Storage(repo_bytes=1024 * 1024, min_free_bytes=0)
+    )
+    with factory(cfg) as engine:
+        assert engine.run() == Result.SUCCESS
+        mirror = engine.path("demo") / "repository.git"
+        git("update-ref", "refs/heads/expanded", "refs/heads/main", cwd=remote[1])
+        fetch = engine.git.fetch
+        burden = engine.path("demo") / "retained-bytes"
+
+        def grow(mirror, url, credential, monitor):
+            with burden.open("wb") as data:
+                data.truncate(2 * 1024 * 1024)
+            assert monitor() is False
+            return fetch(mirror, url, credential, monitor)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(engine.git, "fetch", grow)
+            assert engine.run() == Result.SUCCESS
+        assert "refs/heads/expanded" in engine.git.refs(mirror)
+        assert engine.repos["demo"]["backup"]["successful_updates"] == 2
+        assert engine.run() == Result.BACKUP_FAILED
+        assert engine.repos["demo"]["backup"]["status"] == "repo_limit_reached"
+        assert burden.exists()
+        burden.unlink()
+        assert engine.run() == Result.SUCCESS
+
+
+def test_exact_global_admission_counts_growth_outside_current_repository(
+    factory, remote, monkeypatch
+):
+    from repoharbor.storage import usage
+
+    cfg = replace(
+        factory.config, storage=Storage(global_bytes=32 * 1024**2, min_free_bytes=0)
+    )
+    with factory(cfg) as engine:
+        assert engine.run() == Result.SUCCESS
+        retained = cfg.root / "operator-archive"
+        retained.mkdir()
+        burden = retained / "quarantined-content"
+        refs = engine.git.remote_refs
+        git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+
+        def grow(*args):
+            with burden.open("wb") as data:
+                data.truncate(32 * 1024**2)
+            return refs(*args)
+
+        assert usage(cfg.root) < 16 * 1024**2
+        with monkeypatch.context() as patch:
+            patch.setattr(engine.git, "remote_refs", grow)
+            fetch = Mock(wraps=engine.git.fetch)
+            patch.setattr(engine.git, "fetch", fetch)
+            assert engine.run() == Result.BACKUP_FAILED
+            fetch.assert_not_called()
+        assert engine.repos["demo"]["backup"]["status"] == "global_limit_paused"
+        assert burden.exists()
+        burden.unlink()
+        assert engine.run() == Result.SUCCESS
+
+
+def test_mixed_run_preserves_corrupt_excluded_and_paused_mirrors(factory, remote):
+    from conftest import LocalGit
+
+    sources = (
+        *factory.config.sources,
+        *(
+            Source(name, f"https://example.org/{name}.git")
+            for name in ("broken", "excluded", "paused")
+        ),
+    )
+
+    class LocalMirrors(LocalGit):
+        def run(self, args, *a, **kwargs):
+            return super().run(
+                [
+                    sources[0].url if arg in {s.url for s in sources} else arg
+                    for arg in args
+                ],
+                *a,
+                **kwargs,
+            )
+
+    cfg = replace(factory.config, sources=sources, automatic_repair=False)
+    with factory(cfg, git_instance=LocalMirrors(remote[1])) as engine:
+        assert engine.run() == Result.SUCCESS
+        broken = engine.path("broken") / "repository.git"
+        oid = git("rev-parse", "HEAD:hello.txt", cwd=broken)
+        (broken / "objects" / oid[:2] / oid[2:]).unlink()
+    git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+    limited = replace(
+        cfg,
+        sources=tuple(s for s in sources if s.alias != "excluded"),
+        storage=replace(cfg.storage, overrides={"paused": 0}),
+    )
+    with factory(limited, git_instance=LocalMirrors(remote[1])) as engine:
+        assert engine.run() == Result.BACKUP_FAILED
+        assert engine.repos["demo"]["backup"]["successful_updates"] == 2
+        assert engine.repos["broken"]["integrity"]["status"] == "corrupt"
+        assert engine.repos["paused"]["backup"]["status"] == "repo_limit_reached"
+        assert engine.repos["excluded"]["selection"]["status"] == "excluded"
+        for alias in ("broken", "paused", "excluded"):
+            assert not (engine.path(alias) / "repository.git/refs/heads/new").exists()
+
+    global_limit = replace(limited, storage=replace(cfg.storage, global_bytes=0))
+    git("update-ref", "refs/heads/later", "refs/heads/main", cwd=remote[1])
+    with factory(global_limit, git_instance=LocalMirrors(remote[1])) as engine:
+        assert engine.run() == Result.BACKUP_FAILED
+        for alias in ("demo", "paused"):
+            assert engine.repos[alias]["backup"]["status"] == "global_limit_paused"
+            assert not (engine.path(alias) / "repository.git/refs/heads/later").exists()
+        assert not any("fetch" in args for args in engine.git.calls)

@@ -728,6 +728,7 @@ class Engine:
         integrity = meta["integrity"]
         if (
             "manual_attention_required" in backup
+            or "deferred_operation" in backup
             or integrity["status"] in ("corrupt", "repair_failed", "suspect")
             or integrity.get("periodic", {}).get("repair_pending")
         ):
@@ -778,8 +779,8 @@ class Engine:
                     self.git.remote_head is not None
                     and local_head != self.git.remote_head
                 )
+                self.verify_backup(alias, mirror)
                 if remote == local and not head_changed:
-                    self.verify_backup(alias, mirror)
                     backup["last_checked_at"] = utcnow()
                     backup["status"] = "up_to_date"
                     meta["source"]["status"] = "available"
@@ -813,11 +814,13 @@ class Engine:
                 operation_id=operation,
             )
             self.checkpoint("journal")
+            self.budget.admit_transfer(alias, folder)
 
             interrupt = self.budget.monitor(alias, folder)
 
             if kind == "initial_clone":
                 self.git.clone(source.url, partial, source.credential, interrupt)
+                self.checkpoint("git_returned")
                 self.verify_backup(alias, partial)
                 sync_tree(partial)
                 self.store.update_operation(git_completed_at=utcnow(), changed=True)
@@ -825,6 +828,7 @@ class Engine:
                 move_new_directory(partial, mirror)
             else:
                 self.git.fetch(mirror, source.url, source.credential, interrupt)
+                self.checkpoint("git_returned")
                 expected_head = self.git.remote_head
                 final_remote = self.git.remote_refs(source.url, source.credential)
                 after = "\n".join(sorted(self.git.refs(mirror).split("\n")))
@@ -847,6 +851,7 @@ class Engine:
             self.finish(alias, self.store.data["active_operation"])
             self.checkpoint("metadata")
             self.store.complete()
+            self.checkpoint("journal_completed")
             self.events.log(
                 "backup.completed",
                 legacy=("backup completed: %s", alias),

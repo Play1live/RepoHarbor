@@ -13,6 +13,7 @@ from repoharbor.persistence import (
     read_json,
     validate_integrity_times,
     validate_manual_integrity_metadata,
+    validate_operation,
     validate_periodic_metadata,
 )
 from repoharbor.registry import stored_repository
@@ -142,6 +143,11 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
             raise ValueError
         validate_integrity_times(backup, "created_at")
         canonical_url(repo["clone_url"])
+        if "deferred_operation" in backup:
+            deferred = backup["deferred_operation"]
+            validate_operation(deferred)
+            if deferred["alias"] != alias or deferred["state"] == "reconciled":
+                raise ValueError
         if "partial_operation" in backup and not isinstance(
             backup["partial_operation"], str
         ):

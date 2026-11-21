@@ -348,6 +348,33 @@ def validate_integrity_history(history: Any) -> None:
         validate_integrity_times(entry, "started_at", "at")
 
 
+def validate_operation(value: Any) -> None:
+    if (
+        not isinstance(value, dict)
+        or value.get("state")
+        not in ("running", "interrupted", "completed", "reconciled")
+        or not isinstance(value.get("started_at"), str)
+    ):
+        raise ValueError
+    if (
+        not isinstance(value.get("alias"), str)
+        or not isinstance(value.get("id"), str)
+        or value.get("type")
+        not in {"initial_clone", "mirror_update", "repair", "quarantine"}
+    ):
+        raise ValueError
+    if "trigger" in value and (
+        value["trigger"] != "retry"
+        or value["type"] not in ("initial_clone", "mirror_update")
+    ):
+        raise ValueError
+    if "git_completed_at" in value and (
+        not isinstance(value["git_completed_at"], str)
+        or type(value.get("changed")) is not bool
+    ):
+        raise ValueError
+
+
 def validate_state(data: dict[str, Any]) -> None:
     """Reject semantically corrupt state before any startup write."""
     try:
@@ -424,23 +451,7 @@ def validate_state(data: dict[str, Any]) -> None:
             if key == "active_run" and "coverage" in value:
                 validate_run_coverage(value["coverage"])
             if key == "active_operation":
-                if (
-                    not isinstance(value.get("alias"), str)
-                    or not isinstance(value.get("id"), str)
-                    or value.get("type")
-                    not in {"initial_clone", "mirror_update", "repair", "quarantine"}
-                ):
-                    raise ValueError
-                if "trigger" in value and (
-                    value["trigger"] != "retry"
-                    or value["type"] not in ("initial_clone", "mirror_update")
-                ):
-                    raise ValueError
-                if "git_completed_at" in value and (
-                    not isinstance(value["git_completed_at"], str)
-                    or type(value.get("changed")) is not bool
-                ):
-                    raise ValueError
+                validate_operation(value)
     except (KeyError, TypeError, ValueError, OverflowError, HarborError):
         raise HarborError("Invalid journal structure; preserving state") from None
 

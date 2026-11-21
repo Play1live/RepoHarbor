@@ -7,13 +7,16 @@ from dataclasses import replace
 import pytest
 from conftest import git
 
-from repoharbor.errors import HarborError
+from repoharbor.errors import HarborError, Result
 from repoharbor.persistence import read_json
 from repoharbor.recovery import recover, repair
 
 
 @pytest.mark.parametrize("kind", ["clone", "update", "detached"])
-@pytest.mark.parametrize("checkpoint", ["journal", "git", "promoted", "metadata"])
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["journal", "git_returned", "git", "promoted", "metadata", "journal_completed"],
+)
 def test_sigkill_at_durable_boundaries(factory, remote, kind, checkpoint):
     if kind in ("update", "detached"):
         with factory() as engine:
@@ -62,10 +65,11 @@ def test_sigkill_at_durable_boundaries(factory, remote, kind, checkpoint):
             "git",
             "promoted",
             "metadata",
+            "journal_completed",
         ):
             mirror = engine.path("demo") / "repository.git"
             assert engine.git.healthy(mirror)
-        if checkpoint in ("git", "promoted", "metadata"):
+        if checkpoint in ("git", "promoted", "metadata", "journal_completed"):
             assert after["status"] == "updated"
             if kind == "detached":
                 assert engine.git.head(mirror) == git(
@@ -326,3 +330,122 @@ def test_signal_while_git_command_active(factory, remote, kind, sig, manual):
         assert engine.repos["demo"]["backup"]["status"] in ("error", "interrupted")
         if kind == "update":
             assert engine.git.healthy(engine.path("demo") / "repository.git")
+
+
+@pytest.mark.parametrize("failure", ["healthy", "corrupt", "uncheckable", "missing"])
+def test_completed_operation_is_rechecked_after_interrupted_run(factory, failure):
+    from test_crash_corrections import kill_at
+
+    kill_at(factory, lambda engine: engine.run(), "journal_completed")
+    with factory() as engine:
+        original = engine.store.data["active_operation"].copy()
+        mirror = engine.path("demo") / "repository.git"
+        if failure == "corrupt":
+            oid = git("rev-parse", "HEAD:hello.txt", cwd=mirror)
+            (mirror / "objects" / oid[:2] / oid[2:]).unlink()
+        elif failure == "uncheckable":
+            (mirror / "shallow").touch()
+        elif failure == "missing":
+            mirror.rename(mirror.with_name("retained-copy"))
+        recover(engine)
+        meta = engine.repos["demo"]
+        backup = meta["backup"]
+        assert engine.store.data["active_operation"] == original
+        assert engine.store.data["active_run"]["state"] == "interrupted"
+        assert "last_successful_run_at" not in engine.store.data["scheduler"]
+        assert backup["successful_updates"] == 1
+        if failure == "healthy":
+            assert backup["status"] == "updated"
+        else:
+            assert backup["status"] != "updated"
+            assert meta["integrity"]["status"] == (
+                "corrupt" if failure == "corrupt" else "suspect"
+            )
+        if failure in ("uncheckable", "missing"):
+            assert backup["deferred_operation"] == original
+
+
+def test_clean_start_checks_only_a_completed_operation_with_missing_mirror(factory):
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+    with factory() as engine:
+        recover(engine)
+        assert not engine.git.calls
+        mirror = engine.path("demo") / "repository.git"
+        mirror.rename(mirror.with_name("retained-copy"))
+    with factory() as engine:
+        original = engine.store.data["active_operation"]
+        recover(engine)
+        meta = engine.repos["demo"]
+        assert meta["integrity"]["latest_verification"]["result"] == "uncheckable"
+        assert meta["backup"]["deferred_operation"] == original
+
+
+def test_missing_mirror_during_open_update_keeps_recovery_record(factory, remote):
+    from test_crash_corrections import kill_at
+
+    with factory() as engine:
+        engine.run()
+    git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+    kill_at(factory, lambda engine: engine.run(), "journal")
+    with factory() as engine:
+        original = engine.store.data["active_operation"].copy()
+        mirror = engine.path("demo") / "repository.git"
+        mirror.rename(mirror.with_name("retained-copy"))
+        recover(engine)
+        assert engine.store.data["active_operation"]["state"] == "reconciled"
+        assert engine.repos["demo"]["backup"]["deferred_operation"] == original
+        assert engine.repos["demo"]["integrity"]["status"] == "suspect"
+
+
+def test_uncheckable_operation_survives_crash_during_recovery_and_releases_slot(
+    factory, remote
+):
+    from conftest import LocalGit
+    from test_crash_corrections import kill_at
+
+    from repoharbor.config import Source
+    from repoharbor.restore import mirror_path
+
+    class TwoMirrors(LocalGit):
+        def run(self, args, *a, **kwargs):
+            return super().run(
+                [factory.config.sources[0].url if p == other.url else p for p in args],
+                *a,
+                **kwargs,
+            )
+
+    other = Source("other", "https://example.org/other.git")
+    cfg = replace(factory.config, sources=(*factory.config.sources, other))
+
+    def create(**kwargs):
+        return factory(cfg, git_instance=TwoMirrors(remote[1]), **kwargs)
+
+    with create() as engine:
+        assert engine.run() == Result.SUCCESS
+    git("update-ref", "refs/heads/new", "refs/heads/main", cwd=remote[1])
+    kill_at(create, lambda engine: engine.run(), "git")
+    with create() as engine:
+        original = engine.store.data["active_operation"].copy()
+        mirror = engine.path("demo") / "repository.git"
+        (mirror / "shallow").touch()
+
+    kill_at(create, recover, "recovery_deferred_metadata")
+    with create() as engine:
+        assert engine.store.data["active_operation"] == original
+        assert engine.repos["demo"]["backup"]["deferred_operation"] == original
+        recover(engine)
+        assert engine.store.data["active_operation"]["state"] == "reconciled"
+        with pytest.raises(HarborError, match="unfinished"):
+            mirror_path(cfg.root, "demo")
+        assert engine.run() == Result.BACKUP_FAILED
+        assert engine.repos["other"]["backup"]["successful_updates"] == 2
+        assert engine.repos["demo"]["backup"]["deferred_operation"] == original
+        assert engine.store.data["active_operation"]["alias"] == "other"
+
+    with create() as engine:
+        (engine.path("demo") / "repository.git/shallow").unlink()
+        recover(engine)
+        assert "deferred_operation" not in engine.repos["demo"]["backup"]
+        assert engine.repos["demo"]["backup"]["successful_updates"] == 2
+        assert engine.run() == Result.SUCCESS

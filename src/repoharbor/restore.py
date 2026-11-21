@@ -100,6 +100,7 @@ def mirror_path(root: Path, repository: str) -> Path:
         raise HarborError("Mirror path disagrees with repository metadata")
     if (
         "partial_operation" in backup
+        or "deferred_operation" in backup
         or backup.get("quarantine", {}).get("state") == "pending"
         or (folder / "repository.git.partial").exists()
         or (folder / "repository.git.partial").is_symlink()

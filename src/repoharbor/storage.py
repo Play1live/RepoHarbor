@@ -72,7 +72,9 @@ class Budget:
             self.last_repo = None
             self.sample_timestamp = None
 
-    def global_usage(self, repo: Path, size: int) -> tuple[int, bool]:
+    def global_usage(
+        self, repo: Path, size: int, *, exact: bool = False
+    ) -> tuple[int, bool]:
         if not self.batching:
             return usage(self.root), False
         now = time.monotonic()
@@ -81,7 +83,8 @@ class Budget:
         self.last_repo = (repo, size)
         limit = self.config.global_bytes
         if (
-            self.total is None
+            exact
+            or self.total is None
             or now >= self.sample_at + 30
             or (limit is not None and self.total >= limit - 16 * 1024**2)
         ):
@@ -91,9 +94,9 @@ class Budget:
             return self.total, False
         return self.total, True
 
-    def measure(self, alias: str, repo: Path) -> Measurement:
+    def measure(self, alias: str, repo: Path, *, exact: bool = False) -> Measurement:
         repo_bytes = usage(repo)
-        global_bytes, estimate = self.global_usage(repo, repo_bytes)
+        global_bytes, estimate = self.global_usage(repo, repo_bytes, exact=exact)
         free = shutil.disk_usage(self.root).free
         global_status = None
         if free < self.config.min_free_bytes:
@@ -120,6 +123,15 @@ class Budget:
 
     def status(self, alias: str, repo: Path) -> str | None:
         return self.measure(alias, repo).status
+
+    def admit_transfer(self, alias: str, repo: Path) -> None:
+        # Status measurements can use an estimate. A configured global limit
+        # must also count journal growth and changes outside the current repo.
+        status = self.measure(
+            alias, repo, exact=self.config.global_bytes is not None
+        ).status
+        if status:
+            raise HarborError(status)
 
     def transfer_status(self, alias: str, repo: Path) -> str | None:
         if self.config.during_transfer == "finish":

@@ -481,7 +481,9 @@ def test_retry_fetch_requires_offline_recovery_and_keeps_repair_limits(
             fetch.assert_not_called()
             assert meta["backup"]["successful_updates"] == 1
             assert meta["retry"]["block_reason"] == "RECOVERY_REQUIRED"
-            assert engine.store.data["active_operation"]["state"] == (
-                "interrupted" if local_state == "unsupported" else "reconciled"
-            )
+            operation = engine.store.data["active_operation"]
+            assert operation["state"] == "reconciled"
+            if local_state == "unsupported":
+                assert meta["backup"]["deferred_operation"]["id"] == operation["id"]
+                assert meta["backup"]["deferred_operation"]["state"] == "interrupted"
         assert meta["integrity"]["repair_attempts"] == 2

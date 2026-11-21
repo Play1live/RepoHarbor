@@ -507,7 +507,7 @@ def test_filters_apply_with_only_local_provider_metadata(github_env, monkeypatch
         assert engine.repos[env.key]["selection"] == selection
 
 
-def test_uncertain_periodic_recovery_cannot_replace_an_unresolved_journal(
+def test_uncertain_periodic_recovery_preserves_an_unresolved_operation(
     factory,
     monkeypatch,
 ):
@@ -522,10 +522,14 @@ def test_uncertain_periodic_recovery_cannot_replace_an_unresolved_journal(
         assert engine.repos["demo"]["integrity"]["repair_attempts"] == 0
         assert not any("fetch" in args for args in engine.git.calls)
         journal = engine.store.begin("demo", "repair")
-        with pytest.raises(HarborError, match="Cannot verify interrupted"):
-            recover(engine)
+        original = engine.store.data["active_operation"].copy()
+        recover(engine)
         assert engine.store.data["active_operation"]["id"] == journal
-        assert engine.store.data["active_operation"]["state"] == "running"
+        assert engine.store.data["active_operation"]["state"] == "reconciled"
+        assert engine.repos["demo"]["backup"]["deferred_operation"] == original
+        assert engine.repos["demo"]["integrity"]["status"] == "corrupt"
+        assert engine.repos["demo"]["integrity"]["repair_attempts"] == 0
+        assert not any("fetch" in args for args in engine.git.calls)
 
 
 @pytest.mark.parametrize("excluded", [False, True])

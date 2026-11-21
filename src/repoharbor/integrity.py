@@ -184,6 +184,7 @@ def clear_resolved_damage(
         not in ("healthy", "unchecked", "corrupt", "suspect", *REPAIR_BLOCKS)
         or backup["status"] in ("initializing", "interrupted", "repairing")
         or "manual_attention_required" in backup
+        or "deferred_operation" in backup
         or (journal and journal["state"] in ("running", "interrupted"))
         or deferred not in (None, "DISCOVERY_REQUIRED", *CAPACITY_BLOCKS)
     ):

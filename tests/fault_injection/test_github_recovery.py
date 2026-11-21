@@ -60,7 +60,11 @@ def test_crash_during_selection_publication_requires_fresh_discovery(github_env)
     with create() as engine:
         assert engine.store.data["discovery"]["state"] == "running"
         recover(engine)
-        assert not engine.git.calls
+        # Interrupted runs can trigger a local recheck of the last completed mirror.
+        assert all(
+            not {"clone", "fetch", "ls-remote"}.intersection(call)
+            for call in engine.git.calls
+        )
         engine.run()
         assert engine.sources == ()
         for key, meta in engine.repos.items():
