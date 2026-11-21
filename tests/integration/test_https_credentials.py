@@ -73,29 +73,30 @@ def test_https_detached_head_only_update(tmp_path, remote, monkeypatch):
 @contextmanager
 def https_remote(tmp_path, bare, hostname="127.0.0.1", secret="test-password"):
     cert, key = tmp_path / "server.crt", tmp_path / "server.key"
-    subprocess.run(
-        [
-            "openssl",
-            "req",
-            "-x509",
-            "-newkey",
-            "rsa:2048",
-            "-nodes",
-            "-keyout",
-            str(key),
-            "-out",
-            str(cert),
-            "-days",
-            "1",
-            "-subj",
-            "/CN=localhost",
-            "-addext",
-            "subjectAltName=IP:127.0.0.1,DNS:username.example.org",
-        ],
-        check=True,
-        capture_output=True,
-        timeout=15,
-    )
+    if not cert.exists():
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key),
+                "-out",
+                str(cert),
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1,DNS:username.example.org",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
     expected = "Basic " + base64.b64encode(f"oauth2:{secret}".encode()).decode()
     state = {
         "status": 200,
@@ -350,12 +351,11 @@ def test_managed_mirror_rejects_transport_overrides(tmp_path, remote, key, value
 def test_https_rejects_redirects_and_separates_authority_credentials(
     tmp_path, remote, monkeypatch
 ):
-    first, second = tmp_path / "first", tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
+    # Both endpoints must be trusted so a connection to the redirect target
+    # would reach its HTTP handler if Git followed the redirect.
     with (
-        https_remote(first, remote[1], secret="fixture-first") as a,
-        https_remote(second, remote[1], secret="fixture-second") as b,
+        https_remote(tmp_path, remote[1], secret="fixture-first") as a,
+        https_remote(tmp_path, remote[1], secret="fixture-second") as b,
     ):
         url_a, ca_a, token_a, state_a = a
         url_b, ca_b, token_b, state_b = b
@@ -381,10 +381,23 @@ def test_https_rejects_redirects_and_separates_authority_credentials(
 
 
 @pytest.mark.parametrize("scheme", ["http", "ftp", "smtp", "ldap", "ssh", "git"])
-def test_git_disallows_alternative_network_transports(scheme):
+def test_git_disallows_alternative_network_transports(tmp_path, scheme):
     transport = Git(Credentials({}), threading.Event(), timeout=5)
+    url = f"{scheme}://127.0.0.1:1/remote.git"
     with pytest.raises(GitError, match="GIT_FAILED"):
-        transport.remote_refs(f"{scheme}://127.0.0.1:1/remote.git", None)
+        transport.remote_refs(url, None)
+    # Check Git's policy diagnostic so a dead endpoint cannot make this pass.
+    git_policy = subprocess.run(
+        ["git", "ls-remote", "--", url],
+        cwd=tmp_path,
+        env={**transport.credentials.git_env(None), "LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert git_policy.returncode != 0
+    assert f"transport '{scheme}' not allowed" in git_policy.stderr
 
 
 def test_config_validate_has_no_git_or_runtime_mutations(tmp_path, monkeypatch, capsys):
