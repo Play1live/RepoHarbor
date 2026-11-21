@@ -49,7 +49,7 @@ def stored_repository(meta: dict[str, Any], key: str) -> Repository:
                 "owner": {"login": r["owner"], "type": "User"},
                 "name": r["name"],
                 "full_name": f"{r['owner']}/{r['name']}",
-                "private": r["visibility"] == "private",
+                "private": r["visibility"] != "public",
                 "visibility": r["visibility"],
                 "fork": r["fork"],
                 "archived": r["archived"],
@@ -84,7 +84,13 @@ def manual_addresses(
         raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED") from None
 
 
-def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[str]:
+def manual_identities(
+    client: GitHub,
+    config: Config,
+    names: set[str],
+    *,
+    resolved: dict[str, str] | None = None,
+) -> set[str]:
     """Resolve current manual addresses only to block overlaps, never to adopt data."""
     result = set()
     credentials = list(
@@ -96,7 +102,10 @@ def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[st
                 raw, _ = client.request(
                     "/repos/" + name.removeprefix("github.com/"), credential
                 )
-                result.add(parse_repository(raw).key)
+                key = parse_repository(raw).key
+                result.add(key)
+                if resolved is not None:
+                    resolved[name] = key
                 break
             except DiscoveryError as error:
                 if str(error) != "GITHUB_NOT_ACCESSIBLE":
@@ -107,7 +116,12 @@ def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[st
 
 
 def gitlab_manual_identities(
-    client: GitLab, config: Config, names: set[str], host: str
+    client: GitLab,
+    config: Config,
+    names: set[str],
+    host: str,
+    *,
+    resolved: dict[str, str] | None = None,
 ) -> set[str]:
     """Resolve manual identities; only a 404 permits another instance token."""
     result = set()
@@ -121,7 +135,10 @@ def gitlab_manual_identities(
     for name in sorted(names):
         for credential in credentials:
             try:
-                result.add(client.manual_identity(name, credential))
+                key = client.manual_identity(name, credential)
+                result.add(key)
+                if resolved is not None:
+                    resolved[name] = key
                 break
             except DiscoveryError as error:
                 if str(error) != "GITLAB_NOT_ACCESSIBLE":
@@ -169,6 +186,12 @@ def plan(
             raise DiscoveryError("GITHUB_ALIAS_CONFLICT")
         claimed[observed.address] = key
     manual = manual_addresses(config, catalog, host)
+    manual_ids = manual_ids | {
+        key
+        for meta in catalog.values()
+        if meta["repository"]["provider"] == "manual"
+        for key in meta["repository"].get("identity_claims", ())
+    }
     sources = []
     for key in sorted(set(proposed) | set(found)):
         current = found.get(key)

@@ -124,14 +124,14 @@ def test_paused_first_repair_does_not_starve_second_repository(
     from repoharbor.errors import HarborError
 
     class TwoRemotes(LocalGit):
-        def run(self, args, credential=None, interrupt=lambda: False):
+        def run(self, args, credential=None, interrupt=lambda: False, **kwargs):
             args = [
                 "https://example.org/repo.git"
                 if arg == "https://example.org/other.git"
                 else arg
                 for arg in args
             ]
-            return super().run(args, credential, interrupt)
+            return super().run(args, credential, interrupt, **kwargs)
 
     config = replace(
         factory.config,

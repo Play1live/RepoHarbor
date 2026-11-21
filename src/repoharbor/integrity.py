@@ -97,6 +97,27 @@ def inspect(git: Git, mirror: Path) -> tuple[Finding, str | None]:
     return "healthy", None
 
 
+def record_finding(
+    integrity: dict[str, Any],
+    result: Finding | Literal["skipped"],
+    code: str | None,
+    kind: str,
+) -> None:
+    at = utcnow()
+    integrity["latest_verification"] = {
+        "at": at,
+        "result": result,
+        "code": code,
+        "kind": kind,
+    }
+    if result == "healthy":
+        integrity["last_verified_healthy_at"] = at
+    elif result == "corrupt":
+        if integrity["status"] in ("unchecked", "healthy", "suspect"):
+            integrity["status"] = "corrupt"
+        integrity["damage_pending"] = True
+
+
 def skip_overlap(store: Store, skipped: int, events: Events | None = None) -> None:
     with store.transaction(fatal=True) as data:
         state = data.setdefault("integrity", integrity_state())
@@ -156,13 +177,14 @@ def clear_resolved_damage(
 ) -> None:
     """Publish a healthy mirror without reconciling an unfinished write."""
     backup, integrity = meta["backup"], meta["integrity"]
-    periodic = integrity["periodic"]
+    periodic = integrity.get("periodic", {})
     deferred = backup.get("repair_deferred")
     if (
         integrity["status"]
         not in ("healthy", "unchecked", "corrupt", "suspect", *REPAIR_BLOCKS)
         or backup["status"] in ("initializing", "interrupted", "repairing")
         or "manual_attention_required" in backup
+        or "deferred_operation" in backup
         or (journal and journal["state"] in ("running", "interrupted"))
         or deferred not in (None, "DISCOVERY_REQUIRED", *CAPACITY_BLOCKS)
     ):
@@ -178,14 +200,17 @@ def clear_resolved_damage(
 
     resolved = (
         integrity["status"] in ("corrupt", "suspect", *REPAIR_BLOCKS)
-        or periodic["repair_pending"]
+        or periodic.get("repair_pending")
         or backup["status"] in REPAIR_BLOCKS
         or deferred is not None
+        or integrity.get("damage_pending")
     )
     integrity["status"] = "healthy"
+    integrity.pop("damage_pending", None)
     if not resolved:
         return
-    periodic["repair_pending"] = False
+    if periodic:
+        periodic["repair_pending"] = False
     integrity["repair_attempts"] = 0
     backup.pop("repair_deferred", None)
     if backup["status"] in REPAIR_BLOCKS:
@@ -281,7 +306,14 @@ def check_mirrors(
         state = data.setdefault(key, integrity_state())
         if manual:
             state["target"] = repository
-            state.update(last_completed_at=None, last_result=None)
+        history = data.setdefault("integrity_history", {})
+        if state["last_completed_at"] is not None and key not in history:
+            history[key] = {
+                "at": state["last_completed_at"],
+                "started_at": state["last_started_at"],
+                "result": state["last_result"],
+            }
+        state.update(last_completed_at=None, last_result=None)
         state.update(
             state="running",
             last_started_at=utcnow(),
@@ -290,20 +322,31 @@ def check_mirrors(
         )
     active = store.data["active_operation"]
     aliases = sorted(engine.repos) if repository is None else [repository]
+    unsafe_skips = 0
     for alias in aliases:
         if engine.git.stop.is_set():
             break
         meta = engine.repos[alias]
         folder = engine.path(alias)
-        if (
-            (
-                not manual
-                and not engine.config.integrity.include_excluded
-                and excluded(engine.config, alias, meta)
-            )
-            or blocked(alias, meta["backup"], active)
-            or (manual and has_partial(folder))
-        ):
+        intentionally_excluded = (
+            not manual
+            and not engine.config.integrity.include_excluded
+            and excluded(engine.config, alias, meta)
+        )
+        safety_skip = blocked(alias, meta["backup"], active) or has_partial(folder)
+        if intentionally_excluded or safety_skip:
+            if (
+                safety_skip
+                and not intentionally_excluded
+                and meta["backup"]["created_at"] is not None
+            ):
+                unsafe_skips += 1
+                info = meta["integrity"]
+                record_finding(
+                    info, "skipped", None, "manual" if manual else "periodic"
+                )
+                info.pop("restore_compatibility", None)
+                engine.save_meta(alias, fatal=True)
             with store.transaction(fatal=True) as data:
                 data[key]["skipped"] += 1
             if manual:
@@ -334,15 +377,24 @@ def check_mirrors(
             return
         finished = utcnow()
         record.update(last_completed_at=finished, last_result=result, error_code=code)
-        if not manual and result in ("healthy", "corrupt"):
+        record_finding(integrity, result, code, "manual" if manual else "periodic")
+        if result == "healthy":
+            integrity["restore_compatibility"] = engine.git.restore_compatibility(
+                folder / "repository.git"
+            )
+        else:
+            integrity.pop("restore_compatibility", None)
+        if result == "corrupt" and not manual:
+            record["damaged_at"] = finished
+            record["repair_pending"] = True
+        if result in ("healthy", "corrupt") and not manual:
             integrity.update(last_checked_at=finished, last_check_kind="periodic")
-            if result == "corrupt":
-                record["damaged_at"] = finished
-                if integrity["status"] in ("unchecked", "healthy"):
-                    integrity["status"] = "corrupt"
-                    record["repair_pending"] = True
-            elif (store.data["active_run"] or {}).get("state") != "running":
-                clear_resolved_damage(meta, folder, active)
+        if (
+            result == "healthy"
+            and (store.data["active_run"] or {}).get("state") != "running"
+        ):
+            current = active if active and active["alias"] == alias else None
+            clear_resolved_damage(meta, folder, current)
         engine.save_meta(alias, fatal=True)
         engine.checkpoint("integrity_metadata")
         engine.events.log(
@@ -372,8 +424,13 @@ def check_mirrors(
             last_result="issues"
             if state["corrupt"]
             or state["uncheckable"]
-            or (manual and state["checked"] and state["skipped"])
+            or (state["checked"] and (unsafe_skips or (manual and state["skipped"])))
             else "healthy"
             if state["checked"]
             else "no_candidates",
         )
+        data.setdefault("integrity_history", {})[key] = {
+            "at": state["last_completed_at"],
+            "started_at": state["last_started_at"],
+            "result": state["last_result"],
+        }

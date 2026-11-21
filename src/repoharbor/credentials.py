@@ -1,11 +1,40 @@
 """Resolve one explicit secret source; pass secrets only to a scoped askpass."""
 
 import os
+import stat
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from repoharbor.config import Config
 from repoharbor.errors import HarborError
+
+MAX_TOKEN_BYTES = 8192
+
+
+def read_token(path: Path) -> str:
+    directory = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_RDONLY
+    flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_RDONLY
+    with ExitStack() as stack:
+        fd = os.open("/", directory)
+        stack.callback(os.close, fd)
+        for component in path.parts[1:-1]:
+            fd = os.open(component, directory, dir_fd=fd)
+            stack.callback(os.close, fd)
+        with os.fdopen(os.open(path.name, flags, dir_fd=fd), "rb") as stream:
+            entry = os.fstat(stream.fileno())
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or entry.st_uid not in (0, os.geteuid())
+                or entry.st_mode & 0o077
+            ):
+                raise HarborError(
+                    "Credential file must be owner-readable and private (0400 or 0600)"
+                )
+            value = stream.read(MAX_TOKEN_BYTES + 1)
+    if len(value) > MAX_TOKEN_BYTES:
+        raise HarborError("Credential file exceeds the supported size")
+    return value.decode("ascii").rstrip("\r\n")
 
 
 @dataclass(repr=False)
@@ -26,12 +55,14 @@ class Credentials:
                 if key in env:
                     raise HarborError("Mixed credential modes")
                 try:
-                    if path.is_symlink() or not path.is_file():
-                        raise OSError
-                    value = path.read_text().rstrip("\r\n")
+                    value = read_token(path)
                 except (OSError, UnicodeError):
                     raise HarborError("Missing or unreadable credential file") from None
-            if not value or any(ord(c) < 32 for c in value):
+            if (
+                not value
+                or not value.isascii()
+                or any(not 33 <= ord(c) < 127 for c in value)
+            ):
                 raise HarborError("Missing or malformed credential")
             values[name] = value
         return cls(values)
@@ -50,7 +81,7 @@ class Credentials:
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_LFS_SKIP_SMUDGE": "1",
                 "GIT_ASKPASS": str(Path(__file__).with_name("askpass.py")),
-                "GIT_CONFIG_COUNT": "8",
+                "GIT_CONFIG_COUNT": "10",
                 "GIT_CONFIG_KEY_0": "credential.helper",
                 "GIT_CONFIG_VALUE_0": "",
                 "GIT_CONFIG_KEY_1": "http.followRedirects",
@@ -67,6 +98,10 @@ class Credentials:
                 "GIT_CONFIG_VALUE_6": "false",
                 "GIT_CONFIG_KEY_7": "fetch.writeCommitGraph",
                 "GIT_CONFIG_VALUE_7": "false",
+                "GIT_CONFIG_KEY_8": "core.fsync",
+                "GIT_CONFIG_VALUE_8": "all",
+                "GIT_CONFIG_KEY_9": "fetch.fsckObjects",
+                "GIT_CONFIG_VALUE_9": "true",
             }
         )
         if "SSL_CERT_FILE" in env:

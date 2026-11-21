@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.9.1`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor `0.9.2`. Production NAS/Portainer acceptance requires validation on the target host.
 
 ## Trusted storage boundary
 
@@ -10,7 +10,7 @@ The service refuses symlinks and special files within the backup-root tree. Do n
 
 ## Local control and status
 
-The service listens on a Linux abstract Unix-domain socket addressed by its effective UID and the resolved backup root. The client and server each verify the peer UID with `SO_PEERCRED`. The endpoint is scoped to the Linux network namespace and leaves no socket file on the backup mount. Use `docker exec` under the service's configured user. Operators with access to that UID in the container can request manual backups when the flag is enabled. The optional HTTPS dashboard provides a separate authenticated entry point. The default deployment has no TCP listener.
+The service listens on an owner-only Unix-domain socket in the trusted backup root. The client and server verify the peer UID with `SO_PEERCRED`. The service holds the root lock during socket startup and shutdown. It replaces an old service-owned socket only after confirming that it is no longer accepting connections. Use `docker exec` under the service's configured user. Operators with access to that UID in the container can request manual backups when the flag is enabled. The optional HTTPS dashboard provides a separate authenticated entry point. The default deployment has no TCP listener.
 
 Manual backups are opt-in. The running service owns the root lock and executes all Git work. Scheduled and manual requests share one run lock, and overlapping requests are skipped or rejected without queueing. Disconnecting the CLI leaves the service in control of accepted work. The client cannot infer a successful result from that disconnection.
 
@@ -35,7 +35,7 @@ Keep the TLS key and dashboard password in read-only mounts that the service UID
 ## Git transport and credentials
 
 - Network backup and repair operations accept credential-free **HTTPS** URLs only and invoke Git with argument vectors, not shell interpolation.
-- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. For network backups and repairs, HTTPS certificate checks remain enabled, redirects are disallowed, and other transport protocols are disabled.
+- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. Mirror clone and remote enumeration ignore any Git repository in the invoking directory. Fetch and repair validate the managed mirror configuration before use. Network operations verify HTTPS certificates, disable redirects and reject other transports. A trusted custom CA bundle can be supplied through `SSL_CERT_FILE`.
 - A credential is supplied through a scoped `GIT_ASKPASS` helper environment, **not** through a URL or command-line argument. The container permits one explicit secret source, `env` or `file`.
 - Git diagnostics from remote servers are never directly forwarded into application logs or persisted failure messages; fixed internal error codes are used instead.
 - Secrets in a child process environment may still be inspected by users with sufficient OS/container privileges. Limit Docker-host access and use protected, read-only secret-file mounts where possible.
@@ -61,7 +61,7 @@ TLS verification applies to the API and Git. For an instance with a private CA, 
 
 Pagination validates the authority, endpoint, fixed parameters, and cursor or page progression. Requests are built locally within page-count, response-size, socket, and discovery deadline bounds. These checks constrain API-supplied destinations. The operator still controls the configured authorities and manual URLs, and the application does not filter resolved addresses or pin DNS resolutions. Configured servers may resolve to private networks. Control configuration, DNS, and outbound network access accordingly. See [API pacing and rate limits](CONFIGURATION.md#api-pacing-and-rate-limits) for the bounds and headers.
 
-Complete discovery on one authority requires all of its configured tokens and manual identity lookups to succeed. API errors, a cooldown, incomplete pagination, and ambiguous identities withhold its Git work and remote repairs. Other GitLab authorities and GitHub remain independent. On the affected authority, only established eligible manual mirrors can continue, under the same checks in full and targeted runs. GitLab stores cooldowns in the central journal, including a zero-quota HTTP 200 cooldown before the response body is read. GitLab hosts retain their stored cooldowns across restart and temporary removal.
+Complete discovery on one authority requires all of its configured tokens and active manual identity lookups to succeed. Historical manual address claims still remain reserved when they cannot be resolved. API errors, a cooldown, incomplete pagination, and ambiguous identities withhold its Git work and remote repairs. Other GitLab authorities and GitHub remain independent. On the affected authority, only established eligible manual mirrors can continue, under the same checks in full and targeted runs. GitLab stores cooldowns in the central journal, including a zero-quota HTTP 200 cooldown before the response body is read. GitLab hosts retain their stored cooldowns across restart and temporary removal.
 
 A successful API discovery does not guarantee a successful mirror backup. API presence updates `source.discovery_status` and `source.last_seen_at`. Only Git access can confirm Git availability. Git may fail despite API visibility, for example if the token lacks Git read permission. GitLab can omit `default_branch` or return null with limited access. RepoHarbor records it as unknown. The field establishes neither an empty project nor permission to read Git data.
 
@@ -75,7 +75,7 @@ Crash recovery reconciles interrupted operations, records proven completion only
 
 An existing valid mirror is **never automatically deleted or replaced by a fresh clone**. Removing a source from configuration preserves its local backup. A remote disappearance or authentication failure does not prove that the repository was deleted.
 
-Discovery records its own state in the existing central `data.json` without replacing the active Git-operation slot. Repository metadata is atomically written, but the catalog is **not** a multi-file atomic filesystem transaction. Runnable GitHub sources and the runnable sources for each GitLab authority are published in memory only after all metadata writes and the completion marker are durable. A crash during catalog publication may leave some metadata updated; startup permits no discovered-source remote work from that partial catalog, and a fresh complete discovery must recompute selection. Missing metadata in a newly created directory fails closed and may require operator review; it is never silently overwritten or re-cloned. Existing Git journals and completion markers continue to govern backup recovery.
+Discovery records its own state in the existing central `data.json` without replacing the active Git-operation slot. Repository metadata is atomically written, but the catalog is **not** a multi-file atomic filesystem transaction. Runnable GitHub sources and the runnable sources for each GitLab authority are published in memory only after all metadata writes and the completion marker are durable. A crash during catalog publication may leave some metadata updated; startup permits no discovered-source remote work from that partial catalog, and a fresh complete discovery must recompute selection. New catalog entries are published after staged metadata is durable. Empty legacy directories without metadata are preserved for operator review. Existing Git journals and completion markers continue to govern backup recovery.
 
 ## Interrupted initial clones and quarantine
 
@@ -161,3 +161,45 @@ Invalid file setup causes a safe startup diagnosis. If the file sink fails durin
 A mirror does **not** provide historical snapshots. Deleted remote refs and force-pushes propagate to the mirror. Git LFS data, separate submodule repositories, issues, pull/merge requests, hosting metadata, and never-pushed local objects are not backed up by this version. Notifications are outside its scope.
 
 Follow the [deployment guide](../deploy/README.md) for host-mount validation, non-root permissions, credential setup, updates, and an offline restore. See [configuration](CONFIGURATION.md) for status semantics and [testing](TESTING.md) for automated checks. Actual NAS/Portainer deployment and disaster-recovery acceptance remain separate operator tasks.
+
+
+### Backup and restore durability
+
+An existing mirror's managed Git settings are verified before normal Git mutation.
+System and global configuration, implicit transports, redirects, and credential
+helpers remain restricted. Askpass releases a credential only for its configured
+TLS authority. Keep the backup root and its parents under trusted control. Locks
+and descriptor-based operations do not exclude an independent privileged writer.
+
+Git is configured to synchronize its updates and verify incoming objects. RepoHarbor
+also synchronizes cloned files and Git directories before recording completion.
+At startup, it verifies interrupted mirrors. It also rechecks the latest completed
+Git operation when the enclosing run is still marked running or its completion no
+longer matches the repository metadata or mirror path. A normal restart with matching
+completed state does not scan all mirrors. When a mirror cannot be verified,
+RepoHarbor durably retains its operation in the repository metadata before releasing
+the shared journal slot. The repository stays blocked for backup and offline
+restore until recovery can account for the operation.
+
+A clone's files and directories or the bundle file are synchronized before
+no-replace restore publication. The
+destination parent is synchronized afterwards. If JSON replacement succeeds but the
+directory fails to synchronize, RepoHarbor prevents further writes until restart.
+
+Manual and periodic integrity checks only inspect Git contents. Both can persist
+confirmed damage and block normal mutations. Verification failures such as timeouts
+or I/O errors can leave a mirror unconfirmed without consuming a repair attempt.
+
+These measures depend on Git and the storage stack honoring synchronization.
+Controller caches and NAS implementations without appropriate power-loss protection
+can lose acknowledged writes. Test physical durability and restore on target storage.
+
+### Runtime image vulnerabilities
+
+The application image uses JSON for state and excludes the unused SQLite
+library and optional Python extension. The runtime advisory assessment records
+the Git HTTPS safeguards and explains which scanner entries do not apply to
+supported RepoHarbor execution paths. The supported deployment runs as a
+non-root UID with no-new-privileges and all capabilities dropped. Image CI
+retains the complete, unfiltered scan and CycloneDX SBOM.
+[Runtime image advisory assessment](audits/RepoHarbor-Image-Advisory-Review-0.9.2.md)

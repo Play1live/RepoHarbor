@@ -57,6 +57,15 @@ class Cron:
             (dom and dow) if wildcard_day else (dom or dow)
         )
 
+    def require_possible(self) -> None:
+        # A Gregorian cycle includes every combination of month, day and weekday.
+        day = datetime(2000, 1, 1)
+        for _ in range(146097):
+            if self.matches_date(day):
+                return
+            day += timedelta(days=1)
+        raise HarborError("Cron has no possible calendar date")
+
     def next_after(self, now: datetime, zone: ZoneInfo) -> datetime | None:
         day = now.astimezone(zone).replace(hour=0, minute=0, second=0, microsecond=0)
         minutes, hours, *_ = self.fields

@@ -23,7 +23,13 @@ from repoharbor.events import Events
 from repoharbor.git_backup import Git
 from repoharbor.log_files import LogSetupError
 from repoharbor.mounts import aliases_protected_mount as aliases_protected_mount
-from repoharbor.persistence import read_json, safe_tree, validate_state
+from repoharbor.persistence import (
+    directory_fd,
+    read_json,
+    safe_tree,
+    sync_tree,
+    validate_state,
+)
 
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 AT_FDCWD = -100
@@ -41,9 +47,12 @@ def locked_root(root: Path) -> Iterator[int]:
     if not root.is_dir() or any(p.is_symlink() for p in (root, *root.parents)):
         raise HarborError("Restore requires an existing, safe backup root")
     try:
-        fd = os.open(
-            root / ".repoharbor.lock", os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
-        )
+        with directory_fd(root) as root_fd:
+            fd = os.open(
+                ".repoharbor.lock",
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
     except FileNotFoundError:
         raise HarborError("Existing backup lock is missing") from None
     except OSError as error:
@@ -91,6 +100,7 @@ def mirror_path(root: Path, repository: str) -> Path:
         raise HarborError("Mirror path disagrees with repository metadata")
     if (
         "partial_operation" in backup
+        or "deferred_operation" in backup
         or backup.get("quarantine", {}).get("state") == "pending"
         or (folder / "repository.git.partial").exists()
         or (folder / "repository.git.partial").is_symlink()
@@ -425,7 +435,6 @@ def restore_local(
                 stop,
                 extra_fds=(parent_fd,),
                 output_errors="surrogateescape",
-                scratch=stage,
             )
             git.backup_lock_fd = fd
             try:
@@ -457,6 +466,7 @@ def restore_local(
                 checkout(git, repo, refs, head, branch)
                 artifact = repo
                 artifact.chmod(0o700)
+                sync_tree(artifact)
             else:
                 artifact = bundle
                 with artifact.open("rb") as stream:

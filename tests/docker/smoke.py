@@ -601,10 +601,32 @@ def logging_smoke():
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.9.1"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.9.2"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
+    assert (
+        docker(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python",
+            IMAGE,
+            "-c",
+            "from importlib.util import find_spec;"
+            "from ctypes.util import find_library;"
+            "from pathlib import Path;"
+            "assert find_spec('_sqlite3') is None;"
+            "assert find_library('sqlite3') is None;"
+            "assert find_library('gssrpc') is None;"
+            "assert not any(Path(p).exists() for p in "
+            "('/usr/sbin/krb5kdc', '/usr/sbin/kadmind', "
+            "'/usr/lib/systemd/systemd-homed'))",
+        )
+        == ""
+    )
     env = [
         "-e",
         "REPOHARBOR_TOKEN_SOURCE=env",

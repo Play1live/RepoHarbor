@@ -153,7 +153,6 @@ class Retries:
         state = self.engine.repos[alias].get("retry")
         if state:
             if state["status"] == "running":
-                state.update(last_result="succeeded", last_error_code=None)
                 self.engine.events.log(
                     "retry.succeeded",
                     repository=alias,
@@ -162,7 +161,14 @@ class Retries:
                 )
             state.pop("discovery_deferrals", None)
             state.update(
-                status="succeeded", attempts=0, next_attempt_at=None, block_reason=None
+                status="succeeded",
+                attempts=0,
+                next_attempt_at=None,
+                block_reason=None,
+                last_result="succeeded"
+                if state["last_attempt_at"] is not None
+                else None,
+                last_error_code=None,
             )
 
     def failure(

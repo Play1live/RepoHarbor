@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 import yaml
 
-from repoharbor.config import canonical_url, gib, load
+from repoharbor.config import Source, canonical_url, gib, load
 from repoharbor.credentials import Credentials
 from repoharbor.errors import HarborError
 
@@ -52,6 +52,77 @@ def test_defaults_and_supported_schema():
         canonical_url("https://example.org:8443/r.git")
         == "https://example.org:8443/r.git"
     )
+
+
+def test_yaml_merge_with_explicit_override():
+    cfg = load(
+        env(
+            REPOHARBOR_CONFIG="""schema_version: 1
+storage:
+  <<: {global_gib: 2, default_repo_gib: 1}
+  global_gib: 3
+"""
+        )
+    )
+    assert cfg.storage.global_bytes == 3 * 1024**3
+    assert cfg.storage.repo_bytes == 1024**3
+
+
+def test_yaml_nested_merge_reuses_anchors_across_loads():
+    raw = """schema_version: 1
+manual_git_urls:
+  - &first
+    <<: &base {url: 'https://example.org/base.git', web_url: 'https://example.org/project'}
+    alias: first
+    url: https://example.org/first.git
+  - &second
+    <<: *first
+    alias: second
+    url: https://example.org/second.git
+    web_url: https://example.org/second
+  - <<: [*second, *base, *first, *base]
+    alias: third
+    url: https://example.org/third.git
+"""
+    expected = (
+        Source("first", "https://example.org/first.git", "https://example.org/project"),
+        Source(
+            "second", "https://example.org/second.git", "https://example.org/second"
+        ),
+        Source("third", "https://example.org/third.git", "https://example.org/second"),
+    )
+    for _ in range(2):
+        assert load(env(REPOHARBOR_CONFIG=raw)).sources == expected
+
+
+@pytest.mark.parametrize(
+    ("mapping", "message"),
+    [
+        ("schedule: '0 3 * * *'\nschedule: '0 4 * * *'", "Duplicate YAML mapping key"),
+        (
+            "storage: {<<: &base {global_gib: 2, global_gib: 3}}",
+            "Duplicate YAML mapping key",
+        ),
+        ("storage: {overrides: {demo: 1, demo: 2}}", "Duplicate YAML mapping key"),
+        (
+            "storage: {<<: {global_gib: 2}, <<: {global_gib: 3}}",
+            "Duplicate YAML mapping key",
+        ),
+        ("storage: {? [global_gib] : 2}", "Invalid YAML mapping key"),
+        ("storage: {<<: {unexpected: 2}}", "Unknown or malformed configuration field"),
+        (
+            "manual_git_urls: [{<<: {alias: ../bad}, url: 'https://example.org/demo.git'}]",
+            "Invalid identifier",
+        ),
+        (
+            "manual_git_urls: [{<<: {alias: demo}, url: 'http://example.org/demo.git'}]",
+            "Only credential-free HTTPS URLs",
+        ),
+    ],
+)
+def test_yaml_merge_does_not_bypass_validation(mapping, message):
+    with pytest.raises(HarborError, match=message):
+        load(env(REPOHARBOR_CONFIG=f"schema_version: 1\n{mapping}\n"))
 
 
 @pytest.mark.parametrize(
@@ -157,6 +228,7 @@ def test_credential_modes_rotation_and_redaction(tmp_path):
     assert "REPOHARBOR_ASKPASS_TOKEN" not in creds.git_env(None)
     for name in cfg.credentials:
         (tmp_path / name).write_text("rotated-token\n")
+        (tmp_path / name).chmod(0o600)
     with pytest.raises(HarborError, match="Mixed"):
         Credentials.resolve(cfg, values)
     cfg = replace(cfg, token_source="file")

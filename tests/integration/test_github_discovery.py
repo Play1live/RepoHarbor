@@ -325,13 +325,13 @@ def test_discovery_publication_write_failure_leaves_no_runnable_provider(
 ):
     env = github_env
     with env.create(env.config, git_instance=env.git()) as engine:
-        original = engine.save_meta
+        original = engine.publish_meta
 
-        def fail(alias):
-            original(alias)
+        def fail(alias, meta):
+            original(alias, meta)
             raise OSError(errno.ENOSPC, "injected")
 
-        monkeypatch.setattr(engine, "save_meta", fail)
+        monkeypatch.setattr(engine, "publish_meta", fail)
         with pytest.raises(OSError):
             engine.run()
         assert engine.sources == ()

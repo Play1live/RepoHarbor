@@ -1,6 +1,6 @@
-# RepoHarbor 0.9.1 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor 0.9.2 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.9.1**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **0.9.2**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.9.1`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `0.9.2`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -88,7 +88,7 @@ sudo chown 10001:10001 /srv/repoharbor/secrets/example_primary
 sudo chmod 0400 /srv/repoharbor/secrets/example_primary
 ```
 
-Keep the secrets bind mount read-only. Do not commit, print, screenshot, or log token values. The application removes trailing CR/LF when loading a secret file; a missing, unreadable, or empty configured credential causes validation to fail. Restart the service after token rotation.
+Keep the secrets bind mount read-only. Do not commit, print, screenshot, or log token values. The application removes trailing CR/LF when loading a secret file; a missing, unreadable, empty, oversized, or non-private credential causes validation to fail. Use a regular file with mode 0400 or 0600 owned by the service UID. Root ownership is also accepted when the service can read the file. For Docker Secret drivers that publish broad modes, use a private file in the protected host bind mount. Keep NAS ACLs private. Restart the service after token rotation.
 
 ### Alternative: environment-based credentials
 
@@ -311,7 +311,7 @@ Select **Check integrity** in a repository's details or **Check all repositories
 
 In Portainer, create the files on the Docker endpoint host, use the same read-only bind mount and loopback publication or private proxy network, then redeploy the existing stack. For startup diagnostics, check the container log for `web.ready` or `web.unavailable` when extended logging is active. Without extended logging, look for `HTTPS dashboard ready` or `Web dashboard could not open securely`. Confirm the bind/port, exact browser origin, certificate chain, and that UID 10001 can read all three files. Sessions expire after 15 minutes and after a restart.
 
-When a proxy connects to RepoHarbor, the backend sign-in limit applies to the proxy's source address. Apply per-client limits to `POST /api/login` at the trusted proxy and keep the interface restricted to a management network or VPN. Forwarding headers do not change how RepoHarbor counts attempts. Custom images must provide OpenSSL-backed scrypt through Python's `hashlib`. The supplied Docker image verifies scrypt during dashboard startup.
+By default the sign-in limit applies to the TCP peer, including a reverse proxy. To distinguish clients behind a dedicated proxy, set `web.trusted_proxy` to its exact backend-facing IPv4 address and limit access to the backend listener to that proxy. Configure the proxy to **overwrite** `X-Real-IP` with the verified client address and apply per-client limits to `POST /api/login`. RepoHarbor ignores `Forwarded` and `X-Forwarded-For`. Custom images must provide OpenSSL-backed scrypt through Python's `hashlib`. The supplied Docker image verifies scrypt during dashboard startup.
 
 ### Enable automatic retries
 
@@ -493,3 +493,23 @@ Direct Git recovery needs only the intact local mirror and Git. Git project file
 A mirror follows remote branch/tag deletion and force-pushes. It does **not** provide historical snapshots or preserve Git LFS payloads, separate submodule repositories, issues, pull/merge requests, other hosting metadata, or unpushed local changes. Neither restore workflow nor bundle export retrieves those separately. Plan separate protection for any of those requirements.
 
 **Before production use**, accept the actual host mount, filesystem behavior, user permissions, chosen authentication mode, a real scheduled backup, recorded timestamps, container recreation, and an offline restore on the target NAS. Automated local tests and green CI are not a substitute for that acceptance test.
+
+
+### Upgrade to 0.9.2
+
+Stop the old instance and reuse the existing backup bind mount. Existing schema-1 data,
+repository IDs, aliases and excluded mirrors need no initialization or data migration.
+Review Git secret permissions and use one credential name per HTTPS authority. For a
+mirror whose local Git settings are rejected, preserve the original and review a copy
+offline before attempting another backup.
+
+The backup root must be persistent. Linux containers reject tmpfs and ramfs at that path.
+To detect a wrong bind mount, optionally create a regular `.repoharbor-storage-id` file on
+the intended volume and set `REPOHARBOR_STORAGE_ID` to its ASCII contents, excluding the
+final newline. Use the same setting for restore if you want it to verify the volume. A
+missing or mismatched configured marker stops the operation. Independently verify the
+actual host device when deploying without a marker.
+
+A full run with missing included sources does not advance its successful timestamp.
+Verification of unchanged mirrors can take longer. Review the coverage summary and
+verify both an updated mirror and an offline restore on the target storage.

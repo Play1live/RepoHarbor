@@ -89,6 +89,8 @@ ERROR_CODES = frozenset(
         "GIT_INTERRUPTED",
         "GIT_NETWORK",
         "GIT_OUTPUT_LIMIT",
+        "GIT_INVALID_REFS",
+        "GIT_SNAPSHOT_CHANGED",
         "GIT_SERVER_TEMPORARY",
         "GIT_TIMEOUT",
         "BACKUP_FAILED",

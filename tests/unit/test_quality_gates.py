@@ -29,7 +29,7 @@ def test_coverage_gate_fails_on_each_independent_threshold(gate):
             f"src/repoharbor/{name}.py": {
                 "summary": {"covered_lines": 95, "num_statements": 100}
             }
-            for name in gate.CRITICAL
+            for name in gate.CRITICAL | gate.WEB_AND_RETRY
         },
     }
     gate.check(report)
@@ -39,6 +39,9 @@ def test_coverage_gate_fails_on_each_independent_threshold(gate):
         lambda r: r["totals"].update(covered_branches=84),
         lambda r: r["meta"].update(branch_coverage=False),
         lambda r: r["files"].pop("src/repoharbor/recovery.py"),
+        lambda r: r["files"]["src/repoharbor/dashboard_http.py"]["summary"].update(
+            covered_lines=89
+        ),
         lambda r: r["files"]["src/repoharbor/recovery.py"]["summary"].update(
             covered_lines=94
         ),

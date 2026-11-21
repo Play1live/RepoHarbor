@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 from argparse import Namespace
 from dataclasses import replace
@@ -84,6 +85,10 @@ def test_git_deadline_is_distinct_from_shutdown_and_local_commands(
 ):
     process = Mock(pid=123)
     process.poll.return_value = None
+    for name in ("stdout", "stderr"):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        setattr(process, name, os.fdopen(read_fd, "rb"))
     popen = Mock(return_value=process)
     monkeypatch.setattr("repoharbor.git_backup.subprocess.Popen", popen)
     monkeypatch.setattr("repoharbor.git_backup.os.killpg", Mock())
@@ -160,7 +165,7 @@ def test_retry_backoff_limit_and_regular_success(factory, monkeypatch, caplog):
         assert engine.run() == Result.SUCCESS
         meta = engine.repos["demo"]
         assert state["status"] == "succeeded" and state["attempts"] == 0
-        assert state["last_result"] == "failed"
+        assert state["last_result"] == "succeeded" and state["last_error_code"] is None
         assert meta["backup"]["successful_updates"] == 1
         assert meta["errors"]["total"] == 6 and meta["errors"]["consecutive"] == 0
         assert "retry limit reached repository=demo" in caplog.text
@@ -476,7 +481,9 @@ def test_retry_fetch_requires_offline_recovery_and_keeps_repair_limits(
             fetch.assert_not_called()
             assert meta["backup"]["successful_updates"] == 1
             assert meta["retry"]["block_reason"] == "RECOVERY_REQUIRED"
-            assert engine.store.data["active_operation"]["state"] == (
-                "interrupted" if local_state == "unsupported" else "reconciled"
-            )
+            operation = engine.store.data["active_operation"]
+            assert operation["state"] == "reconciled"
+            if local_state == "unsupported":
+                assert meta["backup"]["deferred_operation"]["id"] == operation["id"]
+                assert meta["backup"]["deferred_operation"]["state"] == "interrupted"
         assert meta["integrity"]["repair_attempts"] == 2

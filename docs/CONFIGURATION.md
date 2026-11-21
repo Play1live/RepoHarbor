@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.9.1` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise discovery and SSH are outside this version's scope.
+RepoHarbor `0.9.2` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise Server and SSH are outside this version's scope. GitHub Enterprise Cloud internal repositories can be included through the visibility filter.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -88,7 +88,7 @@ retry:
 For a configured credential named `example_primary`:
 
 - In **`env` mode**, the token is read from `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`.
-- In **`file` mode**, the token is read from the regular UTF-8 file `/run/secrets/repoharbor/example_primary`, mounted read-only. Its trailing CR/LF is stripped.
+- In **`file` mode**, the token is read from the private regular ASCII file `/run/secrets/repoharbor/example_primary`, mounted read-only. Its trailing CR/LF is stripped. The file is limited to 8 KiB and must be service-owned or root-owned with no group or other permissions. Use one credential name per HTTPS authority, including the effective port.
 
 A configured secret found in both the chosen and opposite modes is rejected. Credential names use lowercase letters, digits, `_`, and `-`, and must be unique. Because `-` and `_` map to the same environment variable name, ambiguous names are rejected. Empty or malformed credential values are rejected. Tokens are never intended to be embedded in URLs or persisted in metadata. Credential rotation requires a restart.
 
@@ -247,7 +247,7 @@ Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts
 
 Budgets use binary GiB (`1 GiB = 1,073,741,824 bytes`); fractional inputs are truncated to whole bytes. `0` means no new transfer may start. An override replaces the default per-repository budget; it does not add to it. Global usage includes **all** backup-root data, including excluded sources, journals, metadata, partials, and quarantines.
 
-With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh during subsequent backup runs. No existing backup is automatically deleted to free space.
+With the default `during_transfer: finish`, a running transfer can complete even if it exceeds a configured size budget. A budget at or above its limit blocks subsequent transfers within its scope. RepoHarbor measures the entire backup root at transfer admission when a global limit is configured. Status views can use a recent estimate between full measurements. The physical reserve may interrupt a running transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds, and capacity is checked at most once every five seconds during Git operations. The budgets are soft limits based on point-in-time measurements. Eligibility is checked again on subsequent runs, including after space is freed. No existing backup is automatically deleted to free space.
 
 ## Periodic integrity checks
 
@@ -406,7 +406,7 @@ Both commands require a new output path with an existing writable parent outside
 ## Runtime state and recovery
 
 - `data.json` is the central, durable run/operation journal and scheduler state. Its `discovery` section records GitHub discovery, and `provider_discovery` records GitLab discovery by authority. These records track running, completed, or failed discovery and any cooldown separately from the Git operation journal. The optional `integrity` section records the periodic run state, counters, and overlap history.
-- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`.
+- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`. The optional `backup.deferred_operation` holds the operation record when recovery must wait for a conclusive mirror check. Other repositories can proceed once that record is durable and the shared journal slot has been reconciled.
 - Optional `data.json.manual_integrity` and `metadaten.json.integrity.manual` records keep the latest manual run and each mirror's latest completed manual finding separately from periodic checks and repair state. Service restart marks an unfinished run interrupted and preserves completed findings.
 - Each source directory's `repository.git/` contains the valid bare mirror when available. A partial first clone can exist as `repository.git.partial/`; an interrupted partial may be preserved in `quarantine/initial-clone/`.
 
@@ -414,7 +414,7 @@ Both commands require a new output path with an existing writable parent outside
 |---|---|
 | `updated` / `up_to_date` | Successful changed mirror or successful no-op remote check. |
 | `global_limit_paused`, `repo_limit_reached`, `FREE_SPACE_RESERVE` | A new operation was withheld by a capacity condition. |
-| `repair_paused` + `repair_deferred` | Repair deferred for storage or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
+| `repair_paused` + `repair_deferred` | Recovery or repair deferred for verification, storage, or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
 | `pending` | Backup work is pending. This can also follow a clean periodic check that cleared an obsolete repair status. |
 | `repair_failed` | Genuine exhausted repair attempts or an unrecoverable/unavailable repair condition. |
 | `interrupted` | Operation was interrupted or not proven complete. |
@@ -423,3 +423,21 @@ Both commands require a new output path with an existing writable parent outside
 `last_attempt_at`, `last_checked_at`, and `last_updated_at` have different meanings; skipped or failed operations must not create a false successful check or update. Repairs do not themselves imply a new Git reference update. An exhausted genuine repair does not become `repair_paused` simply because free space is also low.
 
 For controlled recovery and operator actions, see [SECURITY.md](SECURITY.md). The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) covers the assistant and direct Git recovery from an intact mirror. Both restore workflows and bundles use the Git data in the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, hosting metadata, and unpushed local changes require separate backups. See the [changelog](../Changelog.md) for version history. Production NAS acceptance remains an operator task.
+
+
+### Verification and backup coverage
+
+In the current full run, `backup_coverage` exposes the planned and attempted target counts,
+the excluded catalog count, and unavailable included IDs. A full run with missing included
+provider repositories returns exit 8 even if another source succeeds. An unavailable mirror
+remains on disk and can be recovered offline if otherwise valid.
+
+`latest_verification` records the most recent local finding, including a safety skip.
+`last_verified_healthy_at` is historical. `restore_compatibility` distinguishes the clone
+and bundle formats, clone-only eligibility for an empty mirror, unsupported formats and
+unconfirmed state. Verify an actual offline restore to confirm the export end to end.
+Current and previously completed integrity runs are reported separately.
+
+Use unique explicit keys in each YAML mapping. Normal YAML merge precedence is supported.
+Schedules with no possible calendar date are rejected. See the deployment instructions
+before setting the optional `web.trusted_proxy` or `REPOHARBOR_STORAGE_ID`.

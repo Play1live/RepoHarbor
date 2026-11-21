@@ -93,6 +93,9 @@ def test_manual_checks_all_catalog_mirrors_without_remote_or_repair(factory, rem
             state[key]
             for key in ("checked", "healthy", "corrupt", "skipped", "uncheckable")
         ] == [3, 2, 1, 1, 1]
+        history = engine.store.data["integrity_history"]
+        assert history["integrity"] == previous.pop("integrity_history")["integrity"]
+        assert history["manual_integrity"]["result"] == "issues"
         assert all(engine.store.data[key] == value for key, value in previous.items())
         assert all(
             not {"fetch", "clone", "ls-remote"}.intersection(call)
@@ -504,7 +507,7 @@ def test_filters_apply_with_only_local_provider_metadata(github_env, monkeypatch
         assert engine.repos[env.key]["selection"] == selection
 
 
-def test_uncertain_periodic_recovery_cannot_replace_an_unresolved_journal(
+def test_uncertain_periodic_recovery_preserves_an_unresolved_operation(
     factory,
     monkeypatch,
 ):
@@ -519,10 +522,14 @@ def test_uncertain_periodic_recovery_cannot_replace_an_unresolved_journal(
         assert engine.repos["demo"]["integrity"]["repair_attempts"] == 0
         assert not any("fetch" in args for args in engine.git.calls)
         journal = engine.store.begin("demo", "repair")
-        with pytest.raises(HarborError, match="Cannot verify interrupted"):
-            recover(engine)
+        original = engine.store.data["active_operation"].copy()
+        recover(engine)
         assert engine.store.data["active_operation"]["id"] == journal
-        assert engine.store.data["active_operation"]["state"] == "running"
+        assert engine.store.data["active_operation"]["state"] == "reconciled"
+        assert engine.repos["demo"]["backup"]["deferred_operation"] == original
+        assert engine.repos["demo"]["integrity"]["status"] == "corrupt"
+        assert engine.repos["demo"]["integrity"]["repair_attempts"] == 0
+        assert not any("fetch" in args for args in engine.git.calls)
 
 
 @pytest.mark.parametrize("excluded", [False, True])
@@ -699,8 +706,8 @@ def test_verified_restore_retires_repair_state_only(
         ("repair-journal", "healthy"),
         ("repairing", "healthy"),
         ("interrupted", "healthy"),
-        ("partial", "healthy"),
-        ("partial-access", "healthy"),
+        ("partial", None),
+        ("partial-access", None),
         ("partial-operation", None),
         ("unknown-deferral", "healthy"),
         ("uncheckable", "uncheckable"),

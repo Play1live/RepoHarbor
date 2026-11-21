@@ -1,0 +1,46 @@
+{
+  "authentication": {
+    "credential_name": null
+  },
+  "backup": {
+    "completed_operation": "2026-11-21T14:03:01.653373Z",
+    "created_at": "2026-11-21T14:02:59.544391Z",
+    "format": "mirror",
+    "last_attempt_at": "2026-11-21T14:03:01.344730Z",
+    "last_checked_at": "2026-11-21T14:03:01.963475Z",
+    "last_updated_at": "2026-11-21T14:03:01.963475Z",
+    "limit_bytes": null,
+    "relative_path": "repository.git",
+    "size_bytes": 28005,
+    "size_measured_at": "2026-11-21T14:03:01.975560Z",
+    "status": "updated",
+    "storage_status": "available",
+    "successful_updates": 4
+  },
+  "errors": {
+    "consecutive": 0,
+    "last": null,
+    "recent": [],
+    "total": 0
+  },
+  "integrity": {
+    "last_checked_at": null,
+    "repair_attempts": 0,
+    "status": "healthy",
+    "successful_repairs": 0
+  },
+  "repository": {
+    "clone_url": "https://example.org/repo.git",
+    "id": "demo",
+    "provider": "manual",
+    "web_url": null
+  },
+  "schema_version": 1,
+  "selection": {
+    "reason": null,
+    "status": "included"
+  },
+  "source": {
+    "status": "available"
+  }
+}

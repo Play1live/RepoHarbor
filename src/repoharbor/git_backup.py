@@ -4,18 +4,23 @@ import contextlib
 import os
 import re
 import select
+import selectors
 import shutil
 import signal
+import stat
 import subprocess
-import tempfile
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from repoharbor.credentials import Credentials
 from repoharbor.errors import GitError, HarborError
+
+GIT_OUTPUT_MAX = 32 * 1024 * 1024
+DIAGNOSTIC_MAX = 65536
 
 
 def transient_git_error(diagnostic: bytes) -> str | None:
@@ -54,15 +59,13 @@ class Git:
         timeout: float = 3600,
         *,
         extra_fds: tuple[int, ...] = (),
-        output_errors: str = "replace",
-        scratch: Path | None = None,
+        output_errors: str = "surrogateescape",
     ):
         self.credentials, self.stop, self.timeout = credentials, stop, timeout
         self.remote_head: str | None = None
         self.backup_lock_fd: int | None = None
         self.extra_fds = extra_fds
         self.output_errors = output_errors
-        self.scratch = scratch
         self.classify_transient = False
 
     def run(
@@ -77,7 +80,16 @@ class Git:
             raise HarborError("INTERRUPTED")
         env = self.credentials.git_env(credential if probe is None else None)
         command = next(iter(args[2:] if args[:1] == ["-C"] else args), None)
+        if args and args[0] in ("clone", "ls-remote"):
+            # These commands create or query a repository without using a
+            # local Git config. Suppress discovery from the caller's cwd.
+            env["GIT_DIR"] = os.devnull
         remote = args.index("--") + 1 if "--" in args else len(args)
+        if credential is not None and probe is None:
+            if remote >= len(args) or not args[remote].startswith("https://"):
+                raise GitError("GIT_FAILED")
+            env["REPOHARBOR_ASKPASS_AUTHORITY"] = urlsplit(args[remote]).netloc
+            env["LC_ALL"] = "C"
         classify = (
             self.classify_transient
             and probe is None
@@ -103,22 +115,11 @@ class Git:
                 GIT_ASKPASS="/bin/false",
             )
         with contextlib.ExitStack() as stack:
-            # Periodic probes drain a bounded pipe without writing temporary output.
-            out = (
-                stack.enter_context(tempfile.TemporaryFile(dir=self.scratch))
-                if probe is None
-                else None
-            )
-            err = (
-                stack.enter_context(tempfile.TemporaryFile(dir=self.scratch))
-                if probe is None
-                else None
-            )
             process = subprocess.Popen(
                 [shutil.which("git") or "/usr/bin/git", *args],
                 env=env,
-                stdout=subprocess.PIPE if probe is not None else out,
-                stderr=subprocess.STDOUT if probe is not None else err,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT if probe is not None else subprocess.PIPE,
                 start_new_session=True,
                 # Keep the root locked while Git survives a daemon SIGKILL.
                 pass_fds=self.extra_fds
@@ -130,19 +131,18 @@ class Git:
                     assert process.stdout is not None
                     stack.enter_context(process.stdout)
                     return self.probe_output(process, started, probe == "fsck")
-                assert out is not None and err is not None
-                while process.poll() is None:
-                    if self.stop.is_set() or interrupt():
-                        raise HarborError("INTERRUPTED")
-                    if time.monotonic() - started > self.timeout:
-                        if classify:
-                            raise GitError("GIT_TIMEOUT")
-                        raise HarborError("INTERRUPTED")
-                    self.stop.wait(0.1)
+                assert process.stdout is not None and process.stderr is not None
+                stack.enter_context(process.stdout)
+                stack.enter_context(process.stderr)
+                output, diagnostic = self.command_output(
+                    process,
+                    started,
+                    interrupt,
+                    classify,
+                    command not in ("clone", "fetch"),
+                )
                 if process.returncode:
-                    # Classify bounded diagnostics; never persist/print their contents.
-                    err.seek(0)
-                    diagnostic = err.read(65536).lower()
+                    diagnostic = diagnostic.lower()
                     if b"no space left on device" in diagnostic:
                         raise GitError("ENOSPC")
                     remote = any(
@@ -160,12 +160,11 @@ class Git:
                             b"repository not found",
                         )
                     )
-                    code = transient_git_error(diagnostic) if classify else None
+                    code = transient_git_error(bytes(diagnostic)) if classify else None
                     raise GitError(
                         code or "GIT_FAILED", "unavailable" if unavailable else None
                     )
-                out.seek(0)
-                return out.read().decode("utf-8", errors=self.output_errors)
+                return output.decode("utf-8", errors=self.output_errors)
             finally:
                 if process.poll() is None:
                     with contextlib.suppress(ProcessLookupError):
@@ -175,6 +174,40 @@ class Git:
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+
+    def command_output(
+        self,
+        process: subprocess.Popen[bytes],
+        started: float,
+        interrupt: Callable[[], bool],
+        classify: bool,
+        keep_stdout: bool,
+    ) -> tuple[bytearray, bytearray]:
+        output, diagnostic = bytearray(), bytearray()
+        assert process.stdout is not None and process.stderr is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ, "out")
+            selector.register(process.stderr, selectors.EVENT_READ, "err")
+            while selector.get_map() or process.poll() is None:
+                if self.stop.is_set() or interrupt():
+                    raise HarborError("INTERRUPTED")
+                if time.monotonic() - started > self.timeout:
+                    if classify:
+                        raise GitError("GIT_TIMEOUT")
+                    raise HarborError("INTERRUPTED")
+                for key, _ in selector.select(0.1):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    elif key.data == "err":
+                        diagnostic.extend(
+                            chunk[: max(0, DIAGNOSTIC_MAX - len(diagnostic))]
+                        )
+                    elif keep_stdout:
+                        output.extend(chunk)
+                        if len(output) > GIT_OUTPUT_MAX:
+                            raise GitError("GIT_OUTPUT_LIMIT")
+        return output, diagnostic
 
     def probe_output(
         self, process: subprocess.Popen[bytes], started: float, fsck: bool
@@ -224,20 +257,112 @@ class Git:
             )
         return output.decode("utf-8", errors="replace")
 
+    def require_managed_config(self, mirror: Path) -> None:
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK | os.O_RDONLY
+        # Parse Git's syntax with includes disabled. Every setting used when opening
+        # the existing mirror must belong to the configuration of a managed clone.
+        try:
+            with os.fdopen(os.open(mirror / "config", flags), "rb") as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                    raise GitError("MIRROR_UNSUPPORTED")
+        except OSError:
+            raise GitError("FILESYSTEM_ERROR") from None
+        approved = {
+            "core.repositoryformatversion",
+            "core.filemode",
+            "core.bare",
+            "core.logallrefupdates",
+            "core.ignorecase",
+            "core.precomposeunicode",
+            "core.symlinks",
+            "extensions.objectformat",
+            "extensions.refstorage",
+            "remote.origin.url",
+            "remote.origin.fetch",
+            "remote.origin.tagopt",
+            "remote.origin.mirror",
+        }
+        keys = self.run(
+            [
+                "config",
+                "--file",
+                str(mirror / "config"),
+                "--no-includes",
+                "--null",
+                "--name-only",
+                "--list",
+            ],
+            probe="config",
+        )
+        if any(key not in approved for key in keys.lower().split("\0") if key):
+            raise GitError("MIRROR_UNSUPPORTED")
+        if any(
+            (mirror / item).exists()
+            for item in (
+                "commondir",
+                "config.worktree",
+                "shallow",
+                "objects/info/alternates",
+                "objects/info/http-alternates",
+                "info/grafts",
+            )
+        ) or any((mirror / "objects/pack").glob("*.promisor")):
+            raise GitError("MIRROR_UNSUPPORTED")
+
+    def restore_compatibility(self, mirror: Path) -> str:
+        try:
+            self.require_managed_config(mirror)
+            entries = (
+                self.run(
+                    [
+                        "config",
+                        "--file",
+                        str(mirror / "config"),
+                        "--no-includes",
+                        "--null",
+                        "--list",
+                    ],
+                    probe="config",
+                )
+                .lower()
+                .split("\0")
+            )
+            if any(
+                entry.startswith("extensions.refstorage\n")
+                and entry != "extensions.refstorage\nfiles"
+                for entry in entries
+            ):
+                return "unsupported"
+            head = self.head(mirror)
+            if self.refs(mirror) or (head and not head.startswith("refs/")):
+                return "clone_and_bundle"
+            return "clone_only"
+        except (OSError, HarborError):
+            return "unconfirmed"
+
     def refs(self, mirror: Path) -> str:
         return self.run(
             ["-C", str(mirror), "for-each-ref", "--format=%(objectname) %(refname)"]
-        )
+        ).removesuffix("\n")
 
     def remote_refs(self, url: str, credential: str | None) -> str:
         raw = self.run(["ls-remote", "--symref", "--", url], credential)
         self.remote_head = None
         refs = []
-        for line in raw.splitlines():
-            fields = line.split()
-            if fields[0] == "ref:" and fields[-1] == "HEAD":
-                self.remote_head = fields[1]
-            elif fields[-1] == "HEAD" and self.remote_head is None:
+        # Git ref names can contain UTF-8 forms of whitespace but cannot contain TAB/LF.
+        for line in raw.split("\n"):
+            if not line:
+                continue
+            fields = line.split("\t")
+            if len(fields) != 2:
+                raise GitError("GIT_INVALID_REFS")
+            if fields[0].startswith("ref: "):
+                if fields[1] == "HEAD":
+                    self.remote_head = fields[0][5:]
+                continue
+            elif not re.fullmatch(r"[0-9a-f]{40}(?:[0-9a-f]{24})?", fields[0]):
+                raise GitError("GIT_INVALID_REFS")
+            if fields[-1] == "HEAD" and self.remote_head is None:
                 self.remote_head = fields[0]
             elif fields[-1].startswith("refs/") and not fields[-1].endswith("^{}"):
                 refs.append(" ".join(fields))
@@ -292,12 +417,20 @@ class Git:
         interrupt: Callable[[], bool],
         repair: bool = False,
     ) -> None:
-        # Explicit URL/refspec defeats altered remote URLs, helpers and push settings.
-        args = ["-C", str(mirror), "fetch", "--atomic", "--no-recurse-submodules"]
+        self.require_managed_config(mirror)
+        # Explicit URL/refspec avoids using configured remote URLs and mappings.
+        args = [
+            "-C",
+            str(mirror),
+            "fetch",
+            "--atomic",
+            "--no-auto-gc",
+            "--no-recurse-submodules",
+        ]
         args += (
             ["--refetch", "--no-write-fetch-head", "--refmap="]
             if repair
-            else ["--prune"]
+            else ["--prune", "--refmap="]
         )
         # Explicit object-ID source refspecs have no destination; --refmap= disables
         # any implicit remote mapping. Existing refs are never rewritten by repair.

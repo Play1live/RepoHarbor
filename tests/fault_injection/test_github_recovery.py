@@ -10,7 +10,6 @@ from conftest import api_response, raw_repo
 from test_crash_corrections import kill_at
 
 from repoharbor.config import Discovery, Source
-from repoharbor.errors import HarborError
 from repoharbor.github import GitHub
 from repoharbor.persistence import read_json
 from repoharbor.recovery import recover
@@ -61,7 +60,11 @@ def test_crash_during_selection_publication_requires_fresh_discovery(github_env)
     with create() as engine:
         assert engine.store.data["discovery"]["state"] == "running"
         recover(engine)
-        assert not engine.git.calls
+        # Interrupted runs can trigger a local recheck of the last completed mirror.
+        assert all(
+            not {"clone", "fetch", "ls-remote"}.intersection(call)
+            for call in engine.git.calls
+        )
         engine.run()
         assert engine.sources == ()
         for key, meta in engine.repos.items():
@@ -75,22 +78,26 @@ def test_orphan_metadata_directory_after_io_failure_fails_closed(
     github_env, monkeypatch, code
 ):
     env = github_env
-    with env.create(env.config, git_instance=env.git()) as engine:
+    module = "repoharbor.engine.atomic_json"
+    from repoharbor.persistence import atomic_json
 
-        def fail(alias):
+    def fail_staging(path, value):
+        if path.parent.name.startswith(".repoharbor-catalog-"):
             raise OSError(code, "injected")
+        return atomic_json(path, value)
 
-        monkeypatch.setattr(engine, "save_meta", fail)
-        with pytest.raises(OSError):
-            engine.run()
+    with env.create(env.config, git_instance=env.git()) as engine:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, fail_staging)
+            with pytest.raises(OSError):
+                engine.run()
         assert engine.sources == ()
-        journal = read_json(env.config.root / "data.json")
-        assert journal["discovery"]["state"] == "running"
-    before = (env.config.root / "data.json").read_bytes()
-    with pytest.raises(HarborError), env.create(env.config, git_instance=env.git()):
-        pass
-    assert (env.config.root / "data.json").read_bytes() == before
-    assert not list(env.config.root.rglob("repository.git"))
+        assert not engine.path(env.key).exists()
+        assert not list(env.config.root.rglob("repository.git"))
+    with env.create(env.config, git_instance=env.git()) as engine:
+        recover(engine)
+        engine.run()
+        assert engine.repos[env.key]["backup"]["successful_updates"] == 1
 
 
 def test_sigkill_after_rate_limit_keeps_long_cooldown_and_existing_mirrors(
