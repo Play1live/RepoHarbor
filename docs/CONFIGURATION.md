@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.9.2` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise Server and SSH are outside this version's scope. GitHub Enterprise Cloud internal repositories can be included through the visibility filter.
+RepoHarbor v1.0.0 supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise Server and SSH are outside this version's scope. GitHub Enterprise Cloud internal repositories can be included through the visibility filter.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -422,7 +422,7 @@ Both commands require a new output path with an existing writable parent outside
 
 `last_attempt_at`, `last_checked_at`, and `last_updated_at` have different meanings; skipped or failed operations must not create a false successful check or update. Repairs do not themselves imply a new Git reference update. An exhausted genuine repair does not become `repair_paused` simply because free space is also low.
 
-For controlled recovery and operator actions, see [SECURITY.md](SECURITY.md). The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) covers the assistant and direct Git recovery from an intact mirror. Both restore workflows and bundles use the Git data in the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, hosting metadata, and unpushed local changes require separate backups. See the [changelog](../Changelog.md) for version history. Production NAS acceptance remains an operator task.
+For controlled recovery and operator actions, see [SECURITY.md](SECURITY.md). The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) covers the assistant and direct Git recovery from an intact mirror. Both restore workflows and bundles use the Git data in the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, hosting metadata, and unpushed local changes require separate backups. See the [changelog](../Changelog.md) for version history. Validate each new NAS installation on its target host.
 
 
 ### Verification and backup coverage

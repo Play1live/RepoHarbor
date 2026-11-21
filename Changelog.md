@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0
+
+- First stable release of RepoHarbor following successful NAS/Portainer acceptance of v0.9.2.
+- Retain scheduled and manual Git mirror backups for GitHub, GitLab, and manual HTTPS repositories, with integrity checks, crash recovery, offline restore and bundle export, and an optional HTTPS dashboard.
+- Preserve compatibility with existing mirrors and configuration and persisted data using `schema_version: 1`. No data migration is required.
+
 ## 0.9.2
 
 - Verify Git objects before reporting backup success, including no-change runs. Report incomplete discovery coverage and distinguish Git integrity from restore compatibility.

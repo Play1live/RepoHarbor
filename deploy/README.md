@@ -1,6 +1,6 @@
-# RepoHarbor 0.9.2 — Docker Compose, Portainer, and NAS deployment
+# RepoHarbor v1.0.0 — Docker Compose, Portainer, and NAS deployment
 
-This guide covers RepoHarbor **0.9.2**. Automated Docker testing covers Linux/amd64. Production NAS/Portainer acceptance requires verification on the target host. Adapt the fictional repository, credential, and path examples to your environment.
+This guide covers RepoHarbor **v1.0.0**, the first stable release following successful NAS/Portainer acceptance of v0.9.2. Automated Docker testing covers Linux/amd64. Validate each new NAS/Portainer deployment on its target host. Adapt the fictional repository, credential, and path examples to your environment.
 
 ## 1. Requirements and host storage
 
@@ -38,7 +38,7 @@ docker compose -f deploy/compose.example.yaml build
 docker run --rm repoharbor:local-test --version
 ```
 
-The version command should print `0.9.2`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
+The version command should print `1.0.0`. `repoharbor:local-test` is a local, mutable **test image**. The build needs access to the pinned Python packages and Debian package sources. If an authorized TLS-intercepting build proxy requires a custom CA, the Dockerfile supports a temporary BuildKit secret:
 
 ```sh
 docker build --secret id=build_ca,src=/path/to/trusted-ca.pem -t repoharbor:local-test .
@@ -375,7 +375,7 @@ docker compose -f deploy/compose.example.yaml stop --timeout 300 repoharbor
 docker compose -f deploy/compose.example.yaml up -d --no-build --force-recreate
 ```
 
-SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references. An upgrade from 0.7.0 keeps schema 1 for configuration, state, metadata, and the journal. Existing retry state carries forward. Extended logging is opt-in and the example's Docker retention settings take effect after recreation. Review pending work and reconcile interrupted operations before changing versions. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
+SIGTERM prevents new Git work and stops the active Git process; unfinished work is reconciled on restart. The mutable `local-test` tag is not a reproducible release identifier. Before rolling back, verify that the older version understands the existing provider metadata and journal references. An upgrade from v0.9.2 to v1.0.0 keeps schema 1 for configuration, state, metadata, and the journal. Existing retry state carries forward. Extended logging is opt-in and the example's Docker retention settings take effect after recreation. Review pending work and reconcile interrupted operations before changing versions. Do not delete or reinitialize `data.json`, repository metadata, mirrors, or the lock file in an attempt to bypass an error.
 
 ## 7. Quarantine and troubleshooting
 
@@ -495,9 +495,10 @@ A mirror follows remote branch/tag deletion and force-pushes. It does **not** pr
 **Before production use**, accept the actual host mount, filesystem behavior, user permissions, chosen authentication mode, a real scheduled backup, recorded timestamps, container recreation, and an offline restore on the target NAS. Automated local tests and green CI are not a substitute for that acceptance test.
 
 
-### Upgrade to 0.9.2
+### Upgrade to v1.0.0
 
-Stop the old instance and reuse the existing backup bind mount. Existing schema-1 data,
+Stop the v0.9.2 instance and recreate it with the v1.0.0 image. Reuse the existing
+configuration, backup bind mount, and credential setup. Existing schema-1 data,
 repository IDs, aliases and excluded mirrors need no initialization or data migration.
 Review Git secret permissions and use one credential name per HTTPS authority. For a
 mirror whose local Git settings are rejected, preserve the original and review a copy
