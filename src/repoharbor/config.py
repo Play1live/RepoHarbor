@@ -52,19 +52,26 @@ def canonical_url(value: Any) -> str:
 class UniqueSafeLoader(yaml.SafeLoader):
     """Reject explicitly repeated keys while preserving normal YAML merge precedence."""
 
+    def __init__(self, stream: Any) -> None:
+        super().__init__(stream)
+        self._checked_mappings: set[yaml.nodes.MappingNode] = set()
+
     def flatten_mapping(self, node: yaml.nodes.MappingNode) -> None:
-        seen: set[object] = set()
-        for key, _ in node.value:
-            if key.tag == "tag:yaml.org,2002:merge":
-                value = ("merge", "<<")
-            else:
-                value = self.construct_object(key)  # type: ignore[no-untyped-call]
-            try:
-                if value in seen:
-                    raise HarborError("Duplicate YAML mapping key")
-                seen.add(value)
-            except TypeError:
-                raise HarborError("Invalid YAML mapping key") from None
+        if node not in self._checked_mappings:
+            seen: set[object] = set()
+            for key, _ in node.value:
+                if key.tag == "tag:yaml.org,2002:merge":
+                    value = ("merge", "<<")
+                else:
+                    value = self.construct_object(key)  # type: ignore[no-untyped-call]
+                try:
+                    if value in seen:
+                        raise HarborError("Duplicate YAML mapping key")
+                    seen.add(value)
+                except TypeError:
+                    raise HarborError("Invalid YAML mapping key") from None
+            # PyYAML prepends inherited entries in place and revisits shared anchors.
+            self._checked_mappings.add(node)
         super().flatten_mapping(node)
 
 
