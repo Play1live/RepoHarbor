@@ -35,7 +35,7 @@ Keep the TLS key and dashboard password in read-only mounts that the service UID
 ## Git transport and credentials
 
 - Network backup and repair operations accept credential-free **HTTPS** URLs only and invoke Git with argument vectors, not shell interpolation.
-- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. For network backups and repairs, HTTPS certificate checks remain enabled, redirects are disallowed, and other transport protocols are disabled.
+- Git starts with an isolated environment and disabled system/global configuration, interactive credential prompts, arbitrary credential helpers, hooks, and filesystem monitors. Mirror clone and remote enumeration ignore any Git repository in the invoking directory. Fetch and repair validate the managed mirror configuration before use. Network operations verify HTTPS certificates, disable redirects and reject other transports. A trusted custom CA bundle can be supplied through `SSL_CERT_FILE`.
 - A credential is supplied through a scoped `GIT_ASKPASS` helper environment, **not** through a URL or command-line argument. The container permits one explicit secret source, `env` or `file`.
 - Git diagnostics from remote servers are never directly forwarded into application logs or persisted failure messages; fixed internal error codes are used instead.
 - Secrets in a child process environment may still be inspected by users with sufficient OS/container privileges. Limit Docker-host access and use protected, read-only secret-file mounts where possible.
@@ -196,13 +196,10 @@ can lose acknowledged writes. Test physical durability and restore on target sto
 
 ### Runtime image vulnerabilities
 
-The v0.9.2 application image excludes Debian SQLite and CPython's optional
-`_sqlite3` extension. RepoHarbor uses JSON for state and does not require SQLite.
-The image scan still reports CVE-2023-45853 against zlib because it associates
-the issue with the source package. The vulnerable MiniZip component is absent
-from the runtime.
-
-The advisory review records the evidence, remaining package findings, and
-deployment conditions for the reviewed build. Image CI publishes the full scan
-and SBOM and lists all High/Critical package entries in the job summary.
+The application image uses JSON for state and excludes the unused SQLite
+library and optional Python extension. The runtime advisory assessment records
+the Git HTTPS safeguards and explains which scanner entries do not apply to
+supported RepoHarbor execution paths. The supported deployment runs as a
+non-root UID with no-new-privileges and all capabilities dropped. Image CI
+retains the complete, unfiltered scan and CycloneDX SBOM.
 [Runtime image advisory assessment](audits/RepoHarbor-Image-Advisory-Review-0.9.2.md)
