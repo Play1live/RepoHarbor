@@ -1,8 +1,9 @@
 """One local request per Unix socket connection, with no pending backup queue."""
 
-import hashlib
+import errno
 import os
 import socket
+import stat
 import struct
 import threading
 from collections.abc import Iterator
@@ -12,6 +13,7 @@ from pathlib import Path
 from repoharbor import integrity
 from repoharbor.engine import Engine
 from repoharbor.errors import HarborError, Result
+from repoharbor.persistence import CONTROL_SOCKET, directory_fd
 from repoharbor.scheduler import Scheduler
 from repoharbor.selection import repository_id
 
@@ -20,10 +22,7 @@ MAX_REQUEST = 320
 
 
 def endpoint(root: Path) -> str:
-    # Linux removes abstract addresses automatically when the listener closes.
-    # The address is namespaced by the effective UID and resolved backup root.
-    digest = hashlib.sha256(os.fsencode(os.path.realpath(root))).hexdigest()
-    return f"\0repoharbor-{os.geteuid()}-{digest}"
+    return str(root / CONTROL_SOCKET)
 
 
 def same_user(connection: socket.socket) -> bool:
@@ -34,8 +33,11 @@ def same_user(connection: socket.socket) -> bool:
 
 def request(root: Path, command: bytes) -> Result:
     try:
-        path = endpoint(root)
-        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+        with (
+            directory_fd(root) as fd,
+            socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client,
+        ):
+            path = endpoint(Path(f"/proc/self/fd/{fd}"))
             client.settimeout(TIMEOUT)
             client.connect(path)
             if not same_user(client):
@@ -63,12 +65,36 @@ def parse(command: bytes) -> str | None:
 
 @contextmanager
 def listen(root: Path) -> Iterator[socket.socket]:
-    # Only the service holding Store's exclusive root lock opens this endpoint.
-    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server:
-        server.bind(endpoint(root))
-        server.listen()
-        server.settimeout(0.25)
-        yield server
+    # Store's exclusive root lock protects stale socket cleanup and publication.
+    with (
+        directory_fd(root) as fd,
+        socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as server,
+    ):
+        address = endpoint(Path(f"/proc/self/fd/{fd}"))
+        try:
+            existing = os.stat(CONTROL_SOCKET, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(existing.st_mode) or existing.st_uid != os.geteuid():
+                raise HarborError("Unsafe control socket path")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as previous:
+                previous.settimeout(TIMEOUT)
+                try:
+                    previous.connect(address)
+                except ConnectionRefusedError:
+                    os.unlink(CONTROL_SOCKET, dir_fd=fd)
+                else:
+                    raise OSError(errno.EADDRINUSE, "Control socket is already active")
+        server.bind(address)
+        try:
+            os.chmod(CONTROL_SOCKET, 0o600, dir_fd=fd)
+            server.listen()
+            server.settimeout(0.25)
+            yield server
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(CONTROL_SOCKET, dir_fd=fd)
 
 
 class Control:

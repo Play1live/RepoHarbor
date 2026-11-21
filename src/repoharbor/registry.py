@@ -49,7 +49,7 @@ def stored_repository(meta: dict[str, Any], key: str) -> Repository:
                 "owner": {"login": r["owner"], "type": "User"},
                 "name": r["name"],
                 "full_name": f"{r['owner']}/{r['name']}",
-                "private": r["visibility"] == "private",
+                "private": r["visibility"] != "public",
                 "visibility": r["visibility"],
                 "fork": r["fork"],
                 "archived": r["archived"],
@@ -84,7 +84,13 @@ def manual_addresses(
         raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED") from None
 
 
-def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[str]:
+def manual_identities(
+    client: GitHub,
+    config: Config,
+    names: set[str],
+    *,
+    historical: set[str] | None = None,
+) -> set[str]:
     """Resolve current manual addresses only to block overlaps, never to adopt data."""
     result = set()
     credentials = list(
@@ -100,14 +106,22 @@ def manual_identities(client: GitHub, config: Config, names: set[str]) -> set[st
                 break
             except DiscoveryError as error:
                 if str(error) != "GITHUB_NOT_ACCESSIBLE":
+                    if name in (historical or ()) and not error.retry_at:
+                        break
                     raise
         else:
-            raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED")
+            if name not in (historical or ()):
+                raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED")
     return result
 
 
 def gitlab_manual_identities(
-    client: GitLab, config: Config, names: set[str], host: str
+    client: GitLab,
+    config: Config,
+    names: set[str],
+    host: str,
+    *,
+    historical: set[str] | None = None,
 ) -> set[str]:
     """Resolve manual identities; only a 404 permits another instance token."""
     result = set()
@@ -125,9 +139,12 @@ def gitlab_manual_identities(
                 break
             except DiscoveryError as error:
                 if str(error) != "GITLAB_NOT_ACCESSIBLE":
+                    if name in (historical or ()) and not error.retry_at:
+                        break
                     raise
         else:
-            raise DiscoveryError("GITLAB_MANUAL_IDENTITY_UNRESOLVED")
+            if name not in (historical or ()):
+                raise DiscoveryError("GITLAB_MANUAL_IDENTITY_UNRESOLVED")
     return result
 
 

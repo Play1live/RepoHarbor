@@ -88,6 +88,23 @@ def repo_view(
         "damaged_at": timestamp(saved_periodic.get("damaged_at")),
         "error_code": saved_periodic.get("error_code"),
     }
+    manual = integrity.get("manual", {})
+    latest = integrity.get("latest_verification", {})
+    effective = label(integrity["status"])
+    if not latest:
+        records = [
+            (timestamp(r.get("last_completed_at")) or "", r.get("last_result"))
+            for r in (saved_periodic, manual)
+        ]
+        at, finding = max(records, key=lambda entry: entry[0])
+        if at and at >= (timestamp(integrity.get("last_checked_at")) or ""):
+            latest = {"at": at, "result": finding}
+    finding = latest.get("result")
+    if finding in ("healthy", "corrupt", "uncheckable", "skipped") and effective in (
+        "healthy",
+        "unchecked",
+    ):
+        effective = finding
     result = {
         "id": alias,
         "provider": repo["provider"],
@@ -100,7 +117,17 @@ def repo_view(
         "last_updated_at": timestamp(backup["last_updated_at"]),
         "size_bytes": number(backup["size_bytes"]),
         "last_error_code": last["code"] if last else None,
-        "integrity_status": label(integrity["status"]),
+        "integrity_status": effective,
+        "latest_verification": {
+            "at": timestamp(latest.get("at")),
+            "result": label(finding),
+            "kind": label(latest.get("kind")),
+        },
+        "last_verified_healthy_at": timestamp(
+            integrity.get("last_verified_healthy_at")
+        ),
+        "restore_compatibility": label(integrity.get("restore_compatibility")),
+        "discovery_status": label(source.get("discovery_status")),
         "periodic_integrity": periodic,
         "retry": retry_view(
             meta.get("retry", {}), config.auto_retry, config.retry.max_retries
@@ -227,12 +254,15 @@ def global_view(
         "last_run_started_at": timestamp(scheduler.get("last_run_started_at")),
         "last_run_completed_at": timestamp(scheduler.get("last_run_completed_at")),
         "last_successful_run_at": timestamp(scheduler.get("last_successful_run_at")),
+        "last_backup_result": label(active.get("result")),
+        "backup_coverage": active.get("coverage"),
         "next_scheduled_at": upcoming.isoformat() if upcoming else None,
         "timezone": config.timezone,
         "periodic_integrity": {
             "enabled": config.integrity_check,
             "next_scheduled_at": next_integrity.isoformat() if next_integrity else None,
             **periodic,
+            "last_finished_run": state.get("integrity_history", {}).get("integrity"),
         },
         "retry": {
             "enabled": config.auto_retry,
@@ -256,6 +286,7 @@ def global_view(
         "storage": {
             "last_measured_bytes": number(storage.get("last_measured_bytes")),
             "last_measured_at": timestamp(storage.get("last_measured_at")),
+            "estimated": storage.get("estimated") is True,
             "status": label(storage.get("status")),
             "limit_bytes": config.storage.global_bytes,
             "limit_enabled": config.storage.global_bytes is not None,
@@ -378,7 +409,15 @@ def has_error(meta: dict[str, Any], view: dict[str, Any]) -> bool:
         in ("error", "interrupted", "repair_failed", "repair_paused", "repairing")
         or meta["integrity"]["status"]
         in ("corrupt", "suspect", "repair_failed", "repairing")
-        or view["periodic_integrity"]["last_result"] == "uncheckable"
+        or (
+            not meta["integrity"].get("latest_verification")
+            and view["periodic_integrity"]["last_result"] == "uncheckable"
+        )
+        or view.get("integrity_status") in ("corrupt", "uncheckable", "skipped")
+        or (
+            view.get("selection_status") == "included"
+            and view.get("discovery_status") == "unavailable"
+        )
         or "manual_attention_required" in backup
         or bool(backup.get("repair_deferred"))
         or backup.get("quarantine", {}).get("state") == "pending"

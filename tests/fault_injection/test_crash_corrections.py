@@ -174,7 +174,7 @@ def test_quarantine_write_errors_preserve_and_recover(factory, monkeypatch, phas
                 )
             elif phase == "rename":
                 local.setattr(
-                    "repoharbor.recovery.os.rename",
+                    "repoharbor.recovery.move_new_directory",
                     Mock(side_effect=OSError(errno.EACCES, "synthetic")),
                 )
             else:
@@ -422,6 +422,10 @@ def test_partial_ownership_survives_next_repository_journal(factory, monkeypatch
 
         monkeypatch.setattr(engine.git, "clone", fail)
         engine.backup(config.sources[0])
+        with pytest.raises(HarborError, match="unfinished"):
+            engine.store.begin("other", "initial_clone")
+        # Recreate a v0.9.1 journal that had already overwritten this slot.
+        engine.store.update_operation(state="reconciled")
         engine.store.begin("other", "initial_clone")
     with factory(config) as engine:
         recover(engine)
@@ -457,14 +461,14 @@ def test_active_update_is_reconciled_before_other_source_quarantine(factory, rem
     from repoharbor.config import Source
 
     class TwoRemotes(LocalGit):
-        def run(self, args, credential=None, interrupt=lambda: False):
+        def run(self, args, credential=None, interrupt=lambda: False, **kwargs):
             args = [
                 "https://example.org/repo.git"
                 if arg == "https://example.org/other.git"
                 else arg
                 for arg in args
             ]
-            return super().run(args, credential, interrupt)
+            return super().run(args, credential, interrupt, **kwargs)
 
     config = replace(
         factory.config,
@@ -482,6 +486,7 @@ def test_active_update_is_reconciled_before_other_source_quarantine(factory, rem
         partial = engine.path("demo") / "repository.git.partial"
         partial.mkdir()
         (partial / "precious").write_text("retain")
+        engine.store.update_operation(state="reconciled")
         engine.store.begin("other", "mirror_update")
 
     # Reuse the IPC checkpoint helper with the same configuration.
@@ -614,7 +619,8 @@ def test_integrity_sigkill_does_not_complete_global_run(factory, point, manual):
         integrity.reconcile(engine.store)
         state = engine.store.data[state_key]
         assert state["state"] == "interrupted" and state["current_repository"] is None
-        assert state["last_completed_at"] == (None if manual else last)
+        assert state["last_completed_at"] is None
+        assert engine.store.data["integrity_history"][state_key]["at"] == last
         assert engine.store.data["active_operation"] == journal
         info = engine.repos["demo"]["integrity"]
         repo = info[metadata_key]
@@ -689,12 +695,13 @@ def test_integrity_persistence_faults_stop_writes_and_preserve_journal(
         journal = engine.store.data["active_operation"].copy()
         original = persistence.os.replace
 
-        def replace_state(source, destination):
-            staged = read_json(source)
+        def replace_state(source, destination, *, src_dir_fd, dst_dir_fd):
+            import json
+
+            with os.fdopen(os.open(source, os.O_RDONLY, dir_fd=src_dir_fd)) as stream:
+                staged = json.load(stream)
             state = staged.get("integrity")
-            if (
-                phase == "before-metadata" and destination.name == "metadaten.json"
-            ) or (
+            if (phase == "before-metadata" and destination == "metadaten.json") or (
                 isinstance(state, dict)
                 and "current_repository" in state
                 and (
@@ -703,7 +710,7 @@ def test_integrity_persistence_faults_stop_writes_and_preserve_journal(
                 )
             ):
                 raise OSError(error, "test storage fault")
-            original(source, destination)
+            original(source, destination, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
         with monkeypatch.context() as patch:
             patch.setattr(persistence.os, "replace", replace_state)

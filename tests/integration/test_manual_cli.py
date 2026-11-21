@@ -94,7 +94,7 @@ def test_manual_provider_fresh_discovery_and_filters(request, fixture):
         env.client.discover.side_effect = None
         env.client.discover.return_value = []
         assert engine.run(manual=True, repository=env.key) == Result.NOT_SELECTED
-        assert engine.run(manual=True) == Result.NOT_SELECTED
+        assert engine.run(manual=True) == Result.DISCOVERY_FAILED
         assert len(engine.git.calls) == count
 
 

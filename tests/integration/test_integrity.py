@@ -93,6 +93,9 @@ def test_manual_checks_all_catalog_mirrors_without_remote_or_repair(factory, rem
             state[key]
             for key in ("checked", "healthy", "corrupt", "skipped", "uncheckable")
         ] == [3, 2, 1, 1, 1]
+        history = engine.store.data["integrity_history"]
+        assert history["integrity"] == previous.pop("integrity_history")["integrity"]
+        assert history["manual_integrity"]["result"] == "issues"
         assert all(engine.store.data[key] == value for key, value in previous.items())
         assert all(
             not {"fetch", "clone", "ls-remote"}.intersection(call)
@@ -699,8 +702,8 @@ def test_verified_restore_retires_repair_state_only(
         ("repair-journal", "healthy"),
         ("repairing", "healthy"),
         ("interrupted", "healthy"),
-        ("partial", "healthy"),
-        ("partial-access", "healthy"),
+        ("partial", None),
+        ("partial-access", None),
         ("partial-operation", None),
         ("unknown-deferral", "healthy"),
         ("uncheckable", "uncheckable"),

@@ -1,7 +1,7 @@
 """Sequential backup runs; every mutation has a durable journal first."""
 
 import logging
-import os
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -17,12 +17,15 @@ from repoharbor.git_backup import Git
 from repoharbor.github import DiscoveryError, GitHub
 from repoharbor.gitlab import GitLab
 from repoharbor.persistence import (
+    STAGE_PREFIX,
     Store,
     atomic_json,
     metadata,
+    move_new_directory,
     record_error,
     safe_tree,
     sync_directory,
+    sync_tree,
     utcnow,
 )
 from repoharbor.providers import Observation
@@ -62,6 +65,8 @@ class Engine:
         self.budget = Budget(config.root, config.storage)
         self.checkpoint = checkpoint
         self.repos: dict[str, dict[str, Any]] = {}
+        self.unregistered: set[str] = set()
+        self.unregistered_provider_targets: set[str] = set()
         self.sources = config.sources
 
     def path(self, alias: str) -> Path:
@@ -71,10 +76,39 @@ class Engine:
         with self.store.writing(fatal=fatal):
             atomic_json(self.path(alias) / "metadaten.json", self.repos[alias])
 
+    def publish_meta(self, alias: str, meta: dict[str, Any]) -> None:
+        folder = self.path(alias)
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        for parent in reversed(folder.parents):
+            if parent.is_relative_to(self.config.root):
+                sync_directory(parent)
+        with tempfile.TemporaryDirectory(
+            prefix=STAGE_PREFIX, dir=folder.parent
+        ) as name:
+            stage = Path(name)
+            atomic_json(stage / "metadaten.json", meta)
+            self.checkpoint("catalog_staged")
+            move_new_directory(stage, folder)
+        self.repos[alias] = meta
+
     def inventory(self) -> None:
         safe_tree(self.config.root)
         for alias, folder in catalog_entries(self.config.root):
-            self.repos[alias] = read_metadata(alias, folder)
+            if not (folder / "metadaten.json").exists() and not any(folder.iterdir()):
+                # v0.9.1 could leave an empty published directory after ENOSPC.
+                # Preserve the path until an operator can confirm its provenance.
+                self.unregistered.add(alias)
+                continue
+            meta = read_metadata(alias, folder)
+            integrity = meta["integrity"]
+            manual = integrity.get("manual", {})
+            if (
+                "latest_verification" not in integrity
+                and manual.get("last_result") == "corrupt"
+                and manual["last_completed_at"] >= (integrity["last_checked_at"] or "")
+            ):
+                integrity.update(status="corrupt", damage_pending=True)
+            self.repos[alias] = meta
         configured = {s.alias: s for s in self.config.sources}
         # Verify identity conflicts for the entire catalog before changing any metadata.
         for alias, meta in self.repos.items():
@@ -108,12 +142,16 @@ class Engine:
             }
             self.save_meta(alias)
         for source in self.config.sources:
+            if source.alias in self.unregistered:
+                continue
             if source.alias not in self.repos:
-                folder = self.path(source.alias)
-                folder.mkdir(parents=True, exist_ok=False)
-                self.repos[source.alias] = metadata(
-                    source.alias, source.url, source.web_url, source.credential
+                self.publish_meta(
+                    source.alias,
+                    metadata(
+                        source.alias, source.url, source.web_url, source.credential
+                    ),
                 )
+                continue
             self.repos[source.alias]["authentication"]["credential_name"] = (
                 source.credential
             )
@@ -124,6 +162,7 @@ class Engine:
         started = self.events.start()
         self.events.log("discovery.started", authority=host_scope)
         failures = set()
+        self.unregistered_provider_targets.clear()
         github_config = replace(
             self.config,
             providers=tuple(p for p in self.config.providers if p.type == "github"),
@@ -198,7 +237,12 @@ class Engine:
                 observations.extend(client.discover(provider))
             manual_ids = (
                 gitlab_manual_identities(
-                    client, config, manual_addresses(config, self.repos, host), host
+                    client,
+                    config,
+                    manual_addresses(config, self.repos, host),
+                    host,
+                    historical=manual_addresses(config, self.repos, host)
+                    - manual_addresses(config, {}, host),
                 )
                 if config.providers
                 else set()
@@ -232,15 +276,15 @@ class Engine:
         with self.store.transaction() as data:
             data["provider_discovery"][state_key]["retry_at"] = client.retry_at
         for alias, meta in proposed.items():
-            folder = self.path(alias)
+            if alias in self.unregistered:
+                if meta["selection"]["status"] == "included":
+                    self.unregistered_provider_targets.add(alias)
+                continue
             if alias not in self.repos:
-                folder.parent.mkdir(parents=True, exist_ok=True)
-                sync_directory(config.root)
-                sync_directory(folder.parent.parent)
-                folder.mkdir(exist_ok=False)
-                sync_directory(folder.parent)
-            self.repos[alias] = meta
-            self.save_meta(alias)
+                self.publish_meta(alias, meta)
+            else:
+                self.repos[alias] = meta
+                self.save_meta(alias)
             self.checkpoint("discovery_metadata")
         with self.store.transaction() as data:
             data["provider_discovery"][state_key].update(
@@ -251,7 +295,9 @@ class Engine:
         self.discovery_completed(
             "gitlab", host, observations, proposed, sources, started
         )
-        return sources
+        return tuple(
+            source for source in sources if source.alias not in self.unregistered
+        )
 
     def discover_github(self) -> bool:
         self.sources = self.manual_sources()
@@ -285,7 +331,11 @@ class Engine:
                 observations.extend(client.discover(provider))
             manual_ids = (
                 manual_identities(
-                    client, self.config, manual_addresses(self.config, self.repos)
+                    client,
+                    self.config,
+                    manual_addresses(self.config, self.repos),
+                    historical=manual_addresses(self.config, self.repos)
+                    - manual_addresses(self.config, {}),
                 )
                 if self.config.providers
                 else set()
@@ -318,21 +368,23 @@ class Engine:
         # Publish no runnable sources until every metadata write is durable. On a
         # crash, startup performs local recovery only; next discovery recomputes all.
         for alias, meta in proposed.items():
-            folder = self.path(alias)
+            if alias in self.unregistered:
+                if meta["selection"]["status"] == "included":
+                    self.unregistered_provider_targets.add(alias)
+                continue
             if alias not in self.repos:
-                folder.parent.mkdir(parents=True, exist_ok=True)
-                sync_directory(self.config.root)
-                sync_directory(folder.parent.parent)
-                folder.mkdir(exist_ok=False)
-                sync_directory(folder.parent)
-            self.repos[alias] = meta
-            self.save_meta(alias)
+                self.publish_meta(alias, meta)
+            else:
+                self.repos[alias] = meta
+                self.save_meta(alias)
             self.checkpoint("discovery_metadata")
         with self.store.transaction() as data:
             data["discovery"].update(
                 state="completed", completed_at=utcnow(), retry_at=client.retry_at
             )
-        self.sources = self.manual_sources() + sources
+        self.sources = self.manual_sources() + tuple(
+            source for source in sources if source.alias not in self.unregistered
+        )
         self.discovery_completed(
             "github",
             "github.com",
@@ -415,6 +467,8 @@ class Engine:
         """Do not clone a new manual copy over a known provider-owned URL."""
         result = []
         for source in self.config.sources:
+            if source.alias in self.unregistered:
+                continue
             if not (
                 self.path(source.alias) / "repository.git"
             ).exists() and self.provider_mirror_conflict(source):
@@ -495,7 +549,8 @@ class Engine:
             }
             data["scheduler"]["last_run_started_at"] = started
 
-        result = self.run_backups(repository)
+        with self.budget.batch():
+            result = self.run_backups(repository)
         interrupted = self.git.stop.is_set()
         if interrupted:
             result = Result.BACKUP_FAILED
@@ -573,23 +628,55 @@ class Engine:
                 or self.repos[s.alias]["integrity"]
                 .get("periodic", {})
                 .get("repair_pending")
+                or self.repos[s.alias]["integrity"].get("damage_pending")
                 for s in sources
             ):
                 recover(self, during_run=True, periodic=True)
 
+        processed = {source.alias for source in sources}
+        unavailable = (
+            sorted(
+                self.unregistered_provider_targets
+                | (self.unregistered & {source.alias for source in self.config.sources})
+                | {
+                    alias
+                    for alias, meta in self.repos.items()
+                    if meta["selection"]["status"] == "included"
+                    and alias not in processed
+                }
+            )
+            if repository is None
+            else []
+        )
+        if repository is None:
+            with self.store.transaction() as data:
+                data["active_run"]["coverage"] = {
+                    "planned": len(sources) + len(unavailable),
+                    "attempted": 0,
+                    "excluded": sum(
+                        m["selection"]["status"] == "excluded"
+                        for m in self.repos.values()
+                    ),
+                    "unavailable": unavailable,
+                }
         failed = False
+        attempted = 0
         for source in sources:
-            if self.git.stop.is_set():
-                return Result.BACKUP_FAILED
-            if self.config.auto_retry and not self.reconcile_operation():
-                return Result.BACKUP_FAILED
+            if self.git.stop.is_set() or not self.reconcile_operation():
+                failed = True
+                break
+            attempted += 1
             if not self.backup(source):
                 failed = True
+        if repository is None:
+            with self.store.transaction() as data:
+                data["active_run"]["coverage"]["attempted"] = attempted
         if failed:
             return Result.BACKUP_FAILED
         if failures and repository is None:
             return Result.DISCOVERY_FAILED
-        processed = {source.alias for source in sources}
+        if any(":" in alias for alias in unavailable):
+            return Result.DISCOVERY_FAILED
         if not sources or (
             repository is None
             and any(source.alias not in processed for source in self.config.sources)
@@ -661,15 +748,17 @@ class Engine:
         operation: str | None = None
         try:
             if mirror.exists():
+                self.git.require_managed_config(mirror)
                 remote = self.git.remote_refs(source.url, source.credential)
                 meta["source"]["status"] = "available"
-                local = "\n".join(sorted(self.git.refs(mirror).splitlines()))
+                local = "\n".join(sorted(self.git.refs(mirror).split("\n")))
                 local_head = self.git.head(mirror)
                 head_changed = (
                     self.git.remote_head is not None
                     and local_head != self.git.remote_head
                 )
                 if remote == local and not head_changed:
+                    self.verify_backup(alias, mirror)
                     backup["last_checked_at"] = utcnow()
                     backup["status"] = "up_to_date"
                     meta["source"]["status"] = "available"
@@ -708,13 +797,27 @@ class Engine:
 
             if kind == "initial_clone":
                 self.git.clone(source.url, partial, source.credential, interrupt)
+                self.verify_backup(alias, partial)
+                sync_tree(partial)
                 self.store.update_operation(git_completed_at=utcnow(), changed=True)
                 self.checkpoint("git")
-                os.rename(partial, mirror)
-                sync_directory(folder)
+                move_new_directory(partial, mirror)
             else:
                 self.git.fetch(mirror, source.url, source.credential, interrupt)
-                after = "\n".join(sorted(self.git.refs(mirror).splitlines()))
+                expected_head = self.git.remote_head
+                final_remote = self.git.remote_refs(source.url, source.credential)
+                after = "\n".join(sorted(self.git.refs(mirror).split("\n")))
+                if (
+                    after != final_remote
+                    or self.git.remote_head != expected_head
+                    or (
+                        expected_head is not None
+                        and self.git.head(mirror) != expected_head
+                    )
+                ):
+                    raise GitError("GIT_SNAPSHOT_CHANGED")
+                self.verify_backup(alias, mirror)
+                sync_tree(mirror, files=False)
                 self.store.update_operation(
                     git_completed_at=utcnow(), changed=(local != after or head_changed)
                 )
@@ -734,6 +837,11 @@ class Engine:
             return True
         except HarborError as error:
             code = str(error)
+            if code in ("MIRROR_UNSUPPORTED", "FILESYSTEM_ERROR", "GIT_OUTPUT_LIMIT"):
+                from repoharbor.integrity import record_finding
+
+                record_finding(integrity, "uncheckable", code, "backup")
+                integrity.pop("restore_compatibility", None)
             limited = code in {
                 "FREE_SPACE_RESERVE",
                 "global_limit_paused",
@@ -748,8 +856,8 @@ class Engine:
             # Intentional stops/budget pauses are not failed Git attempts.
             if not limited and not interrupted:
                 record_error(meta, code)
-            if operation and mirror.exists():
-                meta["integrity"]["status"] = "suspect"
+            if operation and mirror.exists() and integrity["status"] != "corrupt":
+                integrity["status"] = "suspect"
             retry_status = self.retries.failure(alias, error, limited, interrupted)
             self.save_meta(alias)
             if retry_status == "pending":
@@ -769,6 +877,19 @@ class Engine:
         finally:
             self.refresh_storage(alias, after=True)
 
+    def verify_backup(self, alias: str, mirror: Path) -> None:
+        from repoharbor.integrity import inspect, record_finding
+
+        finding, code = inspect(self.git, mirror)
+        if finding == "interrupted":
+            raise HarborError("INTERRUPTED")
+        integrity = self.repos[alias]["integrity"]
+        record_finding(integrity, finding, code, "backup")
+        if finding != "healthy":
+            integrity.pop("restore_compatibility", None)
+            raise HarborError(code or "INVALID_MIRROR")
+        integrity["restore_compatibility"] = self.git.restore_compatibility(mirror)
+
     def refresh_storage(self, alias: str, *, after: bool = False) -> str | None:
         measurement = self.budget.measure(alias, self.path(alias))
         backup = self.repos[alias]["backup"]
@@ -783,7 +904,9 @@ class Engine:
                 "status": measurement.global_status or "available",
                 "last_measured_bytes": measurement.global_bytes,
                 "free_bytes": measurement.free_bytes,
-                "last_measured_at": measurement.measured_at,
+                "last_measured_at": measurement.global_sampled_at
+                or measurement.measured_at,
+                "estimated": measurement.global_estimate,
             }
         if after:
             if measurement.status and backup["status"] in ("updated", "up_to_date"):

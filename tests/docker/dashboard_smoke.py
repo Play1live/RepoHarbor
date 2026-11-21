@@ -2,6 +2,8 @@
 
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 DASHBOARD_SMOKE = """
 import http.client
@@ -82,31 +84,33 @@ finally:
 
 
 def dashboard_smoke(image):
-    subprocess.run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--network",
-            "none",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--read-only",
-            "--tmpfs",
-            "/backups:rw,uid=10001,gid=10001,mode=0700",
-            "--tmpfs",
-            "/tmp:rw,uid=10001,gid=10001,mode=0700",
-            "--entrypoint",
-            "python",
-            image,
-            "-c",
-            DASHBOARD_SMOKE,
-        ],
-        check=True,
-        timeout=45,
-    )
+    with tempfile.TemporaryDirectory() as root:
+        Path(root).chmod(0o777)
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges",
+                "--read-only",
+                "--mount",
+                f"type=bind,src={root},dst=/backups",
+                "--tmpfs",
+                "/tmp:rw,uid=10001,gid=10001,mode=0700",
+                "--entrypoint",
+                "python",
+                image,
+                "-c",
+                DASHBOARD_SMOKE,
+            ],
+            check=True,
+            timeout=45,
+        )
     print("Packaged HTTPS dashboard smoke passed.")
 
 

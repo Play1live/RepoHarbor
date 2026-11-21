@@ -1,5 +1,6 @@
 """Single-writer, fail-closed JSON persistence on a trusted local filesystem."""
 
+import ctypes
 import fcntl
 import json
 import math
@@ -8,7 +9,7 @@ import stat
 import tempfile
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,41 +38,127 @@ def safe_tree(
         if interrupt is not None and interrupt():
             raise HarborError("INTERRUPTED")
         for name in dirs + files:
-            mode = (Path(directory) / name).lstat().st_mode
+            entry = (Path(directory) / name).lstat()
+            mode = entry.st_mode
+            if (
+                Path(directory) == root
+                and name == CONTROL_SOCKET
+                and stat.S_ISSOCK(mode)
+                and entry.st_uid == os.geteuid()
+            ):
+                continue
             if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
                 raise HarborError("Symlink or special file in backup root")
 
 
+STORAGE_MARKER = ".repoharbor-storage-id"
+CONTROL_SOCKET = ".rh-control"
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+STAGE_PREFIX = ".repoharbor-catalog-"
+
+
+class UncertainCommit(OSError):
+    """The new name is visible, but its persistence could not be confirmed."""
+
+
+@contextmanager
+def directory_fd(path: Path) -> Iterator[int]:
+    with ExitStack() as stack:
+        fd = os.open("/", DIRECTORY_FLAGS)
+        stack.callback(os.close, fd)
+        for part in path.absolute().parts[1:]:
+            fd = os.open(part, DIRECTORY_FLAGS, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield fd
+
+
 def atomic_json(path: Path, data: dict[str, Any]) -> None:
-    if path.is_symlink():
-        raise HarborError("Refusing JSON symlink")
-    fd, temporary = tempfile.mkstemp(
-        prefix=".repoharbor-", suffix=".tmp", dir=path.parent
-    )
-    try:
-        with os.fdopen(fd, "w") as stream:
-            json.dump(data, stream, sort_keys=True, allow_nan=False)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        sync_directory(path.parent)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    with directory_fd(path.parent) as parent:
+        try:
+            mode = os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(mode):
+                raise HarborError("Refusing non-regular JSON file")
+        fd, temporary = tempfile.mkstemp(
+            prefix=".repoharbor-", suffix=".tmp", dir=f"/proc/self/fd/{parent}"
+        )
+        name = Path(temporary).name
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(data, stream, sort_keys=True, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            try:
+                os.fsync(parent)
+            except OSError as error:
+                raise UncertainCommit(
+                    error.errno, "JSON publication could not be synchronized"
+                ) from None
+        finally:
+            with suppress(FileNotFoundError):
+                os.unlink(name, dir_fd=parent)
 
 
 def sync_directory(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
+    with directory_fd(path) as fd:
         os.fsync(fd)
-    finally:
-        os.close(fd)
+
+
+def sync_tree(path: Path, *, files: bool = True) -> None:
+    # Symlinks in a restored worktree are Git data. Sync their containing directory.
+    def fail(error: OSError) -> None:
+        raise error
+
+    for _, _, names, fd in os.fwalk(path, topdown=False, onerror=fail):
+        if files:
+            for name in names:
+                entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if stat.S_ISREG(entry.st_mode):
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    with os.fdopen(os.open(name, flags, dir_fd=fd), "rb") as stream:
+                        os.fsync(stream.fileno())
+        os.fsync(fd)
+
+
+def rename_noreplace(source: str, source_fd: int, target: str, target_fd: int) -> None:
+    rename = ctypes.CDLL(None, use_errno=True).renameat2
+    rename.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename.restype = ctypes.c_int
+    if rename(source_fd, os.fsencode(source), target_fd, os.fsencode(target), 1):
+        raise OSError(ctypes.get_errno(), "Atomic no-replace publication failed")
+
+
+def move_new_directory(source: Path, target: Path) -> None:
+    with (
+        directory_fd(source.parent) as source_fd,
+        directory_fd(target.parent) as target_fd,
+    ):
+        if not stat.S_ISDIR(
+            os.stat(source.name, dir_fd=source_fd, follow_symlinks=False).st_mode
+        ):
+            raise HarborError("Refusing to publish a non-directory")
+        rename_noreplace(source.name, source_fd, target.name, target_fd)
+        os.fsync(target_fd)
+        if source.parent != target.parent:
+            os.fsync(source_fd)
 
 
 def read_json(path: Path) -> dict[str, Any]:
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        with os.fdopen(os.open(path, flags)) as stream:
+        with (
+            directory_fd(path.parent) as parent,
+            os.fdopen(os.open(path.name, flags, dir_fd=parent)) as stream,
+        ):
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise ValueError
             value = json.load(stream)
@@ -220,6 +307,47 @@ def validate_periodic_metadata(value: Any) -> None:
         raise ValueError
 
 
+def validate_run_coverage(coverage: Any) -> None:
+    if not isinstance(coverage, dict) or coverage.keys() != {
+        "planned",
+        "attempted",
+        "excluded",
+        "unavailable",
+    }:
+        raise ValueError
+    if any(
+        type(coverage[k]) is not int or coverage[k] < 0
+        for k in ("planned", "attempted", "excluded")
+    ):
+        raise ValueError
+    missing = coverage["unavailable"]
+    if (
+        not isinstance(missing, list)
+        or len(missing) + coverage["attempted"] > coverage["planned"]
+    ):
+        raise ValueError
+    for alias in missing:
+        if not isinstance(alias, str):
+            raise ValueError
+        repository_id(alias)
+
+
+def validate_integrity_history(history: Any) -> None:
+    if not isinstance(history, dict) or history.keys() - {
+        "integrity",
+        "manual_integrity",
+    }:
+        raise ValueError
+    for entry in history.values():
+        if (
+            not isinstance(entry, dict)
+            or entry.keys() != {"started_at", "at", "result"}
+            or entry["result"] not in ("healthy", "issues", "no_candidates")
+        ):
+            raise ValueError
+        validate_integrity_times(entry, "started_at", "at")
+
+
 def validate_state(data: dict[str, Any]) -> None:
     """Reject semantically corrupt state before any startup write."""
     try:
@@ -234,6 +362,8 @@ def validate_state(data: dict[str, Any]) -> None:
             raise ValueError
         if "integrity" in data:
             validate_integrity_state(data["integrity"])
+        if "integrity_history" in data:
+            validate_integrity_history(data["integrity_history"])
         if "manual_integrity" in data:
             validate_manual_integrity_state(data["manual_integrity"])
         scheduler = data["scheduler"]
@@ -291,6 +421,8 @@ def validate_state(data: dict[str, Any]) -> None:
                 raise ValueError
             if not isinstance(value.get("started_at"), str):
                 raise ValueError
+            if key == "active_run" and "coverage" in value:
+                validate_run_coverage(value["coverage"])
             if key == "active_operation":
                 if (
                     not isinstance(value.get("alias"), str)
@@ -309,7 +441,7 @@ def validate_state(data: dict[str, Any]) -> None:
                     or type(value.get("changed")) is not bool
                 ):
                     raise ValueError
-    except (KeyError, TypeError, ValueError, OverflowError):
+    except (KeyError, TypeError, ValueError, OverflowError, HarborError):
         raise HarborError("Invalid journal structure; preserving state") from None
 
 
@@ -323,19 +455,26 @@ class Store:
 
     def __enter__(self) -> "Store":
         safe_tree(self.root)
-        self.fd = os.open(
-            self.root / ".repoharbor.lock",
-            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
-            0o600,
-        )
+        with directory_fd(self.root) as root_fd:
+            self.fd = os.open(
+                ".repoharbor.lock",
+                os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+                dir_fd=root_fd,
+            )
         try:
+            if not stat.S_ISREG(os.fstat(self.fd).st_mode):
+                raise HarborError("Invalid backup lock")
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             path = self.root / "data.json"
             if path.exists():
                 self.data = read_json(path)
                 validate_state(self.data)
             else:
-                if set(p.name for p in self.root.iterdir()) - {".repoharbor.lock"}:
+                if set(p.name for p in self.root.iterdir()) - {
+                    ".repoharbor.lock",
+                    STORAGE_MARKER,
+                }:
                     raise HarborError(
                         "Missing journal in nonempty root; manual inventory required"
                     )
@@ -365,8 +504,8 @@ class Store:
                 raise HarborError("State write failed; restart required")
             try:
                 yield
-            except BaseException:
-                if fatal:
+            except BaseException as error:
+                if fatal or isinstance(error, UncertainCommit):
                     self._write_failed = True
                 raise
 
@@ -384,6 +523,9 @@ class Store:
             try:
                 yield self.data
                 self.save(fatal=fatal)
+            except UncertainCommit:
+                # Preserve the visible update in RAM and seal the writer.
+                raise
             except BaseException:
                 self.data = before
                 raise
@@ -403,6 +545,9 @@ class Store:
         if retry:
             operation["trigger"] = "retry"
         with self.transaction() as data:
+            current = data["active_operation"]
+            if current and current["state"] in ("running", "interrupted"):
+                raise HarborError("An unfinished Git operation must be reconciled")
             data["active_operation"] = operation
         return str(operation["id"])
 

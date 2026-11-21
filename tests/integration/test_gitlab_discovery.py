@@ -567,13 +567,13 @@ def test_missing_default_branch_keeps_discovery_transport_and_persistence_separa
         run = engine.git.run
         denied = []
 
-        def deny_git_read(args, credential=None, interrupt=lambda: False):
+        def deny_git_read(args, credential=None, interrupt=lambda: False, **kwargs):
             if unknown["http_url_to_repo"] in args and any(
                 command in args for command in ("clone", "ls-remote", "fetch")
             ):
                 denied.append((args, credential))
                 raise GitError("GIT_FAILED", "unavailable")
-            return run(args, credential, interrupt)
+            return run(args, credential, interrupt, **kwargs)
 
         monkeypatch.setattr(engine.git, "run", deny_git_read)
         engine.run()

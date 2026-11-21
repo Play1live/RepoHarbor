@@ -219,7 +219,8 @@ def test_remote_race_fetch_without_effect_does_not_claim_update(factory, monkeyp
             engine.repos["demo"]["backup"]["successful_updates"]
             == old["successful_updates"]
         )
-        assert engine.repos["demo"]["backup"]["status"] == "up_to_date"
+        assert engine.repos["demo"]["backup"]["status"] == "error"
+        assert engine.repos["demo"]["errors"]["last"]["code"] == "GIT_SNAPSHOT_CHANGED"
 
 
 def test_transient_outage_resumes_without_service_restart(factory, remote, tmp_path):

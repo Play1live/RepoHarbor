@@ -157,6 +157,7 @@ def test_credential_modes_rotation_and_redaction(tmp_path):
     assert "REPOHARBOR_ASKPASS_TOKEN" not in creds.git_env(None)
     for name in cfg.credentials:
         (tmp_path / name).write_text("rotated-token\n")
+        (tmp_path / name).chmod(0o600)
     with pytest.raises(HarborError, match="Mixed"):
         Credentials.resolve(cfg, values)
     cfg = replace(cfg, token_source="file")

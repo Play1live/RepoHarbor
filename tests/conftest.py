@@ -160,7 +160,13 @@ def github_env(factory, remote, monkeypatch):
                 str(self.bare) if a.startswith("https://github.com/") else a
                 for a in args
             ]
-            return super().run(args, credential, interrupt, **kwargs)
+            # Local fixtures never pass a provider token to file transport.
+            return super().run(
+                args,
+                None if str(self.bare) in args else credential,
+                interrupt,
+                **kwargs,
+            )
 
     return SimpleNamespace(
         config=cfg,
@@ -295,7 +301,13 @@ def gitlab_env(factory, remote, monkeypatch):
                 str(self.bare) if a.startswith("https://gitlab.example.org/") else a
                 for a in args
             ]
-            return super().run(args, credential, interrupt, **kwargs)
+            # Local fixtures never pass a provider token to file transport.
+            return super().run(
+                args,
+                None if str(self.bare) in args else credential,
+                interrupt,
+                **kwargs,
+            )
 
     return SimpleNamespace(
         config=cfg,

@@ -7,6 +7,7 @@ from repoharbor.config import canonical_url, identifier
 from repoharbor.errors import HarborError
 from repoharbor.github import DiscoveryError
 from repoharbor.persistence import (
+    STAGE_PREFIX,
     metadata,
     read_json,
     validate_integrity_times,
@@ -31,7 +32,9 @@ def children(folder: Path) -> list[Path]:
     if folder.is_symlink():
         raise HarborError("Unsafe repository directory; preserving data")
     try:
-        entries = sorted(folder.iterdir())
+        entries = sorted(
+            p for p in folder.iterdir() if not p.name.startswith(STAGE_PREFIX)
+        )
     except FileNotFoundError:
         return []
     if any(p.is_symlink() or not p.is_dir() for p in entries):
@@ -88,11 +91,38 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
             validate_periodic_metadata(integrity["periodic"])
         if "manual" in integrity:
             validate_manual_integrity_metadata(integrity["manual"])
+        if "latest_verification" in integrity:
+            latest = integrity["latest_verification"]
+            if (
+                not isinstance(latest, dict)
+                or latest.keys() != {"at", "result", "code", "kind"}
+                or latest["result"]
+                not in ("healthy", "corrupt", "uncheckable", "skipped")
+                or latest["kind"]
+                not in ("manual", "periodic", "backup", "repair", "recovery")
+            ):
+                raise ValueError
+            validate_integrity_times(latest, "at")
+        if "last_verified_healthy_at" in integrity:
+            validate_integrity_times(integrity, "last_verified_healthy_at")
+        if (
+            "damage_pending" in integrity
+            and type(integrity["damage_pending"]) is not bool
+        ):
+            raise ValueError
+        if integrity.get("restore_compatibility") not in (
+            None,
+            "clone_and_bundle",
+            "clone_only",
+            "unsupported",
+            "unconfirmed",
+        ):
+            raise ValueError
         if (
             backup["format"] != "mirror"
             or backup["relative_path"] != "repository.git"
             or integrity.get("last_check_kind")
-            not in (None, "periodic", "recovery", "repair")
+            not in (None, "periodic", "recovery", "repair", "backup", "manual")
         ):
             raise ValueError
         validate_integrity_times(backup, "created_at")

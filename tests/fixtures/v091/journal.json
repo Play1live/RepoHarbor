@@ -1,0 +1,35 @@
+{
+  "active_operation": {
+    "alias": "demo",
+    "changed": true,
+    "completed_at": "2026-11-21T14:03:01.970396Z",
+    "git_completed_at": "2026-11-21T14:03:01.963475Z",
+    "id": "2026-11-21T14:03:01.653373Z",
+    "started_at": "2026-11-21T14:03:01.653392Z",
+    "state": "completed",
+    "type": "mirror_update"
+  },
+  "active_run": {
+    "repository": null,
+    "result": "SUCCESS",
+    "started_at": "2026-11-21T14:03:01.338075Z",
+    "state": "completed",
+    "trigger": "scheduled"
+  },
+  "global_storage": {
+    "free_bytes": 61519945728,
+    "last_measured_at": "2026-11-21T14:03:01.975560Z",
+    "last_measured_bytes": 28854,
+    "status": "available"
+  },
+  "recovery": {
+    "last_checked_at": "2026-11-21T14:02:59.232805Z"
+  },
+  "scheduler": {
+    "last_run_completed_at": "2026-11-21T14:03:01.979073Z",
+    "last_run_started_at": "2026-11-21T14:03:01.338075Z",
+    "last_successful_run_at": "2026-11-21T14:03:01.979073Z",
+    "skipped_overlaps": 0
+  },
+  "schema_version": 1
+}

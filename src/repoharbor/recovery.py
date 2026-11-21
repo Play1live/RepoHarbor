@@ -1,14 +1,19 @@
 """Crash reconciliation and bounded, non-destructive recovery (never backfill)."""
 
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
 from repoharbor.engine import Engine
 from repoharbor.errors import GitError, HarborError
-from repoharbor.integrity import inspect
-from repoharbor.persistence import record_error, sync_directory, utcnow
+from repoharbor.integrity import inspect, record_finding
+from repoharbor.persistence import (
+    move_new_directory,
+    record_error,
+    sync_directory,
+    sync_tree,
+    utcnow,
+)
 
 
 def attention(engine: Engine, alias: str, reason: str) -> None:
@@ -64,6 +69,13 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
         engine.save_meta(alias)
     current = engine.store.data["active_operation"]
     if not (current and current["alias"] == alias and current["type"] == "quarantine"):
+        if (
+            current
+            and current["alias"] == alias
+            and current["state"] in ("running", "interrupted")
+        ):
+            # The durable quarantine metadata holds the predecessor operation ID.
+            engine.store.update_operation(state="reconciled", completed_at=utcnow())
         engine.store.begin(alias, "quarantine")
     engine.store.update_operation(quarantine_pending=True)
     engine.events.log(
@@ -78,7 +90,7 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     if partial.exists():
         destination.parent.mkdir(exist_ok=True)
         sync_directory(folder)
-        os.rename(partial, destination)
+        move_new_directory(partial, destination)
         sync_directory(destination.parent)
         sync_directory(folder)
         engine.checkpoint("quarantine_renamed")
@@ -98,12 +110,20 @@ def quarantine(engine: Engine, alias: str, active: dict[str, Any] | None) -> Non
     )
 
 
-def verify(engine: Engine, mirror: Path, periodic_damage: bool) -> bool | None:
-    if not periodic_damage:
-        return engine.git.healthy(mirror)
-    result, _ = inspect(engine.git, mirror)
+def verify(
+    engine: Engine,
+    mirror: Path,
+    *,
+    integrity: dict[str, Any] | None = None,
+    kind: str = "recovery",
+) -> bool | None:
+    result, code = inspect(engine.git, mirror)
     if result == "interrupted":
         raise HarborError("INTERRUPTED")
+    if integrity is not None:
+        record_finding(integrity, result, code, kind)
+        if result != "healthy":
+            integrity.pop("restore_compatibility", None)
     return {"healthy": True, "corrupt": False}.get(result)
 
 
@@ -156,7 +176,10 @@ def recover(
             )
         )
         finding = integrity.get("periodic", {})
-        periodic_damage = finding.get("repair_pending", False)
+        periodic_damage = finding.get("repair_pending", False) or (
+            integrity.get("damage_pending", False)
+            and integrity.get("latest_verification", {}).get("kind") == "manual"
+        )
         eligible = (
             alias in periodic_sources and meta["selection"]["status"] == "included"
         )
@@ -188,23 +211,19 @@ def recover(
                 and active.get("git_completed_at")
                 and active["type"] == "initial_clone"
                 and not mirror.exists()
-                and engine.git.healthy(partial)
+                and verify(engine, partial) is True
             ):
-                os.rename(partial, mirror)
+                sync_tree(partial)
+                move_new_directory(partial, mirror)
                 sync_directory(folder)
             else:
                 quarantine(engine, alias, active)
         elif pending_quarantine:
             quarantine(engine, alias, active)
         if mirror.exists():
-            if local_only:
-                finding_status, _ = inspect(engine.git, mirror)
-                if engine.git.stop.is_set():
-                    break
-                healthy = {"healthy": True, "corrupt": False}.get(finding_status)
-            else:
-                healthy = verify(engine, mirror, periodic_damage)
+            healthy = verify(engine, mirror, integrity=integrity)
             if healthy is None:
+                engine.save_meta(alias)
                 engine.events.log(
                     "recovery.deferred",
                     logging.WARNING,
@@ -230,8 +249,9 @@ def recover(
                     operation_id=operation_id,
                 )
             if healthy:
-                if periodic_damage:
+                if finding:
                     finding["repair_pending"] = False
+                integrity.pop("damage_pending", None)
                 if not local_only:
                     integrity["repair_attempts"] = 0
                 backup.pop("repair_deferred", None)
@@ -249,7 +269,8 @@ def recover(
             elif not periodic_damage or eligible:
                 repair(engine, alias)
         elif not partial.exists() and not pending_quarantine:
-            backup["status"] = "interrupted"
+            if backup["status"] != "error":
+                backup["status"] = "interrupted"
             integrity["status"] = "unchecked"
             backup.pop("manual_attention_required", None)
         engine.save_meta(alias)
@@ -382,6 +403,14 @@ def repair(engine: Engine, alias: str) -> None:
         if engine.git.stop.is_set():
             return
         started = engine.events.start()
+        current = engine.store.data["active_operation"]
+        if (
+            current
+            and current["alias"] == alias
+            and current["state"] in ("running", "interrupted")
+        ):
+            engine.save_meta(alias)
+            engine.store.update_operation(state="reconciled", completed_at=utcnow())
         operation = engine.store.begin(alias, "repair")
         integrity["status"] = backup["status"] = "repairing"
         engine.save_meta(alias)
@@ -404,10 +433,18 @@ def repair(engine: Engine, alias: str) -> None:
             healthy = verify(
                 engine,
                 mirror,
-                integrity.get("periodic", {}).get("repair_pending", False),
+                integrity=integrity,
+                kind="repair",
             )
-            if healthy is not None:
-                integrity.update(last_checked_at=utcnow(), last_check_kind="repair")
+            if healthy is None:
+                integrity["status"] = "suspect"
+                backup.update(
+                    status="repair_paused", repair_deferred="RECOVERY_REQUIRED"
+                )
+                engine.save_meta(alias)
+                engine.store.update_operation(state="interrupted")
+                return
+            integrity.update(last_checked_at=utcnow(), last_check_kind="repair")
         except HarborError as error:
             if isinstance(error, GitError) and error.source_status is not None:
                 meta["source"]["status"] = error.source_status
@@ -434,7 +471,23 @@ def repair(engine: Engine, alias: str) -> None:
                     else str(error),
                 )
                 return
+            if str(error) in (
+                "MIRROR_UNSUPPORTED",
+                "FILESYSTEM_ERROR",
+                "GIT_OUTPUT_LIMIT",
+            ):
+                record_finding(integrity, "uncheckable", str(error), "repair")
+                integrity.pop("restore_compatibility", None)
+                backup.update(
+                    status="repair_paused", repair_deferred="RECOVERY_REQUIRED"
+                )
+                engine.save_meta(alias)
+                engine.store.update_operation(state="interrupted")
+                return
             healthy = False
+        if healthy:
+            sync_tree(mirror, files=False)
+            integrity.pop("damage_pending", None)
         repair_result(engine, alias, operation, healthy is True, started)
         engine.checkpoint("repair_metadata")
         engine.store.complete()

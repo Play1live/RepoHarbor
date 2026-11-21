@@ -2,11 +2,13 @@
 
 import http.client
 import json
+import os
 import secrets
+import socket
 import ssl
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -817,3 +819,171 @@ def test_normalized_events_and_cache(factory):
     assert all(e["correlation"] for e in saved["activities"])
     assert "PRIVATE" not in json.dumps(saved)
     assert saved is data()
+
+
+def test_proxy_login_isolates_clients(factory, tls_files):
+    password, client, env = tls_files
+    config = replace(factory.config, web=Web(True, HOST, 0, ORIGIN, HOST))
+    with (
+        factory(config) as engine,
+        listening(open_live(config, engine.events, env)) as port,
+    ):
+
+        def post(value, address=None, peer=HOST):
+            headers = {"Origin": ORIGIN}
+            if address:
+                headers["X-Real-IP"] = address
+            return exchange(
+                port,
+                "POST",
+                "/api/login",
+                headers,
+                {"password": value},
+                client,
+                peer=peer,
+            )[0]
+
+        assert post(password) == 400
+        for _ in range(5):
+            assert post("wrong", "192.0.2.101") == 401
+        assert post(password, "192.0.2.101") == 429
+        assert post(password, "192.0.2.102") == 200
+        assert post(password, peer="127.0.0.2") == 200
+
+
+def test_absolute_request_deadline(factory, tls_files, monkeypatch):
+    password, tls, env = tls_files
+    monkeypatch.setattr("repoharbor.dashboard_http.REQUEST_TIMEOUT", 0.5)
+    config = replace(factory.config, web=Web(True, HOST, 0, ORIGIN))
+    with (
+        factory(config) as engine,
+        listening(open_live(config, engine.events, env)) as port,
+        tls.wrap_socket(
+            socket.create_connection((HOST, port)), server_hostname=HOST
+        ) as slow,
+    ):
+        slow.settimeout(2)
+        slow.sendall(b"GET / HTTP/1.1\r\n")
+        assert login(port, tls, password)
+        # Closing an incomplete TLS request may send a fatal alert instead of EOF.
+        with suppress(ssl.SSLError):
+            assert slow.recv(1) in (b"", b"H")
+
+
+def test_cache_invalidation_does_not_wait_for_old_snapshot(factory, monkeypatch):
+    data = DashboardData(factory.config, Events())
+    entered, release = Event(), Event()
+
+    def builder(*_):
+        entered.set()
+        assert release.wait(3)
+        return {"snapshot": 1}
+
+    monkeypatch.setattr("repoharbor.dashboard_data.snapshot", builder)
+    with ThreadPoolExecutor() as pool:
+        previous = pool.submit(data)
+        assert entered.wait(1)
+        invalidation = pool.submit(data.invalidate)
+        try:
+            invalidation.result(timeout=1)
+            with pytest.raises(HarborError, match="being refreshed"):
+                data()
+        finally:
+            release.set()
+        with pytest.raises(HarborError, match="superseded"):
+            previous.result(timeout=1)
+        assert data() == {"snapshot": 1}
+
+
+@pytest.mark.skipif(
+    os.environ.get("REPOHARBOR_BROWSER_TEST") != "1",
+    reason="Playwright Chromium is installed by the browser job",
+)
+def test_browser_login_repository_navigation_and_integrity(factory, tls_files):
+    from playwright.sync_api import expect, sync_playwright
+
+    from repoharbor.control import Control
+    from repoharbor.scheduler import Cron, Scheduler
+
+    password, _, env = tls_files
+    with factory() as engine:
+        assert engine.run() == Result.SUCCESS
+        with socket.socket() as reserve:
+            reserve.bind((HOST, 0))
+            port = reserve.getsockname()[1]
+        origin = f"https://{HOST}:{port}"
+        config = replace(
+            factory.config, manual_run=True, web=Web(True, HOST, port, origin)
+        )
+        engine.config = config
+        scheduler = Scheduler(Cron(config.schedule), config.timezone, datetime.now(UTC))
+        control = Control(engine, scheduler, engine.git.stop)
+        with (
+            control.start(),
+            listening(open_live(config, engine.events, env)),
+            sync_playwright() as p,
+        ):
+            browser = p.chromium.launch(
+                executable_path=os.environ.get("REPOHARBOR_CHROMIUM_PATH")
+            )
+            try:
+                context = browser.new_context(ignore_https_errors=True)
+                page = context.new_page()
+                page.on("dialog", lambda dialog: dialog.accept())
+                page.goto(origin + "/repositories")
+                page.get_by_label("Administrator password").fill(password)
+                page.get_by_role("button", name="Sign in").click()
+                expect(page.locator("#repo-demo")).to_be_visible()
+                page.locator("#repo-demo").click()
+                check = page.get_by_role("button", name="Check integrity")
+                expect(check).to_be_enabled()
+                check.click()
+                expect(
+                    page.get_by_text("Integrity check completed successfully.")
+                ).to_be_visible()
+                page.get_by_label("Close details").click()
+                expect(page.locator("#repo-demo")).to_be_visible()
+                page.reload()
+                expect(page.locator("#repo-demo")).to_be_visible()
+            finally:
+                browser.close()
+
+
+def test_dashboard_projects_active_repository_and_retry(factory, monkeypatch):
+    with factory() as engine:
+        assert engine.run() is Result.SUCCESS
+        monkeypatch.setattr("repoharbor.dashboard_data.request", lambda *_: Result.BUSY)
+        with engine.store.transaction() as data:
+            data["active_run"]["state"] = "running"
+        engine.store.begin("demo", "mirror_update")
+        data = snapshot(engine.config, engine.events)
+        assert data["service"]["active_run"]["repository"] == "demo"
+        engine.store.complete()
+        engine.store.begin("demo", "mirror_update", retry=True)
+        data = snapshot(engine.config, engine.events)
+        assert data["service"]["active_retry"]["repository"] == "demo"
+
+
+def test_dashboard_uses_bounded_stale_view_during_refresh(factory, monkeypatch):
+    data = DashboardData(factory.config, Events())
+    monkeypatch.setattr(
+        "repoharbor.dashboard_data.snapshot", lambda *_: {"revision": 1}
+    )
+    assert data() == {"revision": 1}
+    data.expiry -= 5
+    entered, release = Event(), Event()
+
+    def refresh(*_):
+        entered.set()
+        assert release.wait(3)
+        return {"revision": 2}
+
+    monkeypatch.setattr("repoharbor.dashboard_data.snapshot", refresh)
+    with ThreadPoolExecutor() as pool:
+        pending = pool.submit(data)
+        try:
+            assert entered.wait(1)
+            assert data() == {"revision": 1}
+        finally:
+            release.set()
+        assert pending.result(timeout=1) == {"revision": 2}

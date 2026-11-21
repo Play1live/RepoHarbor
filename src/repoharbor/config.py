@@ -49,6 +49,25 @@ def canonical_url(value: Any) -> str:
     return urlunsplit(("https", authority, u.path.rstrip("/"), "", ""))
 
 
+class UniqueSafeLoader(yaml.SafeLoader):
+    """Reject explicitly repeated keys while preserving normal YAML merge precedence."""
+
+    def flatten_mapping(self, node: yaml.nodes.MappingNode) -> None:
+        seen: set[object] = set()
+        for key, _ in node.value:
+            if key.tag == "tag:yaml.org,2002:merge":
+                value = ("merge", "<<")
+            else:
+                value = self.construct_object(key)  # type: ignore[no-untyped-call]
+            try:
+                if value in seen:
+                    raise HarborError("Duplicate YAML mapping key")
+                seen.add(value)
+            except TypeError:
+                raise HarborError("Invalid YAML mapping key") from None
+        super().flatten_mapping(node)
+
+
 def keys(value: Any, allowed: set[str]) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) - allowed:
         raise HarborError("Unknown or malformed configuration field")
@@ -187,13 +206,15 @@ class Web:
     bind: str = "127.0.0.1"
     port: int = 8080
     origin: str | None = None
+    trusted_proxy: str | None = None
 
 
 def web_settings(raw: Any, enabled: bool) -> Web:
-    options = keys(raw, {"bind", "port", "origin"})
+    options = keys(raw, {"bind", "port", "origin", "trusted_proxy"})
     bind = options.get("bind", Web.bind)
     port = options.get("port", Web.port)
     origin = options.get("origin")
+    proxy = options.get("trusted_proxy")
     if (
         not isinstance(bind, str)
         or type(port) is not int
@@ -203,6 +224,10 @@ def web_settings(raw: Any, enabled: bool) -> Web:
         raise HarborError("Invalid web configuration or missing HTTPS origin")
     try:
         IPv4Address(bind)
+        if proxy is not None and (
+            not isinstance(proxy, str) or str(IPv4Address(proxy)) != proxy
+        ):
+            raise ValueError
         if origin is not None and (
             canonical_url(origin) != origin or urlsplit(origin).path
         ):
@@ -211,7 +236,7 @@ def web_settings(raw: Any, enabled: bool) -> Web:
         raise HarborError(
             "Web requires an IPv4 bind and canonical HTTPS origin"
         ) from None
-    return Web(enabled, bind, port, origin)
+    return Web(enabled, bind, port, origin, proxy)
 
 
 @dataclass(frozen=True)
@@ -347,8 +372,8 @@ def load(env: dict[str, str]) -> Config:
     if mode not in ("env", "file"):
         raise HarborError("REPOHARBOR_TOKEN_SOURCE must explicitly be env or file")
     try:
-        data = yaml.safe_load(env.get("REPOHARBOR_CONFIG", "{}"))
-    except yaml.YAMLError:
+        data = yaml.load(env.get("REPOHARBOR_CONFIG", "{}"), Loader=UniqueSafeLoader)
+    except (yaml.YAMLError, RecursionError):
         raise HarborError("Invalid configuration YAML") from None
     d = keys(
         data,
@@ -372,7 +397,7 @@ def load(env: dict[str, str]) -> Config:
     if type(d.get("schema_version")) is not int or d["schema_version"] != 1:
         raise HarborError("schema_version must be 1")
     schedule = d.get("schedule", "0 3 * * *")
-    Cron(schedule)
+    Cron(schedule).require_possible()
     timezone = env.get("TZ", "UTC")
     try:
         ZoneInfo(timezone)
@@ -396,15 +421,17 @@ def load(env: dict[str, str]) -> Config:
     if not isinstance(raw_sources, list):
         raise HarborError("manual_git_urls must be a list")
     sources: list[Source] = []
+    authorities = {p.credential: p.host for p in providers}
     for raw in raw_sources:
         s = keys(raw, {"alias", "url", "web_url", "credential"})
         alias, url = identifier(s.get("alias")), canonical_url(s.get("url"))
         credential = s.get("credential")
         if credential is not None and credential not in names:
             raise HarborError("Unknown credential reference")
-        bound = next((p for p in providers if p.credential == credential), None)
-        if bound is not None and urlsplit(url).netloc != bound.host:
-            raise HarborError("Manual source credential belongs to another host")
+        if credential is not None:
+            authority = urlsplit(url).netloc
+            if authorities.setdefault(credential, authority) != authority:
+                raise HarborError("Manual source credential belongs to another host")
         if any(x.alias == alias for x in sources):
             raise HarborError("Duplicate source alias")
         existing = next((x for x in sources if x.url == url), None)
@@ -482,7 +509,7 @@ def load(env: dict[str, str]) -> Config:
         raise HarborError("Invalid or unsupported optional feature")
     integrity = keys(d.get("integrity", {}), {"schedule", "include_excluded"})
     integrity_schedule = integrity.get("schedule", Integrity.schedule)
-    Cron(integrity_schedule)
+    Cron(integrity_schedule).require_possible()
     include_excluded = integrity.get("include_excluded", True)
     if type(include_excluded) is not bool:
         raise HarborError("Invalid integrity include_excluded setting")

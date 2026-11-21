@@ -1,4 +1,5 @@
 import importlib
+import os
 import runpy
 import signal
 import sys
@@ -18,15 +19,24 @@ from repoharbor.git_backup import Git
 
 
 @pytest.mark.parametrize(
-    "prompt,expected",
+    "prompt,expected,authority",
     [
-        ("Username for 'https://username.example.org': ", "oauth2"),
-        ("Password for 'https://oauth2@username.example.org': ", "test-token"),
-        ("Password for 'https://example.org/username': ", "test-token"),
-        ("USERNAME for 'https://example.org': ", "oauth2"),
+        (
+            "Username for 'https://username.example.org': ",
+            "oauth2",
+            "username.example.org",
+        ),
+        (
+            "Password for 'https://oauth2@username.example.org': ",
+            "test-token",
+            "username.example.org",
+        ),
+        ("Password for 'https://example.org/username': ", "test-token", "example.org"),
+        ("Username for 'https://example.org:8443': ", "oauth2", "example.org:8443"),
     ],
 )
-def test_askpass_prompt_type_ignores_url(monkeypatch, capsys, prompt, expected):
+def test_askpass_prompt_is_scoped(monkeypatch, capsys, prompt, expected, authority):
+    monkeypatch.setenv("REPOHARBOR_ASKPASS_AUTHORITY", authority)
     monkeypatch.setenv("REPOHARBOR_ASKPASS_TOKEN", "test-token")
     monkeypatch.setattr(sys, "argv", ["askpass", prompt])
     askpass.main()
@@ -37,10 +47,15 @@ def test_askpass_prompt_type_ignores_url(monkeypatch, capsys, prompt, expected):
 
 def test_askpass(monkeypatch, capsys):
     monkeypatch.setenv("REPOHARBOR_ASKPASS_TOKEN", "fictional-test-token")
-    monkeypatch.setattr(sys, "argv", ["askpass", "Username for https://example.org"])
+    monkeypatch.setenv("REPOHARBOR_ASKPASS_AUTHORITY", "example.org")
+    monkeypatch.setattr(
+        sys, "argv", ["askpass", "Username for 'https://example.org': "]
+    )
     askpass.main()
     assert capsys.readouterr().out == "oauth2\n"
-    monkeypatch.setattr(sys, "argv", ["askpass", "Password"])
+    monkeypatch.setattr(
+        sys, "argv", ["askpass", "Password for 'https://example.org': "]
+    )
     askpass.main()
     assert capsys.readouterr().out == "fictional-test-token\n"
     with pytest.raises(SystemExit) as exit_info:
@@ -48,7 +63,9 @@ def test_askpass(monkeypatch, capsys):
         runpy.run_module("repoharbor", run_name="__main__")
     assert exit_info.value.code == 0
     assert __version__ in capsys.readouterr().out
-    monkeypatch.setattr(sys, "argv", ["askpass", "Username"])
+    monkeypatch.setattr(
+        sys, "argv", ["askpass", "Username for 'https://example.org': "]
+    )
     runpy.run_path(askpass.__file__, run_name="__main__")
     assert capsys.readouterr().out == "oauth2\n"
 
@@ -149,6 +166,10 @@ def test_git_interrupt_kills_and_reaps_process_tree(monkeypatch, kill_timeout):
     process = Mock()
     process.pid = 123
     process.poll.return_value = None
+    for name in ("stdout", "stderr"):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
+        setattr(process, name, os.fdopen(read_fd, "rb"))
     if kill_timeout:
         process.wait.side_effect = [subprocess.TimeoutExpired("git", 5), 0]
     monkeypatch.setattr(module.subprocess, "Popen", Mock(return_value=process))

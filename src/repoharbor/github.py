@@ -6,6 +6,7 @@ import contextlib
 import errno
 import json
 import math
+import queue
 import re
 import socket
 import sys
@@ -31,6 +32,7 @@ from repoharbor.selection import address, repository_key
 BASE = "https://api.github.com"
 MAX_BODY = 4 * 1024 * 1024
 TEMPORARY_HTTP_ERRORS = (500, 502, 503, 504)
+NETWORK_WORKERS = threading.BoundedSemaphore(4)
 
 
 class DiscoveryError(HarborError):
@@ -134,8 +136,10 @@ def parse_repository(value: Any) -> Repository:
         private, fork, archived = value["private"], value["fork"], value["archived"]
         if any(type(v) is not bool for v in (private, fork, archived)):
             raise ValueError
-        visibility = "private" if private else "public"
-        if value.get("visibility", visibility) != visibility:
+        visibility = value.get("visibility", "private" if private else "public")
+        if visibility not in (
+            ("private", "internal") if private else ("public", "internal")
+        ):
             raise ValueError
         # Never trust an API-supplied clone target for secret delivery.
         url = f"https://github.com/{login}/{name}"
@@ -181,6 +185,7 @@ class GitHub:
         self.last_completed: float | None = None
         self.retry_at = 0.0
         self.lock = threading.Lock()
+        self.network = threading.local()
 
     def request(self, path: str, credential: str) -> tuple[Any, Mapping[str, str]]:
         # One client is shared by all providers, pages and identity checks per run.
@@ -202,8 +207,8 @@ class GitHub:
                     break
                 self.stop.wait(min(remaining, self.deadline - now))
             try:
-                return self._request(path, credential)
-            except (HTTPException, OSError, ValueError, UnicodeError) as error:
+                return self.bounded_request(path, credential)
+            except (HTTPException, OSError, ValueError, RecursionError) as error:
                 raise DiscoveryError(
                     "GITHUB_INVALID_RESPONSE_OR_NETWORK",
                     self.retry_at,
@@ -211,6 +216,67 @@ class GitHub:
                 ) from None
             finally:
                 self.last_completed = time.monotonic()
+
+    def bounded_request(
+        self, path: str, credential: str
+    ) -> tuple[Any, Mapping[str, str]]:
+        # DNS and some blocking TLS reads cannot be cancelled inside urllib. Workers
+        # never write persistent state, and a global cap bounds abandoned I/O.
+        if not NETWORK_WORKERS.acquire(blocking=False):
+            raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT", temporary=True)
+        outcome: queue.Queue[tuple[Any, Mapping[str, str]] | Exception | None] = (
+            queue.Queue()
+        )
+        acknowledged = threading.Event()
+        cancelled = threading.Event()
+
+        def cooldown() -> None:
+            outcome.put(None)
+            acknowledged.wait()
+            if cancelled.is_set():
+                raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT", temporary=True)
+
+        def receive() -> None:
+            self.network.cooldown = cooldown
+            try:
+                outcome.put(self._request(path, credential))
+            except Exception as error:
+                outcome.put(error)
+            finally:
+                NETWORK_WORKERS.release()
+
+        thread = threading.Thread(
+            target=receive, name="repoharbor-discovery", daemon=True
+        )
+        try:
+            thread.start()
+        except BaseException:
+            NETWORK_WORKERS.release()
+            raise
+        try:
+            while not self.stop.is_set():
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise DiscoveryError("GITHUB_DISCOVERY_TIMEOUT", temporary=True)
+                try:
+                    result = outcome.get(timeout=min(remaining, 0.1))
+                except queue.Empty:
+                    continue
+                if result is None:
+                    self.persist_cooldown()
+                    acknowledged.set()
+                elif isinstance(result, Exception):
+                    raise result
+                else:
+                    return result
+            raise DiscoveryError("INTERRUPTED")
+        finally:
+            cancelled.set()
+            acknowledged.set()
+
+    def report_cooldown(self) -> None:
+        callback = getattr(self.network, "cooldown", self.persist_cooldown)
+        callback()
 
     def persist_cooldown(self) -> None:
         pass
@@ -233,8 +299,7 @@ class GitHub:
                         self.retry_at,
                         self.retry_time(headers, time.time(), require_reset=True),
                     )
-                if self.retry_at:
-                    self.persist_cooldown()
+                    self.report_cooldown()
                 body = bytearray()
                 while True:
                     if time.monotonic() >= self.deadline:
@@ -271,8 +336,7 @@ class GitHub:
                     self.retry_at = max(
                         self.retry_at, self.retry_time(error.headers, time.time())
                     )
-                if rate:
-                    self.persist_cooldown()
+                    self.report_cooldown()
                 retry = self.retry_at if rate else 0
             raise DiscoveryError(
                 code, retry, temporary=error.code in TEMPORARY_HTTP_ERRORS

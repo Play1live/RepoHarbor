@@ -151,7 +151,9 @@ def test_repair_guards_and_three_attempts(factory, remote, mode, monkeypatch):
 
             monkeypatch.setattr(engine.git, "fetch", fail)
         else:
-            monkeypatch.setattr(engine.git, "healthy", lambda *a: False)
+            monkeypatch.setattr(
+                "repoharbor.recovery.inspect", lambda *a: ("corrupt", "GIT_CORRUPTION")
+            )
         repair(engine, "demo")
         attempts = engine.repos["demo"]["integrity"]["repair_attempts"]
         assert attempts == (3 if mode in ("failure", "invalid") else 0)

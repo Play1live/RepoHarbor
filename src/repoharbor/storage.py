@@ -1,9 +1,10 @@
-"""Soft budgets and bounded transfer monitoring; no caching of inventory results."""
+"""Soft budgets and bounded transfer monitoring."""
 
 import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,6 +42,8 @@ class Measurement:
     measured_at: str
     global_status: str | None
     repo_status: str | None
+    global_estimate: bool = False
+    global_sampled_at: str | None = None
 
     @property
     def status(self) -> str | None:
@@ -50,9 +53,47 @@ class Measurement:
 class Budget:
     def __init__(self, root: Path, config: Storage):
         self.root, self.config = root, config
+        self.batching = False
+        self.total: int | None = None
+        self.sample_at = 0.0
+        self.sample_timestamp: str | None = None
+        self.last_repo: tuple[Path, int] | None = None
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        # The engine owns the exclusive writer lock. Account for changes to its
+        # current repository between periodic whole-root measurements.
+        self.batching = True
+        try:
+            yield
+        finally:
+            self.batching = False
+            self.total = None
+            self.last_repo = None
+            self.sample_timestamp = None
+
+    def global_usage(self, repo: Path, size: int) -> tuple[int, bool]:
+        if not self.batching:
+            return usage(self.root), False
+        now = time.monotonic()
+        if self.total is not None and self.last_repo and repo == self.last_repo[0]:
+            self.total += size - self.last_repo[1]
+        self.last_repo = (repo, size)
+        limit = self.config.global_bytes
+        if (
+            self.total is None
+            or now >= self.sample_at + 30
+            or (limit is not None and self.total >= limit - 16 * 1024**2)
+        ):
+            self.total = usage(self.root)
+            self.sample_at = now
+            self.sample_timestamp = utcnow()
+            return self.total, False
+        return self.total, True
 
     def measure(self, alias: str, repo: Path) -> Measurement:
-        global_bytes, repo_bytes = usage(self.root), usage(repo)
+        repo_bytes = usage(repo)
+        global_bytes, estimate = self.global_usage(repo, repo_bytes)
         free = shutil.disk_usage(self.root).free
         global_status = None
         if free < self.config.min_free_bytes:
@@ -67,7 +108,14 @@ class Budget:
             "repo_limit_reached" if limit is not None and repo_bytes >= limit else None
         )
         return Measurement(
-            global_bytes, repo_bytes, free, utcnow(), global_status, repo_status
+            global_bytes,
+            repo_bytes,
+            free,
+            utcnow(),
+            global_status,
+            repo_status,
+            estimate,
+            self.sample_timestamp,
         )
 
     def status(self, alias: str, repo: Path) -> str | None:

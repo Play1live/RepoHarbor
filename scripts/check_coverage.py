@@ -6,6 +6,7 @@ from pathlib import Path
 
 CRITICAL = {
     "catalog",
+    "engine",
     "events",
     "log_files",
     "mounts",
@@ -20,6 +21,7 @@ CRITICAL = {
     "selection",
     "gitlab",
 }
+WEB_AND_RETRY = {"dashboard_http", "dashboard_data", "retry"}
 
 
 def percent(covered, total):
@@ -36,14 +38,15 @@ def check(report):
     found = set()
     for filename, data in report["files"].items():
         module = Path(filename).stem
-        if module in CRITICAL:
+        if module in CRITICAL | WEB_AND_RETRY:
             found.add(module)
             summary = data["summary"]
             value = percent(summary["covered_lines"], summary["num_statements"])
             print(f"{module}: {value:.2f}% lines")
-            if value < 95:
-                failures.append(f"{module} below 95% lines")
-    if found != CRITICAL:
+            threshold = 95 if module in CRITICAL else 90
+            if value < threshold:
+                failures.append(f"{module} below {threshold}% lines")
+    if found != CRITICAL | WEB_AND_RETRY:
         failures.append("missing critical modules")
     print(f"Total: {lines:.2f}% lines, {branches:.2f}% branches")
     if failures:

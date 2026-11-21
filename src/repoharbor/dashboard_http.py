@@ -10,11 +10,12 @@ import socket
 import ssl
 import stat
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ipaddress import ip_address
 from pathlib import Path
-from threading import BoundedSemaphore, Lock, Thread
+from threading import BoundedSemaphore, Lock, Thread, Timer
 from time import monotonic
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -40,6 +41,8 @@ LIFETIME = 900
 LOGIN_WINDOW = 60
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_PEER_LIMIT = 256
+HANDSHAKE_TIMEOUT = 4.0
+REQUEST_TIMEOUT = 8.0
 AUTH_ERROR = "Sign-in required."
 SocketRequest = socket.socket | tuple[bytes, socket.socket]
 
@@ -156,7 +159,7 @@ class DashboardServer(ThreadingHTTPServer):
     ) -> None:
         assert isinstance(request, socket.socket)
         try:
-            request.settimeout(4)
+            request.settimeout(HANDSHAKE_TIMEOUT)
             request = self.tls.wrap_socket(request, server_side=True)
             super().process_request_thread(request, client_address)
         except OSError:
@@ -171,6 +174,21 @@ class DashboardServer(ThreadingHTTPServer):
 
 class DashboardRequest(BaseHTTPRequestHandler):
     server: DashboardServer
+
+    def handle(self) -> None:
+        def expire() -> None:
+            with suppress(OSError):
+                self.connection.shutdown(socket.SHUT_RD)
+
+        # Covers request line, headers and body. Stop the timer once parsed,
+        # before waiting for an authenticated backup or integrity operation.
+        self.deadline = Timer(REQUEST_TIMEOUT, expire)
+        self.deadline.daemon = True
+        self.deadline.start()
+        try:
+            super().handle()
+        finally:
+            self.deadline.cancel()
 
     def log_message(self, format: str, *args: Any) -> None:
         pass
@@ -194,6 +212,7 @@ class DashboardRequest(BaseHTTPRequestHandler):
         mime: str = "application/json; charset=utf-8",
         cookie: str | None = None,
     ) -> None:
+        self.deadline.cancel()
         body = (
             data
             if isinstance(data, bytes)
@@ -246,6 +265,7 @@ class DashboardRequest(BaseHTTPRequestHandler):
         return value if re.fullmatch(r"[A-Za-z0-9_-]{43}", value) else ""
 
     def do_GET(self) -> None:
+        self.deadline.cancel()
         if not self.trusted():
             self.reply(403, {"error": "Access denied."})
             return
@@ -313,6 +333,7 @@ class DashboardRequest(BaseHTTPRequestHandler):
                 self.reply(403, {"error": "Invalid session or request."})
                 return
         body = self.body()
+        self.deadline.cancel()
         if body is None:
             self.reply(400, {"error": "Invalid request."})
         elif self.path == "/api/login":
@@ -334,8 +355,14 @@ class DashboardRequest(BaseHTTPRequestHandler):
         ):
             self.reply(400, {"error": "Invalid sign-in request."})
             return
-        # Only the TCP peer is authoritative. A proxy's forwarding headers are ignored.
-        status, token = sessions.login(password, self.client_address[0])
+        peer = self.client_address[0]
+        if peer == self.server.config.web.trusted_proxy:
+            try:
+                peer = str(ip_address(self.header("X-Real-IP") or ""))
+            except ValueError:
+                self.reply(400, {"error": "Invalid sign-in request."})
+                return
+        status, token = sessions.login(password, peer)
         if token is not None:
             sessions.logout(session)
             self.reply(200, {}, cookie=f"{token}; Max-Age={LIFETIME}")

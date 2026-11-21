@@ -4,7 +4,7 @@ import stat
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
 from time import monotonic
 from typing import Any
 from urllib.parse import urlsplit
@@ -224,14 +224,6 @@ def repository_view(
         "last_result": manual.get("last_result"),
         "error_code": safe_code(manual.get("error_code")),
     }
-    completed = repo["manual_integrity"]["last_completed_at"]
-    if completed and completed >= max(
-        repo["integrity"]["last_checked_at"] or "", periodic["last_completed_at"] or ""
-    ):
-        result = manual["last_result"]
-        if result != "healthy" or repo["integrity_status"] in ("healthy", "unchecked"):
-            repo["integrity_status"] = result
-        repo["has_error"] |= result in ("corrupt", "uncheckable")
     repo["can_check_integrity"] = False
     if (
         config.manual_run
@@ -280,6 +272,9 @@ def snapshot(config: Config, events: Events) -> dict[str, Any]:
             "started_at": timestamp(manual["last_started_at"]),
             "last_result": manual["last_result"],
             "last_completed_at": timestamp(manual["last_completed_at"]),
+            "last_finished_run": state.get("integrity_history", {}).get(
+                "manual_integrity"
+            ),
             **{key: manual[key] for key in INTEGRITY_COUNTS},
         }
     stored = state.get("global_storage", {})
@@ -312,6 +307,7 @@ def snapshot(config: Config, events: Events) -> dict[str, Any]:
         "last_result": label(periodic.get("last_result")),
         "last_completed_at": timestamp(periodic.get("last_completed_at")),
         "started_at": timestamp(periodic.get("last_started_at")),
+        "last_finished_run": periodic["last_finished_run"],
         "next_scheduled_at": periodic["next_scheduled_at"],
         "repository": periodic.get("current_repository"),
     }
@@ -373,15 +369,42 @@ class DashboardData:
         self.events = events
         self.lock = Lock()
         self.expiry = 0.0
+        self.refreshing: Event | None = None
+        self.generation = 0
         self.saved: dict[str, Any] = {}
 
     def __call__(self) -> dict[str, Any]:
         with self.lock:
-            if monotonic() >= self.expiry:
-                self.saved = snapshot(self.config, self.events)
+            now = monotonic()
+            if now < self.expiry:
+                return self.saved
+            pending = self.refreshing
+            if pending is not None and self.expiry and now - self.expiry <= 5:
+                return self.saved
+            generation = self.generation
+            done = Event()
+            if pending is None:
+                self.refreshing = done
+        if pending is not None:
+            if pending.wait(0.75):
+                with self.lock:
+                    if monotonic() < self.expiry and generation == self.generation:
+                        return self.saved
+            raise HarborError("Dashboard snapshot is being refreshed")
+        try:
+            latest = snapshot(self.config, self.events)
+            with self.lock:
+                if generation != self.generation:
+                    raise HarborError("Dashboard snapshot was superseded")
+                self.saved = latest
                 self.expiry = monotonic() + 5
-            return self.saved
+                return latest
+        finally:
+            with self.lock:
+                self.refreshing = None
+                done.set()
 
     def invalidate(self) -> None:
         with self.lock:
+            self.generation += 1
             self.expiry = 0.0

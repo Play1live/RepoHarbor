@@ -6,7 +6,6 @@ import pytest
 from test_crash_corrections import kill_at
 
 from repoharbor.config import Discovery
-from repoharbor.errors import HarborError
 from repoharbor.persistence import read_json
 from repoharbor.recovery import recover
 from repoharbor.selection import Selection
@@ -34,18 +33,26 @@ def test_gitlab_sigkill_recovery_requires_fresh_discovery(gitlab_env, point):
 @pytest.mark.parametrize("code", [errno.ENOSPC, errno.EIO])
 def test_gitlab_metadata_io_failure_preserves_state(gitlab_env, monkeypatch, code):
     env = gitlab_env
-    with env.create(env.config, git_instance=env.git()) as engine:
+    module = "repoharbor.engine.atomic_json"
+    from repoharbor.persistence import atomic_json
 
-        def fail(alias):
+    def fail_staging(path, value):
+        if path.parent.name.startswith(".repoharbor-catalog-"):
             raise OSError(code, "injected")
+        return atomic_json(path, value)
 
-        monkeypatch.setattr(engine, "save_meta", fail)
-        with pytest.raises(OSError):
-            engine.run()
+    with env.create(env.config, git_instance=env.git()) as engine:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, fail_staging)
+            with pytest.raises(OSError):
+                engine.run()
         assert engine.sources == ()
+        assert not engine.path(env.key).exists()
         assert not list(env.config.root.rglob("repository.git"))
-    with pytest.raises(HarborError), env.create(env.config, git_instance=env.git()):
-        pass
+    with env.create(env.config, git_instance=env.git()) as engine:
+        recover(engine)
+        engine.run()
+        assert engine.repos[env.key]["backup"]["successful_updates"] == 1
 
 
 def test_gitlab_partial_selection_crash_preserves_mirror(gitlab_env):

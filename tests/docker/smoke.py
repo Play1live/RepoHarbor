@@ -601,7 +601,7 @@ def logging_smoke():
 
 
 def smoke():
-    assert docker("run", "--rm", IMAGE, "--version") == "0.9.1"
+    assert docker("run", "--rm", IMAGE, "--version") == "0.9.2"
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")

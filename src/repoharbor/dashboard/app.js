@@ -313,7 +313,9 @@ function overview(data) {
         ["Integrity check", p.enabled ? badge(["interrupted", "running"].includes(p.state)
           ? p.state : p.last_result || (data.state_available && p.state === "idle" ? "never" : "unknown")) : badge("disabled")],
         ["Next integrity check", p.enabled ? time(p.next_scheduled_at) : "Disabled"],
-        ["Last integrity check", p.enabled ? time(p.last_completed_at) : "Disabled"],
+        ["Last integrity check", p.enabled ? time(p.last_finished_run?.at || p.last_completed_at) : "Disabled"],
+        ["Last backup result", s.last_backup_result ? label(s.last_backup_result) : "—"],
+        ["Unavailable backup targets", s.backup_coverage ? count(s.backup_coverage.unavailable.length) : "—"],
         ["Sources with issues", shortcut("/sources?problems=yes", count(sources.filter(sourceProblem).length))],
       ])))),
   ];
@@ -450,6 +452,8 @@ function repoDetail(repo, data) {
       ["Measured size", bytes(repo.size_bytes)], ["Limit", limit(repo.limit_bytes)],
       ["Storage status", badge(repo.storage_status)]])),
     section("Integrity and repair", fields([["Integrity", badge(repo.integrity_status)], ["Last recorded engine check", time(integrity.last_checked_at)],
+      ["Last verified healthy", time(repo.last_verified_healthy_at)],
+      ["Restore compatibility", repo.restore_compatibility ? label(repo.restore_compatibility) : unknown],
       ["Periodic check result", badge(periodic.last_result)], ["Last periodic check", time(periodic.last_completed_at)],
       ["Last manual check", time(manual.last_completed_at)], ["Manual check result", badge(manual.last_result)],
       ["Manual check error", manual.error_code || "—"],
@@ -608,7 +612,7 @@ function storage(data) {
     badge(repo.storage_status), time(repo.size_measured_at),
   ]));
   return [
-    metrics(metric("Backup storage used", s.last_measured_bytes == null && data.state_available ? "Not measured" : bytes(s.last_measured_bytes),
+    metrics(metric(s.estimated ? "Estimated backup storage used" : "Backup storage used", s.last_measured_bytes == null && data.state_available ? "Not measured" : bytes(s.last_measured_bytes),
       s.last_measured_at ? "Last measured: " + date(s.last_measured_at) : null, "storage"),
       metric("Global limit", limit(config.global_limit), "Backup directory", "repositories"),
       metric("Free disk space", bytes(s.free_bytes), s.free_bytes == null ? "No recorded measurement" : "At the last measurement", "storage"),

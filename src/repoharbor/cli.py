@@ -5,6 +5,7 @@ import errno
 import logging
 import os
 import signal
+import stat
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -21,7 +22,8 @@ from repoharbor.errors import HarborError, Result
 from repoharbor.events import Events
 from repoharbor.git_backup import Git
 from repoharbor.log_files import LogSetupError
-from repoharbor.persistence import Store
+from repoharbor.mounts import read_mounts
+from repoharbor.persistence import STORAGE_MARKER, Store, directory_fd
 from repoharbor.recovery import recover
 from repoharbor.restore import restore
 from repoharbor.scheduler import Cron, Scheduler
@@ -32,12 +34,28 @@ from repoharbor.status import print_status
 def verify_mount(root: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> None:
     # In the image a real mount is mandatory. No auto-mkdir fallback to overlay storage.
     if Path("/.dockerenv").exists():
-        mounts = [
-            line.split()[4].replace("\\040", " ")
-            for line in mountinfo.read_text().splitlines()
-        ]
-        if str(root) not in mounts:
+        mount = read_mounts(mountinfo).get(root)
+        if mount is None or mount.filesystem in (b"tmpfs", b"ramfs"):
             raise HarborError("Backup root must be a dedicated persistent bind mount")
+    expected = os.environ.get("REPOHARBOR_STORAGE_ID")
+    if expected is not None:
+        if not expected.isascii() or not (1 <= len(expected) <= 128):
+            raise HarborError("Invalid backup storage identifier")
+        with (
+            directory_fd(root) as fd,
+            os.fdopen(
+                os.open(
+                    STORAGE_MARKER,
+                    os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW,
+                    dir_fd=fd,
+                ),
+                "rb",
+            ) as marker,
+        ):
+            if not stat.S_ISREG(os.fstat(marker.fileno()).st_mode):
+                raise HarborError("Backup storage marker must be a regular file")
+            if marker.read(130).removesuffix(b"\n") != expected.encode("ascii"):
+                raise HarborError("Backup storage marker does not match configuration")
 
 
 def serve(engine: Engine, stop: threading.Event) -> None:
