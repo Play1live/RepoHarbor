@@ -1,6 +1,10 @@
 FROM python:3.12.14-slim-bookworm@sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e
+# RepoHarbor and its runtime dependencies use no SQLite. dpkg refuses
+# removal if a future system package requires it.
 RUN apt-get update && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends git ca-certificates \
+    && dpkg --purge libsqlite3-0 \
+    && rm -f /usr/local/lib/python3.12/lib-dynload/_sqlite3*.so \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -g 10001 repoharbor && useradd -u 10001 -g 10001 -M repoharbor
 WORKDIR /app

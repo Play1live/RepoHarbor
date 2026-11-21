@@ -113,8 +113,12 @@ jobs:
           persist-credentials: false
       - run: |
           mkdir -p test-results/image-security
+          cp docs/audits/RepoHarbor-Image-Advisory-Review-0.9.2.md test-results/image-security/
           docker build -t repoharbor:security .
           docker image inspect --format '{{.Id}}' repoharbor:security > test-results/image-security/image-id.txt
+          docker run --rm --network none --entrypoint dpkg-query repoharbor:security \
+            -W -f='${binary:Package}\t${Version}\t${source:Package}\n' > test-results/image-security/packages.tsv
+          docker run --rm "$TRIVY_IMAGE" --version > test-results/image-security/trivy-version.txt
           docker save -o "${RUNNER_TEMP}/repoharbor-image.tar" repoharbor:security
       - name: Generate CycloneDX SBOM and scan Debian and Python packages
         run: |
@@ -125,18 +129,34 @@ jobs:
             -v "$PWD/test-results/image-security:/out" "$TRIVY_IMAGE" image \
             --db-repository ghcr.io/aquasecurity/trivy-db:2 --input /scan/image.tar --scanners vuln --format json --output /out/vulnerabilities.json
           python - <<'PY_GATE'
+          from html import escape
           import json
+          import os
           from pathlib import Path
 
           report = json.loads(Path("test-results/image-security/vulnerabilities.json").read_text())
-          findings = [
+          flagged = [
               v for result in report.get("Results", [])
               for v in result.get("Vulnerabilities", [])
-              if v.get("Severity") in ("HIGH", "CRITICAL") and v.get("FixedVersion")
+              if v.get("Severity") in ("HIGH", "CRITICAL")
           ]
-          for v in findings:
-              print(v["VulnerabilityID"], v["PkgName"], v["InstalledVersion"], v["FixedVersion"])
-          raise SystemExit(bool(findings))
+          fixable = sum(bool(v.get("FixedVersion")) for v in flagged)
+
+          def cell(value):
+              return escape(str(value)).replace("|", "&#124;").replace("\r", " ").replace("\n", " ")
+
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as summary:
+              print("## Image advisories\n", file=summary)
+              unique = len({v["VulnerabilityID"] for v in flagged})
+              print(f"{unique} High/Critical advisories across {len(flagged)} package entries. "
+                    f"Trivy lists a fixed version for {fixable} entries.\n", file=summary)
+              print("| Advisory | Severity | Package | Installed | Scanner status | Fixed version |", file=summary)
+              print("| --- | --- | --- | --- | --- | --- |", file=summary)
+              for v in sorted(flagged, key=lambda v: (v["VulnerabilityID"], v["PkgName"])):
+                  fields = [v[key] for key in ("VulnerabilityID", "Severity", "PkgName", "InstalledVersion")]
+                  fields += [v.get("Status") or "Unspecified", v.get("FixedVersion") or "Unlisted"]
+                  print("| " + " | ".join(map(cell, fields)) + " |", file=summary)
+          raise SystemExit(bool(fixable))
           PY_GATE
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()

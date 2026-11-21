@@ -605,6 +605,23 @@ def smoke():
     info = json.loads(docker("image", "inspect", IMAGE))[0]["Config"]
     assert info["User"] == "10001:10001"
     assert not info.get("ExposedPorts") and not info.get("Healthcheck")
+    assert (
+        docker(
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--entrypoint",
+            "python",
+            IMAGE,
+            "-c",
+            "from importlib.util import find_spec;"
+            "from ctypes.util import find_library;"
+            "assert find_spec('_sqlite3') is None;"
+            "assert find_library('sqlite3') is None",
+        )
+        == ""
+    )
     env = [
         "-e",
         "REPOHARBOR_TOKEN_SOURCE=env",
