@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.2
+
+- Verify Git objects before reporting backup success, including no-change runs. Report incomplete discovery coverage and distinguish Git integrity from restore compatibility.
+- Keep confirmed manual and periodic damage actionable. Maintain historical check outcomes and protect open operation journals.
+- Stage catalog entries and synchronize Git and restore output before publishing success. Require restart after an uncertain JSON commit.
+- Bind Git credentials to their HTTPS authority, enforce private token files, and restrict managed mirror configuration.
+- Bound provider and Git I/O, harden the local control socket and HTTPS request handling, and support per-client throttling behind an explicitly trusted proxy.
+- Reject duplicate configuration keys and impossible schedules. Support opt-in GitHub internal visibility and retain historical mirrors during discovery.
+- Retain schema 1 and existing mirror paths. Add hashed dependencies, image SBOM and advisory scanning, CodeQL, and Chromium tests.
+
 ## 0.9.1
 
 - Open repository details across the dashboard content area and preserve list filters, sorting, and pagination when navigating back.

@@ -1,6 +1,6 @@
 # Testing, quality gates, and CI
 
-RepoHarbor `0.9.1` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, authenticated loopback HTTPS servers, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
+RepoHarbor `0.9.2` is tested with mocked GitHub and GitLab API responses, isolated local Git repositories, authenticated loopback HTTPS servers, crash and recovery tests, and a Linux Docker image. Production NAS/Portainer acceptance requires separate verification on the target system.
 
 ## Local prerequisites and commands
 
@@ -8,7 +8,7 @@ Install **Python 3.12+**, **Git**, and the **OpenSSL CLI** (for the synthetic HT
 
 ```sh
 python -m venv .venv
-.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/pip install --require-hashes -r requirements-dev.lock
 .venv/bin/pip install --no-build-isolation --no-deps -e .
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
@@ -28,7 +28,8 @@ The version is defined in `pyproject.toml`; the CLI reports the installed packag
 |---|---:|
 | Total line coverage | **90%** |
 | Total branch coverage | **85%** |
-| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `events`, `git_backup`, `gitlab`, `integrity`, `log_files`, `mounts`, `persistence`, `recovery`, `restore`, `selection`, `storage`) | **95%** |
+| Line coverage for each dashboard module and retry | **90%** |
+| Line coverage for **each** critical module (`catalog`, `control`, `credentials`, `engine`, `events`, `git_backup`, `gitlab`, `integrity`, `log_files`, `mounts`, `persistence`, `recovery`, `restore`, `selection`, `storage`) | **95%** |
 
 `scripts/check_coverage.py` enforces these independently using `coverage.json`, including a check that branch-coverage data is present. A green pytest result alone does not replace the separate coverage gate.
 
@@ -144,3 +145,19 @@ The [root README](../README.md) summarizes the architecture and supported featur
 Before production use, an operator must separately verify the actual host NAS mount, filesystem locking and durability, UID/GID and ACL permissions, selected credential mode, a real scheduled backup, recorded timestamps, controlled container restart, and a complete offline restore. Automated validation or an apparently healthy Docker container is **not** evidence of a successful backup.
 
 For deployments that enable file output, verify the dedicated log bind mount, effective UID/GID, ACLs, private files, and directory locking on the real filesystem. Run a disposable backup, confirm the expected console and file events, and test both size-based retention limits. Recreate the container with the same mounts and verify that the active application log is appended. Stop the service and verify the original mirror can still be restored offline.
+
+
+### Browser and image verification
+
+Install `requirements-browser.lock` with `pip --require-hashes` and install Chromium
+with `python -m playwright install chromium`. Run
+`REPOHARBOR_BROWSER_TEST=1 pytest tests/integration/test_dashboard.py -k browser`.
+The test uses a temporary mirror, locally issued certificate, and fixture credentials.
+
+CI publishes the image ID, CycloneDX SBOM, and Debian and Python advisory report.
+The gate fails on known high or critical findings with vendor fixes. Review the
+full report for findings without vendor fixes and for lower-severity issues.
+CodeQL analyzes Python and JavaScript in its own workflow. Python development and
+build artifacts are pinned by hash. The base-image digest is fixed and Debian
+packages follow signed Bookworm updates, so different build dates can yield
+different package revisions. Review lock and digest updates explicitly.

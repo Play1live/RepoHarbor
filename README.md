@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.9.1-64748B)
+![Version](https://img.shields.io/badge/Version-0.9.2-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -104,6 +104,8 @@ repoharbor restore bundle --repository example-demo --output /exports/example-de
 
 The clone includes Git history, branches, tags, and available refs. Add `--branch development` to check out that existing branch. A bundle is a portable Git file that you can clone offline. Repositories that were excluded, removed from the backup configuration, or are unreachable upstream can still be restored from a valid local backup. See [offline restoration](deploy/README.md#8-offline-restoration-and-acceptance) for the read-only Docker workflow, bundle import, and manual Git recovery.
 
+A full backup reports missing included repositories separately. An unchanged mirror is verified before it can report success. See the [upgrade guidance](deploy/README.md#upgrade-to-092).
+
 **Mirrors are not historical snapshots.** Synchronization reflects deleted refs and force-pushes; Restore and bundle export contain the Git data retained by the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, other hosting metadata, and unpushed local changes require separate backups. RepoHarbor has no notification feature. Excluded repositories remain stored locally. Interrupted or damaged backups may require manual intervention; existing mirrors are never silently replaced with fresh clones.
 
 Discovery reevaluates selection during scheduled and manual runs. The default is `selected` with an empty selection. Incomplete discovery pauses GitHub or the affected GitLab authority for the run. Independent authorities and eligible manual sources can continue. An established manual mirror on the affected authority can still be eligible. A first clone on that authority waits for successful discovery. Existing mirrors are retained, and manual identity conflicts block automatic assignment. See the [combined configuration example](docs/CONFIGURATION.md#combined-github-and-gitlab-example).
@@ -120,8 +122,8 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.1` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.2` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
-Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, security checks, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
+Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, Chromium, CodeQL, image scanning, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 
 Before relying on a backup, verify the host storage mount, permissions, a completed scheduled run, and an **offline restore** on the target system. Automated CI results do not replace NAS/Portainer acceptance testing.

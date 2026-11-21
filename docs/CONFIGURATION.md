@@ -1,6 +1,6 @@
 # Configuration reference (schema 1)
 
-RepoHarbor `0.9.1` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise discovery and SSH are outside this version's scope.
+RepoHarbor `0.9.2` supports discovery on GitHub.com, GitLab.com, and compatible Self-Managed GitLab instances, alongside manual HTTPS Git remotes. The web dashboard is optional. GitHub Enterprise Server and SSH are outside this version's scope. GitHub Enterprise Cloud internal repositories can be included through the visibility filter.
 
 The canonical service configuration is a YAML document supplied through **`REPOHARBOR_CONFIG`**. The image also accepts `TZ`, `REPOHARBOR_TOKEN_SOURCE`, `REPOHARBOR_BACKUP_ROOT`, and `REPOHARBOR_SECRETS_DIR`. Unknown YAML keys are rejected. The schema requires the integer `schema_version: 1`.
 
@@ -88,7 +88,7 @@ retry:
 For a configured credential named `example_primary`:
 
 - In **`env` mode**, the token is read from `REPOHARBOR_TOKEN_EXAMPLE_PRIMARY`.
-- In **`file` mode**, the token is read from the regular UTF-8 file `/run/secrets/repoharbor/example_primary`, mounted read-only. Its trailing CR/LF is stripped.
+- In **`file` mode**, the token is read from the private regular ASCII file `/run/secrets/repoharbor/example_primary`, mounted read-only. Its trailing CR/LF is stripped. The file is limited to 8 KiB and must be service-owned or root-owned with no group or other permissions. Use one credential name per HTTPS authority, including the effective port.
 
 A configured secret found in both the chosen and opposite modes is rejected. Credential names use lowercase letters, digits, `_`, and `-`, and must be unique. Because `-` and `_` map to the same environment variable name, ambiguous names are rejected. Empty or malformed credential values are rejected. Tokens are never intended to be embedded in URLs or persisted in metadata. Credential rotation requires a restart.
 
@@ -423,3 +423,21 @@ Both commands require a new output path with an existing writable parent outside
 `last_attempt_at`, `last_checked_at`, and `last_updated_at` have different meanings; skipped or failed operations must not create a false successful check or update. Repairs do not themselves imply a new Git reference update. An exhausted genuine repair does not become `repair_paused` simply because free space is also low.
 
 For controlled recovery and operator actions, see [SECURITY.md](SECURITY.md). The [deployment guide](../deploy/README.md#8-offline-restoration-and-acceptance) covers the assistant and direct Git recovery from an intact mirror. Both restore workflows and bundles use the Git data in the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, hosting metadata, and unpushed local changes require separate backups. See the [changelog](../Changelog.md) for version history. Production NAS acceptance remains an operator task.
+
+
+### Verification and backup coverage
+
+In the current full run, `backup_coverage` exposes the planned and attempted target counts,
+the excluded catalog count, and unavailable included IDs. A full run with missing included
+provider repositories returns exit 8 even if another source succeeds. An unavailable mirror
+remains on disk and can be recovered offline if otherwise valid.
+
+`latest_verification` records the most recent local finding, including a safety skip.
+`last_verified_healthy_at` is historical. `restore_compatibility` distinguishes the clone
+and bundle formats, clone-only eligibility for an empty mirror, unsupported formats and
+unconfirmed state. Verify an actual offline restore to confirm the export end to end.
+Current and previously completed integrity runs are reported separately.
+
+Use unique explicit keys in each YAML mapping. Normal YAML merge precedence is supported.
+Schedules with no possible calendar date are rejected. See the deployment instructions
+before setting the optional `web.trusted_proxy` or `REPOHARBOR_STORAGE_ID`.
