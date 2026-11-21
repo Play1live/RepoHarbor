@@ -196,21 +196,13 @@ can lose acknowledged writes. Test physical durability and restore on target sto
 
 ### Runtime image vulnerabilities
 
-The Debian Bookworm runtime image reviewed for v0.9.2 contained
-`libsqlite3-0` version `3.40.1-2+deb12u2`. The package is affected by
-CVE-2025-7458. The upstream fix is in SQLite 3.41.2, and the signed Bookworm,
-security, updates, and backports repositories offered no fixed package at review
-time. Exploitation requires executing attacker-controlled SQL in an application
-using the affected SQLite code. RepoHarbor persists JSON, provides no SQL interface,
-and does not import SQLite. Python's optional `sqlite3` module remains available.
-The package finding remains in the scanner report. Deployments that add software
-using SQLite in the same image should reassess exposure and adopt a fixed Debian
-package once available. [Debian status](https://security-tracker.debian.org/tracker/CVE-2025-7458) · [Upstream fix](https://sqlite.org/src/info/12ad822d9b827777)
+The v0.9.2 application image excludes Debian SQLite and CPython's optional
+`_sqlite3` extension. RepoHarbor uses JSON for state and does not require SQLite.
+The image scan still reports CVE-2023-45853 against zlib because it associates
+the issue with the source package. The vulnerable MiniZip component is absent
+from the runtime.
 
-The scanner also reports CVE-2023-45853 against `zlib1g` version
-`1:1.2.13.dfsg-1`. The affected ZIP-writing code belongs to MiniZip, which is
-separate from the installed zlib library. The image contains no MiniZip package,
-library, or utility, and the installed `libz.so.1` does not export the affected
-MiniZip function. The upstream MiniZip fix is in zlib 1.3.1. This finding is
-inapplicable to the image as built and remains visible in the scanner report.
-[Debian status](https://security-tracker.debian.org/tracker/CVE-2023-45853) · [Upstream changelog](https://github.com/madler/zlib/blob/v1.3.1/ChangeLog)
+The advisory review records the evidence, remaining package findings, and
+deployment conditions for the reviewed build. Image CI publishes the full scan
+and SBOM and lists all High/Critical package entries in the job summary.
+[Runtime image advisory assessment](audits/RepoHarbor-Image-Advisory-Review-0.9.2.md)
