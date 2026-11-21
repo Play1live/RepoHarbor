@@ -247,7 +247,7 @@ Cron uses five fields (`minute hour day-of-month month day-of-week`) and accepts
 
 Budgets use binary GiB (`1 GiB = 1,073,741,824 bytes`); fractional inputs are truncated to whole bytes. `0` means no new transfer may start. An override replaces the default per-repository budget; it does not add to it. Global usage includes **all** backup-root data, including excluded sources, journals, metadata, partials, and quarantines.
 
-With the default `during_transfer: finish`, size budgets are evaluated before/after operations, but a running transfer is allowed to exceed them. The physical reserve may interrupt the transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds; capacity is checked at most once every five seconds during Git operations. All measurements are point-in-time, **not hard quotas**, and eligibility is checked afresh during subsequent backup runs. No existing backup is automatically deleted to free space.
+With the default `during_transfer: finish`, a running transfer can complete even if it exceeds a configured size budget. A budget at or above its limit blocks subsequent transfers within its scope. RepoHarbor measures the entire backup root at transfer admission when a global limit is configured. Status views can use a recent estimate between full measurements. The physical reserve may interrupt a running transfer. With `abort`, configured size budgets are also checked during transfer. Stop signals are polled approximately every 100 milliseconds, and capacity is checked at most once every five seconds during Git operations. The budgets are soft limits based on point-in-time measurements. Eligibility is checked again on subsequent runs, including after space is freed. No existing backup is automatically deleted to free space.
 
 ## Periodic integrity checks
 
@@ -406,7 +406,7 @@ Both commands require a new output path with an existing writable parent outside
 ## Runtime state and recovery
 
 - `data.json` is the central, durable run/operation journal and scheduler state. Its `discovery` section records GitHub discovery, and `provider_discovery` records GitLab discovery by authority. These records track running, completed, or failed discovery and any cooldown separately from the Git operation journal. The optional `integrity` section records the periodic run state, counters, and overlap history.
-- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`.
+- Each source directory's `metadaten.json` contains repository identity and selection, source availability, backup status, timestamps, storage measurements, errors, and integrity data. It is **outside** the Git mirror. Its optional `integrity.periodic` record includes the last start, completed finding and error code, the last recorded damage time, and `repair_pending`. The optional `backup.deferred_operation` holds the operation record when recovery must wait for a conclusive mirror check. Other repositories can proceed once that record is durable and the shared journal slot has been reconciled.
 - Optional `data.json.manual_integrity` and `metadaten.json.integrity.manual` records keep the latest manual run and each mirror's latest completed manual finding separately from periodic checks and repair state. Service restart marks an unfinished run interrupted and preserves completed findings.
 - Each source directory's `repository.git/` contains the valid bare mirror when available. A partial first clone can exist as `repository.git.partial/`; an interrupted partial may be preserved in `quarantine/initial-clone/`.
 
@@ -414,7 +414,7 @@ Both commands require a new output path with an existing writable parent outside
 |---|---|
 | `updated` / `up_to_date` | Successful changed mirror or successful no-op remote check. |
 | `global_limit_paused`, `repo_limit_reached`, `FREE_SPACE_RESERVE` | A new operation was withheld by a capacity condition. |
-| `repair_paused` + `repair_deferred` | Repair deferred for storage or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
+| `repair_paused` + `repair_deferred` | Recovery or repair deferred for verification, storage, or discovery, without consuming a failed attempt. A later eligible run reevaluates it. |
 | `pending` | Backup work is pending. This can also follow a clean periodic check that cleared an obsolete repair status. |
 | `repair_failed` | Genuine exhausted repair attempts or an unrecoverable/unavailable repair condition. |
 | `interrupted` | Operation was interrupted or not proven complete. |

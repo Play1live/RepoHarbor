@@ -173,8 +173,16 @@ and descriptor-based operations do not exclude an independent privileged writer.
 
 Git is configured to synchronize its updates and verify incoming objects. RepoHarbor
 also synchronizes cloned files and Git directories before recording completion.
-An interrupted operation still requires verification. A clone's files and directories
-or the bundle file are synchronized before no-replace restore publication. The
+At startup, it verifies interrupted mirrors. It also rechecks the latest completed
+Git operation when the enclosing run is still marked running or its completion no
+longer matches the repository metadata or mirror path. A normal restart with matching
+completed state does not scan all mirrors. When a mirror cannot be verified,
+RepoHarbor durably retains its operation in the repository metadata before releasing
+the shared journal slot. The repository stays blocked for backup and offline
+restore until recovery can account for the operation.
+
+A clone's files and directories or the bundle file are synchronized before
+no-replace restore publication. The
 destination parent is synchronized afterwards. If JSON replacement succeeds but the
 directory fails to synchronize, RepoHarbor prevents further writes until restart.
 
@@ -185,3 +193,24 @@ or I/O errors can leave a mirror unconfirmed without consuming a repair attempt.
 These measures depend on Git and the storage stack honoring synchronization.
 Controller caches and NAS implementations without appropriate power-loss protection
 can lose acknowledged writes. Test physical durability and restore on target storage.
+
+### Runtime image vulnerabilities
+
+The Debian Bookworm runtime image reviewed for v0.9.2 contained
+`libsqlite3-0` version `3.40.1-2+deb12u2`. The package is affected by
+CVE-2025-7458. The upstream fix is in SQLite 3.41.2, and the signed Bookworm,
+security, updates, and backports repositories offered no fixed package at review
+time. Exploitation requires executing attacker-controlled SQL in an application
+using the affected SQLite code. RepoHarbor persists JSON, provides no SQL interface,
+and does not import SQLite. Python's optional `sqlite3` module remains available.
+The package finding remains in the scanner report. Deployments that add software
+using SQLite in the same image should reassess exposure and adopt a fixed Debian
+package once available. [Debian status](https://security-tracker.debian.org/tracker/CVE-2025-7458) · [Upstream fix](https://sqlite.org/src/info/12ad822d9b827777)
+
+The scanner also reports CVE-2023-45853 against `zlib1g` version
+`1:1.2.13.dfsg-1`. The affected ZIP-writing code belongs to MiniZip, which is
+separate from the installed zlib library. The image contains no MiniZip package,
+library, or utility, and the installed `libz.so.1` does not export the affected
+MiniZip function. The upstream MiniZip fix is in zlib 1.3.1. This finding is
+inapplicable to the image as built and remains visible in the scanner report.
+[Debian status](https://security-tracker.debian.org/tracker/CVE-2023-45853) · [Upstream changelog](https://github.com/madler/zlib/blob/v1.3.1/ChangeLog)
