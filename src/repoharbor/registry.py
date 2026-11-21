@@ -89,7 +89,7 @@ def manual_identities(
     config: Config,
     names: set[str],
     *,
-    historical: set[str] | None = None,
+    resolved: dict[str, str] | None = None,
 ) -> set[str]:
     """Resolve current manual addresses only to block overlaps, never to adopt data."""
     result = set()
@@ -102,16 +102,16 @@ def manual_identities(
                 raw, _ = client.request(
                     "/repos/" + name.removeprefix("github.com/"), credential
                 )
-                result.add(parse_repository(raw).key)
+                key = parse_repository(raw).key
+                result.add(key)
+                if resolved is not None:
+                    resolved[name] = key
                 break
             except DiscoveryError as error:
                 if str(error) != "GITHUB_NOT_ACCESSIBLE":
-                    if name in (historical or ()) and not error.retry_at:
-                        break
                     raise
         else:
-            if name not in (historical or ()):
-                raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED")
+            raise DiscoveryError("GITHUB_MANUAL_IDENTITY_UNRESOLVED")
     return result
 
 
@@ -121,7 +121,7 @@ def gitlab_manual_identities(
     names: set[str],
     host: str,
     *,
-    historical: set[str] | None = None,
+    resolved: dict[str, str] | None = None,
 ) -> set[str]:
     """Resolve manual identities; only a 404 permits another instance token."""
     result = set()
@@ -135,16 +135,16 @@ def gitlab_manual_identities(
     for name in sorted(names):
         for credential in credentials:
             try:
-                result.add(client.manual_identity(name, credential))
+                key = client.manual_identity(name, credential)
+                result.add(key)
+                if resolved is not None:
+                    resolved[name] = key
                 break
             except DiscoveryError as error:
                 if str(error) != "GITLAB_NOT_ACCESSIBLE":
-                    if name in (historical or ()) and not error.retry_at:
-                        break
                     raise
         else:
-            if name not in (historical or ()):
-                raise DiscoveryError("GITLAB_MANUAL_IDENTITY_UNRESOLVED")
+            raise DiscoveryError("GITLAB_MANUAL_IDENTITY_UNRESOLVED")
     return result
 
 
@@ -186,6 +186,12 @@ def plan(
             raise DiscoveryError("GITHUB_ALIAS_CONFLICT")
         claimed[observed.address] = key
     manual = manual_addresses(config, catalog, host)
+    manual_ids = manual_ids | {
+        key
+        for meta in catalog.values()
+        if meta["repository"]["provider"] == "manual"
+        for key in meta["repository"].get("identity_claims", ())
+    }
     sources = []
     for key in sorted(set(proposed) | set(found)):
         current = found.get(key)

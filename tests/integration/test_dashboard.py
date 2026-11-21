@@ -987,3 +987,12 @@ def test_dashboard_uses_bounded_stale_view_during_refresh(factory, monkeypatch):
         finally:
             release.set()
         assert pending.result(timeout=1) == {"revision": 2}
+
+
+def test_dashboard_lists_configured_provider_before_first_discovery(github_env):
+    env = github_env
+    with env.create(env.config, git_instance=env.git()) as engine:
+        data = snapshot(engine.config, engine.events)
+        assert data["sources"][0]["provider"] == "github"
+        assert data["sources"][0]["status"] == "never"
+        assert data["sources"][0]["known"] == 0

@@ -404,3 +404,26 @@ def test_invalid_check_history_is_rejected(factory, history):
         engine.store.data["integrity_history"] = history
         with pytest.raises(HarborError, match="journal"):
             validate_state(engine.store.data)
+
+
+def test_manual_identity_claim_survives_rename_and_removal(github_env):
+    env = github_env
+    source = Source("historical", "https://github.com/fictional/project.git")
+    with env.create(
+        replace(env.config, sources=(source,)), git_instance=env.git()
+    ) as engine:
+        engine.discover()
+        assert engine.repos["historical"]["repository"]["identity_claims"] == [env.key]
+    env.results["first"] = [
+        raw_repo(name="renamed"),
+        raw_repo(rid=23, name="independent"),
+    ]
+    env.results["second"] = env.results["first"]
+    env.client.request.reset_mock()
+    with env.create(env.config, git_instance=env.git()) as engine:
+        assert engine.run() == Result.SUCCESS
+        assert (
+            engine.repos[env.key]["selection"]["reason"] == "manual_identity_conflict"
+        )
+        assert len(engine.sources) == 1
+        env.client.request.assert_not_called()

@@ -372,7 +372,11 @@ def load(env: dict[str, str]) -> Config:
     if mode not in ("env", "file"):
         raise HarborError("REPOHARBOR_TOKEN_SOURCE must explicitly be env or file")
     try:
-        data = yaml.load(env.get("REPOHARBOR_CONFIG", "{}"), Loader=UniqueSafeLoader)
+        loader = UniqueSafeLoader(env.get("REPOHARBOR_CONFIG", "{}"))
+        try:
+            data = loader.get_single_data()
+        finally:
+            loader.dispose()  # type: ignore[no-untyped-call]
     except (yaml.YAMLError, RecursionError):
         raise HarborError("Invalid configuration YAML") from None
     d = keys(

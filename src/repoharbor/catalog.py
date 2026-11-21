@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from repoharbor.config import canonical_url, identifier
 from repoharbor.errors import HarborError
@@ -84,6 +85,20 @@ def read_metadata(alias: str, folder: Path) -> dict[str, Any]:
             stored_repository(meta, alias)
         elif repo["id"] != alias or repo["provider"] != "manual":
             raise ValueError
+        if "identity_claims" in repo:
+            authority = urlsplit(canonical_url(repo["clone_url"])).netloc
+            claims = repo["identity_claims"]
+            if (
+                repo["provider"] != "manual"
+                or not isinstance(claims, list)
+                or any(
+                    not isinstance(key, str)
+                    or repository_key(key).split(":", 1)[1].rsplit(":", 1)[0]
+                    != authority
+                    for key in claims
+                )
+            ):
+                raise ValueError
         if "retry" in meta:
             validate_retry(meta["retry"])
         integrity = meta["integrity"]

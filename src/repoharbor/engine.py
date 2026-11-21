@@ -203,6 +203,25 @@ class Engine:
         )
         return failures
 
+    def record_manual_claims(self, resolved: dict[str, str]) -> None:
+        if not resolved:
+            return
+        for source in self.config.sources:
+            if source.alias not in self.repos:
+                continue
+            try:
+                name = address(source.url)
+            except HarborError:
+                continue
+            if name in resolved:
+                repo = self.repos[source.alias]["repository"]
+                claims = repo.setdefault("identity_claims", [])
+                key = resolved[name]
+                if key not in claims:
+                    claims.append(key)
+                    claims.sort()
+                    self.save_meta(source.alias)
+
     def discover_gitlab(self, config: Config, host: str) -> tuple[Source, ...] | None:
         state_key = "gitlab:" + host
         previous = self.store.data.get("provider_discovery", {}).get(state_key, {})
@@ -235,18 +254,19 @@ class Engine:
             observations = []
             for provider in config.providers:
                 observations.extend(client.discover(provider))
+            claims: dict[str, str] = {}
             manual_ids = (
                 gitlab_manual_identities(
                     client,
                     config,
-                    manual_addresses(config, self.repos, host),
+                    manual_addresses(config, {}, host),
                     host,
-                    historical=manual_addresses(config, self.repos, host)
-                    - manual_addresses(config, {}, host),
+                    resolved=claims,
                 )
                 if config.providers
                 else set()
             )
+            self.record_manual_claims(claims)
             proposed, sources = plan(
                 config,
                 self.repos,
@@ -329,17 +349,18 @@ class Engine:
                 if self.git.stop.is_set():
                     raise DiscoveryError("INTERRUPTED")
                 observations.extend(client.discover(provider))
+            claims: dict[str, str] = {}
             manual_ids = (
                 manual_identities(
                     client,
                     self.config,
-                    manual_addresses(self.config, self.repos),
-                    historical=manual_addresses(self.config, self.repos)
-                    - manual_addresses(self.config, {}),
+                    manual_addresses(self.config, {}),
+                    resolved=claims,
                 )
                 if self.config.providers
                 else set()
             )
+            self.record_manual_claims(claims)
             proposed, sources = plan(self.config, self.repos, observations, manual_ids)
         except DiscoveryError as error:
             with self.store.transaction() as data:
