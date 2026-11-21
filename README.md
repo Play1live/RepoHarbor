@@ -7,7 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)
 ![Git](https://img.shields.io/badge/Git-Mirror-F05032?logo=git&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/Version-0.9.2-64748B)
+![Version](https://img.shields.io/badge/Version-1.0.0-64748B)
 [![CI](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml/badge.svg)](https://github.com/Play1live/RepoHarbor/actions/workflows/ci.yml)
 
 </div>
@@ -32,7 +32,7 @@ RepoHarbor discovers repositories on GitHub.com, GitLab.com, and compatible Self
 
 ## Getting started
 
-Build the development image from the repository root and verify the CLI:
+Build the image locally from the repository root and verify the CLI:
 
 ```sh
 docker build -t repoharbor:local-test .
@@ -91,7 +91,7 @@ Set `features.integrity_check: true` in `REPOHARBOR_CONFIG`. The default schedul
 
 ### Enable extended logging
 
-Set `features.extended_logging: true` for events covering backups, discovery, retries, integrity, recovery, and offline restore. The console defaults to text at `INFO`. Set `logging.format: json` for one event per line. File output is a separate opt-in and uses a dedicated persistent bind mount. Existing v0.7.0 deployments can update in place with their current backup and secret mounts and schema-1 state. [Logging configuration](docs/CONFIGURATION.md#extended-logging) · [Docker and NAS setup](deploy/README.md#configure-log-retention)
+Set `features.extended_logging: true` for events covering backups, discovery, retries, integrity, recovery, and offline restore. The console defaults to text at `INFO`. Set `logging.format: json` for one event per line. File output is a separate opt-in and uses a dedicated persistent bind mount. Existing v0.9.2 deployments can update in place with their current backup and secret mounts and schema-1 state. [Logging configuration](docs/CONFIGURATION.md#extended-logging) · [Docker and NAS setup](deploy/README.md#configure-log-retention)
 
 ### Restore or export a mirror
 
@@ -104,7 +104,7 @@ repoharbor restore bundle --repository example-demo --output /exports/example-de
 
 The clone includes Git history, branches, tags, and available refs. Add `--branch development` to check out that existing branch. A bundle is a portable Git file that you can clone offline. Repositories that were excluded, removed from the backup configuration, or are unreachable upstream can still be restored from a valid local backup. See [offline restoration](deploy/README.md#8-offline-restoration-and-acceptance) for the read-only Docker workflow, bundle import, and manual Git recovery.
 
-A full backup reports missing included repositories separately. An unchanged mirror is verified before it can report success. See the [upgrade guidance](deploy/README.md#upgrade-to-092).
+A full backup reports missing included repositories separately. An unchanged mirror is verified before it can report success. See the [upgrade guidance](deploy/README.md#upgrade-to-v100).
 
 **Mirrors are not historical snapshots.** Synchronization reflects deleted refs and force-pushes; Restore and bundle export contain the Git data retained by the mirror. Git LFS payloads, separate submodule repositories, issues, pull/merge requests, other hosting metadata, and unpushed local changes require separate backups. RepoHarbor has no notification feature. Excluded repositories remain stored locally. Interrupted or damaged backups may require manual intervention; existing mirrors are never silently replaced with fresh clones.
 
@@ -122,7 +122,7 @@ Discovery reevaluates selection during scheduled and manual runs. The default is
 
 ## Development and deployment notes
 
-RepoHarbor follows Semantic Versioning: PATCH for corrections, MINOR for new compatible features, and MAJOR for incompatible changes or the first stable major version (`1.0.0`). Product version `0.9.2` is independent of configuration and persistence `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
+RepoHarbor v1.0.0 is the first stable release and follows the successful NAS/Portainer acceptance of v0.9.2. RepoHarbor follows Semantic Versioning. PATCH releases provide corrections, MINOR releases add compatible features, and MAJOR releases can introduce incompatible changes. Configuration and persistence continue to use `schema_version: 1`. The changelog records version history. GitHub Releases and tags show publication history.
 
 Local development uses Python 3.12+, Git, and OpenSSL for HTTPS integration tests. CI tests Python 3.12 and 3.13 and includes fault injection, Chromium, CodeQL, image scanning, and Docker smoke tests. See the [testing guide](docs/TESTING.md) for commands and coverage requirements.
 

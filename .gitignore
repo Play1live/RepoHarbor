@@ -236,6 +236,7 @@ __marimo__/
 /artifacts/
 /logs/
 /test-results/
+/docs/audits/
 coverage.json
 junit*.xml
 repository.git/

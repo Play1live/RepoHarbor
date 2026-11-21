@@ -1,6 +1,6 @@
 # Security, data integrity, and recovery
 
-This document describes the security and recovery guarantees of RepoHarbor `0.9.2`. Production NAS/Portainer acceptance requires validation on the target host.
+This document describes the security and recovery guarantees of RepoHarbor v1.0.0. Validate each new NAS/Portainer deployment on its target host.
 
 ## Trusted storage boundary
 
@@ -160,7 +160,7 @@ Invalid file setup causes a safe startup diagnosis. If the file sink fails durin
 
 A mirror does **not** provide historical snapshots. Deleted remote refs and force-pushes propagate to the mirror. Git LFS data, separate submodule repositories, issues, pull/merge requests, hosting metadata, and never-pushed local objects are not backed up by this version. Notifications are outside its scope.
 
-Follow the [deployment guide](../deploy/README.md) for host-mount validation, non-root permissions, credential setup, updates, and an offline restore. See [configuration](CONFIGURATION.md) for status semantics and [testing](TESTING.md) for automated checks. Actual NAS/Portainer deployment and disaster-recovery acceptance remain separate operator tasks.
+Follow the [deployment guide](../deploy/README.md) for host-mount validation, non-root permissions, credential setup, updates, and an offline restore. See [configuration](CONFIGURATION.md) for status semantics and [testing](TESTING.md) for automated checks. Verify deployment and disaster recovery on the target storage before production use.
 
 
 ### Backup and restore durability
@@ -197,9 +197,6 @@ can lose acknowledged writes. Test physical durability and restore on target sto
 ### Runtime image vulnerabilities
 
 The application image uses JSON for state and excludes the unused SQLite
-library and optional Python extension. The runtime advisory assessment records
-the Git HTTPS safeguards and explains which scanner entries do not apply to
-supported RepoHarbor execution paths. The supported deployment runs as a
+library and optional Python extension. The supported deployment runs as a
 non-root UID with no-new-privileges and all capabilities dropped. Image CI
 retains the complete, unfiltered scan and CycloneDX SBOM.
-[Runtime image advisory assessment](audits/RepoHarbor-Image-Advisory-Review-0.9.2.md)

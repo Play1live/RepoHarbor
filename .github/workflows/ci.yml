@@ -113,7 +113,6 @@ jobs:
           persist-credentials: false
       - run: |
           mkdir -p test-results/image-security
-          cp docs/audits/RepoHarbor-Image-Advisory-Review-0.9.2.md test-results/image-security/
           docker build -t repoharbor:security .
           docker image inspect --format '{{.Id}}' repoharbor:security > test-results/image-security/image-id.txt
           docker run --rm --network none --entrypoint dpkg-query repoharbor:security \
