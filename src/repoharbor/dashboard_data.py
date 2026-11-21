@@ -231,7 +231,7 @@ def repository_view(
         result = manual["last_result"]
         if result != "healthy" or repo["integrity_status"] in ("healthy", "unchecked"):
             repo["integrity_status"] = result
-        repo["has_error"] |= result == "corrupt"
+        repo["has_error"] |= result in ("corrupt", "uncheckable")
     repo["can_check_integrity"] = False
     if (
         config.manual_run
