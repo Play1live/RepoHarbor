@@ -80,6 +80,10 @@ class Git:
             raise HarborError("INTERRUPTED")
         env = self.credentials.git_env(credential if probe is None else None)
         command = next(iter(args[2:] if args[:1] == ["-C"] else args), None)
+        if args and args[0] in ("clone", "ls-remote"):
+            # These commands create or query a repository without using a
+            # local Git config. Suppress discovery from the caller's cwd.
+            env["GIT_DIR"] = os.devnull
         remote = args.index("--") + 1 if "--" in args else len(args)
         if credential is not None and probe is None:
             if remote >= len(args) or not args[remote].startswith("https://"):

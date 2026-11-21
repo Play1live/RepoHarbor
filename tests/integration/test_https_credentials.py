@@ -19,6 +19,7 @@ from repoharbor import cli
 from repoharbor.config import load
 from repoharbor.credentials import Credentials
 from repoharbor.engine import Engine
+from repoharbor.errors import GitError
 from repoharbor.git_backup import Git
 from repoharbor.persistence import Store
 
@@ -70,7 +71,7 @@ def test_https_detached_head_only_update(tmp_path, remote, monkeypatch):
 
 
 @contextmanager
-def https_remote(tmp_path, bare, hostname="127.0.0.1"):
+def https_remote(tmp_path, bare, hostname="127.0.0.1", secret="test-password"):
     cert, key = tmp_path / "server.crt", tmp_path / "server.key"
     subprocess.run(
         [
@@ -95,9 +96,14 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1"):
         capture_output=True,
         timeout=15,
     )
-    secret = "test-password"
     expected = "Basic " + base64.b64encode(f"oauth2:{secret}".encode()).decode()
-    state = {"status": 200, "authorized": 0, "challenged": 0}
+    state = {
+        "status": 200,
+        "authorized": 0,
+        "challenged": 0,
+        "headers": [],
+        "location": None,
+    }
 
     class Handler(BaseHTTPRequestHandler):
         timeout = 15
@@ -112,6 +118,13 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1"):
             self.handle_git()
 
         def handle_git(self):
+            state["headers"].append(
+                (
+                    self.headers.get("Host"),
+                    "Cookie" in self.headers,
+                    "Proxy-Authorization" in self.headers,
+                )
+            )
             if self.headers.get("Authorization") != expected:
                 state["challenged"] += 1
                 self.send_response(401)
@@ -122,6 +135,8 @@ def https_remote(tmp_path, bare, hostname="127.0.0.1"):
             state["authorized"] += 1
             if state["status"] != 200:
                 self.send_response(state["status"])
+                if state["location"] is not None:
+                    self.send_header("Location", state["location"])
                 self.send_header("Content-Length", str(len(secret.encode())))
                 self.end_headers()
                 self.wfile.write(
@@ -260,6 +275,116 @@ def test_https_authentication_and_offline_restore(
     # Server is gone. Restore must still work without authentication or network.
     git("clone", "--no-hardlinks", mirror, tmp_path / "restored")
     assert (tmp_path / "restored/hello.txt").read_text() == "first\n"
+
+
+def test_direct_https_ignores_ambient_repository_and_environment(
+    tmp_path, remote, monkeypatch
+):
+    ambient = tmp_path / "ambient"
+    git("init", ambient)
+    cookie = tmp_path / "cookies.txt"
+    cookie.write_text("127.0.0.1\tFALSE\t/\tTRUE\t0\tfixture\tvalue\n")
+    for key, value in (
+        ("http.extraHeader", "Host: ambient.invalid"),
+        ("http.cookieFile", str(cookie)),
+        ("http.saveCookies", "true"),
+    ):
+        git("config", key, value, cwd=ambient)
+    monkeypatch.chdir(ambient)
+    for name in ("https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    for name in ("no_proxy", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    for name in ("KRB5_CONFIG", "KRB5CCNAME", "KRB5_KTNAME", "KRB5_CLIENT_KTNAME"):
+        monkeypatch.setenv(name, str(tmp_path / name))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "http.extraHeader")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "Host: environment.invalid")
+
+    with https_remote(tmp_path, remote[1]) as (url, cert, secret, state):
+        transport = Git(Credentials({"local": secret}), threading.Event(), timeout=15)
+        child_env = transport.credentials.git_env("local")
+        assert not any(
+            k.startswith("KRB5") or k.lower().endswith("_proxy") for k in child_env
+        )
+        # Without the fixture CA, the authenticated endpoint is unreachable.
+        monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        with pytest.raises(GitError, match="GIT_FAILED"):
+            transport.remote_refs(url, "local")
+        assert not state["headers"]
+        monkeypatch.setenv("SSL_CERT_FILE", str(cert))
+        assert "refs/heads/main" in transport.remote_refs(url, "local")
+        mirror = tmp_path / "mirror.git"
+        transport.clone(url, mirror, "local", lambda: False)
+        assert transport.healthy(mirror)
+        assert state["authorized"] > 0
+        assert set(state["headers"]) == {(urlsplit(url).netloc, False, False)}
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("http.extraHeader", "Host: mirror.invalid"),
+        ("http.cookieFile", "/dev/null"),
+        ("http.saveCookies", "true"),
+        ("http.proxy", "http://127.0.0.1:1"),
+        ("remote.origin.proxy", "http://127.0.0.1:1"),
+        ("http.proxyAuthMethod", "digest"),
+        ("http.proxyServiceName", "fixture"),
+        ("http.delegation", "always"),
+        ("http.followRedirects", "true"),
+        ("http.sslVerify", "false"),
+        ("protocol.http.allow", "always"),
+    ],
+)
+def test_managed_mirror_rejects_transport_overrides(tmp_path, remote, key, value):
+    mirror = tmp_path / "mirror.git"
+    git("clone", "--mirror", remote[1], mirror)
+    git("config", key, value, cwd=mirror)
+    transport = Git(Credentials({}), threading.Event(), timeout=5)
+    with pytest.raises(GitError, match="MIRROR_UNSUPPORTED"):
+        transport.fetch(mirror, "https://127.0.0.1:1/remote.git", None, lambda: False)
+
+
+def test_https_rejects_redirects_and_separates_authority_credentials(
+    tmp_path, remote, monkeypatch
+):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    with (
+        https_remote(first, remote[1], secret="fixture-first") as a,
+        https_remote(second, remote[1], secret="fixture-second") as b,
+    ):
+        url_a, ca_a, token_a, state_a = a
+        url_b, ca_b, token_b, state_b = b
+        transport = Git(
+            Credentials({"first": token_a, "second": token_b}),
+            threading.Event(),
+            timeout=15,
+        )
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_a))
+        state_a.update(status=302, location=url_b)
+        with pytest.raises(GitError, match="GIT_FAILED"):
+            transport.remote_refs(url_a, "first")
+        assert state_a["authorized"] and not state_b["headers"]
+        state_a["location"] = url_a.replace("https:", "http:", 1)
+        with pytest.raises(GitError, match="GIT_FAILED"):
+            transport.remote_refs(url_a, "first")
+        assert state_a["authorized"] == 2
+        state_a["status"] = 200
+        assert "refs/heads/main" in transport.remote_refs(url_a, "first")
+        monkeypatch.setenv("SSL_CERT_FILE", str(ca_b))
+        assert "refs/heads/main" in transport.remote_refs(url_b, "second")
+        assert state_b["challenged"] and state_b["authorized"]
+
+
+@pytest.mark.parametrize("scheme", ["http", "ftp", "smtp", "ldap", "ssh", "git"])
+def test_git_disallows_alternative_network_transports(scheme):
+    transport = Git(Credentials({}), threading.Event(), timeout=5)
+    with pytest.raises(GitError, match="GIT_FAILED"):
+        transport.remote_refs(f"{scheme}://127.0.0.1:1/remote.git", None)
 
 
 def test_config_validate_has_no_git_or_runtime_mutations(tmp_path, monkeypatch, capsys):

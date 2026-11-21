@@ -617,8 +617,13 @@ def smoke():
             "-c",
             "from importlib.util import find_spec;"
             "from ctypes.util import find_library;"
+            "from pathlib import Path;"
             "assert find_spec('_sqlite3') is None;"
-            "assert find_library('sqlite3') is None",
+            "assert find_library('sqlite3') is None;"
+            "assert find_library('gssrpc') is None;"
+            "assert not any(Path(p).exists() for p in "
+            "('/usr/sbin/krb5kdc', '/usr/sbin/kadmind', "
+            "'/usr/lib/systemd/systemd-homed'))",
         )
         == ""
     )
